@@ -1,0 +1,25 @@
+ OPEN  (2)
+ID        PRI  TITLE                            
+────────  ───  ─────────────────────────────────
+TICK-150  1    Implement auth middleware refa...
+TICK-151  2    Add rate limiting to the API     
+
+ IN PROGRESS  (1)
+ID        PRI  TITLE                      
+────────  ───  ───────────────────────────
+TICK-149  1    Database connection pooling
+
+ COMPLETE  (1)
+ID        PRI  TITLE                           
+────────  ───  ────────────────────────────────
+TICK-148  2    CLI command for status reporting
+
+ REVIEW  (1)
+ID        PRI  TITLE                            
+────────  ───  ─────────────────────────────────
+TICK-147  2    Add comprehensive logging to o...
+
+ MERGED  (1)
+ID        PRI  TITLE                            
+────────  ───  ─────────────────────────────────
+TICK-146  1    Python API for board/tickets/d...

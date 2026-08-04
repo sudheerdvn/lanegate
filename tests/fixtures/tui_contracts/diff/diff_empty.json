@@ -1,0 +1,12 @@
+{
+  "id": "TICK-154",
+  "ticket_id": "TICK-154",
+  "branch": "tick-154-noop",
+  "base": "main",
+  "stat": "",
+  "files": [],
+  "diff": "",
+  "truncated": false,
+  "max_patch_chars": 20000,
+  "error": null
+}

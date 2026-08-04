@@ -1,0 +1,46 @@
+TICK-145  Database schema migration for multi-tenant support
+ COMPLETE   review: changes_requested
+
+Milestone: v1.5
+Branch: tick-145-multi-tenant
+Touches: migrations/0042_user_schema.sql, tests/test_migrations.py
+
+## Background
+We need to support multiple isolated tenants in
+the database. This requires adding a tenant_id
+column to all existing tables and implementing
+partition-level isolation.
+## What
+- Add tenant_id UUID column to users, accounts,
+and transactions tables
+- Create indexes on (tenant_id, id) for
+efficient queries
+- Implement migration with zero-downtime
+approach
+- Add rollback script for emergency revert
+## Close Criteria
+- Migration succeeds on 50M+ row production-like
+dataset in under 2 hours
+- Zero data corruption or loss
+- Rollback tested and verified
+
+Review Summary:
+Significant concerns about zero-downtime
+approach and missing rollback testing. Please
+revise.
+
+Lifecycle Timeline:
+- open → in_progress — worktree claimed for
+implementation
+- code_complete → code_complete — review
+verdict: changes_requested
+
+Review Findings:
+- Migration lacks downtime strategy; need
+zero-downtime approach using online schema
+migration tools like online_alter
+- Missing rollback testing - unclear if rollback
+can succeed after partial migration
+- Performance on large datasets: need estimated
+time on test dataset with 100M rows
+- Documentation missing for operational runbook

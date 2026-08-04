@@ -1,0 +1,22 @@
+{
+  "run_id": null,
+  "status": "idle",
+  "started_at": null,
+  "orchestrator_pid": null,
+  "process_alive": false,
+  "tickets": [],
+  "workers": [],
+  "last_event_id": null,
+  "orchestration": {
+    "active": false,
+    "state": "no-active-run",
+    "reconciliation_state": "none",
+    "last_event": "no_active_run",
+    "ticket_id": null,
+    "executor_pid": null,
+    "executor_session": null,
+    "elapsed_seconds": null,
+    "elapsed": "unknown",
+    "log_path": null
+  }
+}

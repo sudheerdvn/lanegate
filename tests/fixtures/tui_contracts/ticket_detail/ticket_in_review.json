@@ -1,0 +1,18 @@
+{
+  "id": "TICK-147",
+  "title": "Add comprehensive logging to orchestrate",
+  "status": "in_review",
+  "priority": 2,
+  "milestone": "v1.5",
+  "touches": [
+    "lanegate/orchestrate.py"
+  ],
+  "depends_on": [],
+  "branch": "tick-147-logging",
+  "worktree": "worktrees/tick-147",
+  "body": "## Background\n\nThe orchestrate loop currently has minimal logging, making it hard to debug issues during batch runs.\n\n## What\n\n- Add structured logging to orchestrate.py\n- Log executor state transitions\n- Include timing information for each step\n- Write logs to `.lanegate/logs/orchestrate.jsonl` with machine-readable format\n\n## Close Criteria\n\n- Logging outputs JSON to `.lanegate/logs/` directory\n- Each step includes timestamp and duration\n- No performance impact on orchestration runs\n",
+  "close_criteria": "Logging outputs JSON to `.lanegate/logs/` directory; each step includes timestamp and duration; no performance impact on orchestration runs",
+  "review_verdict": "pending",
+  "review_summary": "Awaiting review from the on-call reviewer",
+  "review_findings": []
+}

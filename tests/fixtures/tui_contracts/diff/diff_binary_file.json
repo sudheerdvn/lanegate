@@ -1,0 +1,19 @@
+{
+  "id": "TICK-153",
+  "ticket_id": "TICK-153",
+  "branch": "tick-153-brand-assets",
+  "base": "main",
+  "stat": " assets/logo.png | Bin 0 -> 24831 bytes\n 1 file changed, 0 insertions(+), 0 deletions(-)\n",
+  "files": [
+    {
+      "path": "assets/logo.png",
+      "status": "M",
+      "patch": "Binary files a/assets/logo.png and b/assets/logo.png differ\n",
+      "truncated": false
+    }
+  ],
+  "diff": "Binary files a/assets/logo.png and b/assets/logo.png differ\n",
+  "truncated": false,
+  "max_patch_chars": 20000,
+  "error": null
+}

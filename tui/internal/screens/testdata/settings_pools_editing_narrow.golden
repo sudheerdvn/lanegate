@@ -1,0 +1,33 @@
+Repository
+Root:        /home/operator/lanegate-dev
+Tickets dir: .lanegate/tickets
+Worktrees:   .lanegate/worktrees
+Prefix:      TICK
+
+Execution
+Executor:      claude
+Max parallel:  2
+Milestone:     v1.6
+On rate limit: halt
+GitHub PR:     false
+Commit status: true
+
+Models
+claude: claude-sonnet-5
+
+Environments
+ENV      BRANCH   FROM  TRIGGER  SYNC   
+───────  ───────  ────  ───────  ───────
+staging  staging  main  auto     ff-only
+
+API: 127.0.0.1:8000
+
+Pools
+> default (least-loaded)  [default]
+    * 1. claude-2  dispatched: 1
+      2. claude-1  dispatched: 4
+  local (round-robin)
+      1. ollama-a  dispatched: 2
+      2. ollama-b  dispatched: 2
+      3. ollama-c  dispatched: 1
+Reordering — up/down select, J/K move, enter save, esc cancel

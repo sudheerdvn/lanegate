@@ -1,0 +1,125 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lanegate"
+version = "1.0.0"
+description = "Git-native agentic delivery engine — queue, parallel agents, quality gates, staged deployment"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Sudheer Donaboina", email = "54123367+sudheerdvn@users.noreply.github.com" }]
+requires-python = ">=3.11"
+keywords = ["cli", "tickets", "agent", "workflow", "git", "mcp", "devops", "orchestration", "agentic", "ollama", "local-ai"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    # <2 is load-bearing: mcp 2.0.0 removed mcp.server.fastmcp, which lanegate/mcp.py imports.
+    "mcp>=1.0.0,<2",
+    "portalocker>=2.0",
+    "rich>=13.0",
+    # Windows has no OS-level IANA tz database; zoneinfo needs this to resolve
+    # zone keys like "America/Los_Angeles" there. No-op on Linux/macOS.
+    "tzdata; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/sudheerdvn/lanegate"
+Repository = "https://github.com/sudheerdvn/lanegate"
+"Bug Tracker" = "https://github.com/sudheerdvn/lanegate/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.8",
+    "mypy>=1.8",
+]
+treesitter = [
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "tree-sitter-typescript>=0.21",
+    "tree-sitter-go>=0.21",
+    "tree-sitter-rust>=0.21",
+    "tree-sitter-java>=0.21",
+    "tree-sitter-ruby>=0.21",
+    "tree-sitter-c>=0.21",
+    "tree-sitter-cpp>=0.21",
+]
+security = [
+    "semgrep",
+    "bandit",
+    "pip-audit",
+]
+ollama = [
+    "requests>=2.31",
+]
+
+[project.scripts]
+lanegate = "lanegate.cli:main"
+lgt = "lanegate.cli:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/lanegate",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/NOTICE",
+    "/pyproject.toml",
+    "/.lanegate.yml.example",
+]
+exclude = [
+    "/docs/internal",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lanegate"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"lanegate/templates/scripts/run-tests.sh" = "lanegate/templates/scripts/run-tests.sh"
+"lanegate/templates/scripts/pre-deploy-check.sh" = "lanegate/templates/scripts/pre-deploy-check.sh"
+"lanegate/templates/prompts/analyze.md" = "lanegate/templates/prompts/analyze.md"
+"lanegate/templates/prompts/implement.md" = "lanegate/templates/prompts/implement.md"
+"lanegate/templates/prompts/review.md" = "lanegate/templates/prompts/review.md"
+"lanegate/templates/prompts/fix.md" = "lanegate/templates/prompts/fix.md"
+"lanegate/templates/prompts/drift_check.md" = "lanegate/templates/prompts/drift_check.md"
+"lanegate/skills/implement.md" = "lanegate/skills/implement.md"
+"lanegate/skills/integrate.md" = "lanegate/skills/integrate.md"
+"lanegate/skills/next-ticket.md" = "lanegate/skills/next-ticket.md"
+"lanegate/skills/orchestrate.md" = "lanegate/skills/orchestrate.md"
+"lanegate/skills/tickets.md" = "lanegate/skills/tickets.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+tmp_path_retention_policy = "failed"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["venv", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["lanegate"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

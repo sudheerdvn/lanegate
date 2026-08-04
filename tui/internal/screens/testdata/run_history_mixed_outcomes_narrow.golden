@@ -1,0 +1,17 @@
+No active orchestration run.
+
+Run History
+RUN ID     REASON   OUTCOMES                                     
+─────────  ───────  ─────────────────────────────────────────────
+run-mixed  STOPPED  1 success · 1 failure · 1 changes_requested  
+
+Selected Run: run-mixed
+Terminal Reason: stopped
+Timestamp: 2026-07-30 03:00:00 PDT
+
+Tickets
+TICKET  EXECUTOR  OUTCOME            DURATION
+──────  ────────  ─────────────────  ────────
+TICK-1  claude-a  success            10.0s   
+TICK-2  claude-a  failure            20.0s   
+TICK-3  codex-a   changes_requested  30.0s   

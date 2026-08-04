@@ -1,0 +1,18 @@
+{
+  "id": "TICK-144",
+  "title": "Minimal ticket without optional fields",
+  "status": "open",
+  "priority": null,
+  "milestone": null,
+  "touches": [
+    "README.md"
+  ],
+  "depends_on": [],
+  "branch": null,
+  "worktree": null,
+  "body": "A simple documentation update",
+  "close_criteria": "",
+  "review_verdict": null,
+  "review_summary": null,
+  "review_findings": []
+}

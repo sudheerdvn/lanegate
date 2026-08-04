@@ -1,0 +1,27 @@
+{
+  "run_id": "run-20260728T090000Z-def45678",
+  "status": "finished",
+  "started_at": 1785306000.0,
+  "started_at_iso": "2026-07-28T09:00:00Z",
+  "orchestrator_pid": 54000,
+  "process_alive": false,
+  "stop_requested": false,
+  "process_exit_code": 0,
+  "last_event": "orchestrator_finished",
+  "updated_at": "2026-07-28T09:10:10Z",
+  "tickets": [],
+  "workers": [],
+  "last_event_id": 6,
+  "orchestration": {
+    "active": false,
+    "state": "finished",
+    "reconciliation_state": "finished",
+    "ticket_id": "TICK-149",
+    "executor_pid": null,
+    "executor_session": null,
+    "elapsed_seconds": 610,
+    "elapsed": "10m10s",
+    "log_path": ".lanegate/logs/orchestrate-20260728T090000Z.log",
+    "heartbeat_count": 6
+  }
+}

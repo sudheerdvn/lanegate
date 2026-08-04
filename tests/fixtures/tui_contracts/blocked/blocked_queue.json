@@ -1,0 +1,30 @@
+{
+  "blocked": [
+    {
+      "id": "TICK-145",
+      "title": "Database schema migration for multi-tenant support",
+      "branch": "tick-145-multi-tenant",
+      "diff_cmd": "git diff main...tick-145-multi-tenant",
+      "priority": 1,
+      "milestone": "v1.5",
+      "findings": [
+        "Migration lacks downtime strategy; need zero-downtime approach",
+        "Missing rollback testing",
+        "Performance on large datasets: need estimated time on test dataset",
+        "Documentation missing for operational runbook"
+      ]
+    },
+    {
+      "id": "TICK-143",
+      "title": "API rate limiting implementation",
+      "branch": "tick-143-rate-limit",
+      "diff_cmd": "git diff main...tick-143-rate-limit",
+      "priority": 2,
+      "milestone": "v1.6",
+      "findings": [
+        "Rate limiter doesn't account for distributed backends",
+        "Missing tests for edge cases (clock skew, concurrent requests)"
+      ]
+    }
+  ]
+}

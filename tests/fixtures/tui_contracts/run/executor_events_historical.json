@@ -1,0 +1,16 @@
+{
+  "run_id": "run-20260727T090000Z-historical",
+  "events": [
+    {
+      "ts": "2026-07-27T09:00:03Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-149",
+      "progress": {
+        "phase": "reviewing",
+        "activity": "completed",
+        "executor": "claude-b",
+        "model": "claude-sonnet-5"
+      }
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+# .lanegate.yml — project configuration for lanegate
+# Copy this file to .lanegate.yml in your repo root and edit to taste.
+# Or run `lanegate init` to generate a config interactively.
+
+ticket_prefix: TICK          # TICK-NNN, FEAT-NNN, BUG-NNN, TASK-NNN, etc.
+tickets_dir: .lanegate/tickets
+worktrees_dir: .lanegate/worktrees
+
+# Legacy shorthand: who writes the code when `steps.implement.driver` is not set.
+executor: claude             # claude | claude-subagent | claude-process | aider | openhands | codex | ollama
+
+# Legacy shorthand: who reviews the code when `steps.review.driver` is not set
+# (optional — defaults to executor if omitted).
+# Set to a different executor for model review, or `human` when you want a
+# person to record each review verdict.
+# For a batch-level human gate without changing the reviewer, run:
+#   lanegate orchestrate --human-review final
+# For per-ticket human verdicts, uncomment `reviewer: human` and run:
+#   lanegate orchestrate --human-review per_ticket
+# reviewer: human
+
+# --- Multi-agent dispatch (optional) ---
+#
+# Define named driver instances. Each driver is an invocation of an agent type
+# with specific settings. Use driver names in `steps:` or per-ticket
+# `executor:` / `reviewer:` frontmatter.
+drivers:
+  # Claude via subprocess — good for high-quality review.
+  claude-main:
+    type: claude-process
+    model: claude-sonnet-4-6
+
+  # Ollama REST driver — text-only, no file-editing/commit capability of its
+  # own (Ollama is a model server, not a coding agent). Only useful for
+  # text-only steps like analyze. For local *coding*, use aider-local below.
+  ollama-qwen:
+    type: ollama
+    model: qwen2.5-coder:32b
+    base_url: http://localhost:11434   # default; omit if using the standard port
+
+  # Aider with a local model — no hosted rate limits; useful for bulk
+  # implementation. This is the validated local/offline coding path, since
+  # Aider applies and commits edits itself. ollama_chat/ (not ollama/) is the
+  # recommended prefix for instruct-tuned coding models.
+  aider-local:
+    type: aider
+    model: ollama_chat/qwen2.5-coder:14b
+    provider: ollama
+    context_window_tokens: 32768   # local models have a finite context window
+    flags: ["--no-pretty", "--no-stream", "--yes-always", "--no-check-update",
+            "--no-analytics", "--no-show-model-warnings"]
+
+  # Aider on a rented/remote GPU box, reached through an SSH tunnel rather
+  # than exposing Ollama's (unauthenticated) API port publicly:
+  #   ssh -N -L 11435:localhost:11434 <user>@<remote-host>
+  #   export OLLAMA_API_BASE=http://localhost:11435   # aider reads this directly
+  # Route to it with a ticket-level `executor: aider-remote` override rather
+  # than the global `executor:` default or a pool — a single local model
+  # instance isn't necessarily the right tier for every ticket.
+  aider-remote:
+    type: aider
+    model: ollama_chat/qwen3-coder:30b-a3b-q4_K_M
+    provider: ollama
+    context_window_tokens: 32768
+
+  # OpenAI Codex CLI.
+  codex-cloud:
+    type: codex
+    model: o4-mini
+
+# Route each pipeline step to a specific driver.
+# Omit this block to use the top-level legacy `executor:` / `reviewer:` fields.
+steps:
+  analyze:
+    driver: claude-main     # strong model for ticket analysis
+  implement:
+    driver: aider-local     # local model handles bulk coding
+  review:
+    driver: claude-main     # Claude reviews for quality
+
+# Legacy shorthand: max tickets the orchestrator runs in parallel.
+# Effective batch = min(touch-disjoint candidates, max_parallel)
+max_parallel: 2
+
+# What to do when the executor hits a rate limit / quota error mid-run.
+# halt   (default) — hibernate the ticket, print instructions, stop the run.
+#                     You re-run `lanegate orchestrate` manually once the limit clears.
+# resume            — same hibernate, but also spawns a detached `lanegate resume-watch`
+#                     daemon that polls with capped exponential backoff and re-runs
+#                     `lanegate orchestrate` automatically once the limit clears.
+on_rate_limit: halt
+
+# Backoff settings for the resume-watch daemon (only used when on_rate_limit: resume).
+# ceiling_s: null polls forever; set it (e.g. 21600 for 6h) to give up after that
+# many total seconds and fall back to printing manual-resume instructions instead.
+rate_limit_resume:
+  initial_backoff_s: 300   # first retry after 5 minutes
+  max_backoff_s: 7200      # backoff never grows past 2 hours between retries
+  ceiling_s: null
+
+# Chain a ticket's pipeline steps onto one CLI session via --resume (Claude
+# subprocess executors only) instead of every step starting cold. The
+# per-invocation fixed bootstrap cost (system prompt/tools) only needs to be
+# cache-written once per session, not once per process — a measured ~9x cost
+# reduction on a resumed call vs a cold one (see
+# docs/session-usage-investigation.md). implement resumes analyze's session;
+# fix resumes implement's (or a prior fix pass's, on a second autofix cycle);
+# drift_check resumes fix's. Gated per-resume by max_session_age_s/
+# max_session_tokens using real step_costs data, since a resume past the
+# server's prompt-cache TTL re-pays cache-write price for the whole
+# accumulated session instead of just the fixed bootstrap — potentially
+# costing *more* than a cold dispatch would have.
+session_chaining:
+  enabled: true             # master switch
+  # Review stays independent (cold, no --resume) by default — a reviewer
+  # that inherits the implementer's exact reasoning trail undermines the
+  # point of an independent check. Opt in only if you want the cost saving
+  # more than that independence.
+  chain_review: false
+  max_session_age_s: 2700     # don't resume past this (45 min; safety
+                               # margin under the CLI's 1h cache TTL)
+  max_session_tokens: 150000  # don't resume past this either — dispatch
+                               # fresh instead once a session has grown this large
+
+# Phone alert (via ntfy.sh) when `lanegate orchestrate` looks stuck: dead process,
+# stale executor heartbeat, or the loop halted with tickets still waiting in
+# needs_review/blocked/failed/hibernated. Also used by resume-watch to push on
+# rate-limit hit / give-up / resumed. Set ntfy_topic and run `lanegate notify-watch`
+# (see docs/config-reference.md#phone-alerts-for-stuck-runs-notify-watch).
+# ntfy_topic is credential-like (anyone who knows it can read/post to your
+# channel) — if this file is git-tracked, leave it null here and set the
+# LANEGATE_NTFY_TOPIC env var instead; it overrides this value when set.
+notify:
+  ntfy_topic: null         # null = log only, no pushes sent
+  poll_seconds: 60
+  heartbeat_stale_seconds: 180
+
+# Legacy shorthand: per-executor overrides (replace the global, not additive).
+# `flags` are prepended to the executor command when dispatching a ticket.
+# The flags below enable headless/autonomous operation — remove them if you
+# want the executor to prompt for approval on each action (supervised mode).
+# `claude` shown here uses the scoped default (`lanegate init` writes this
+# automatically): it auto-approves only the tool categories orchestrate needs
+# and leaves everything else (WebFetch, WebSearch, MCP tools, ...) gated. The
+# fully-open alternative, flags: ["--dangerously-skip-permissions"], disables
+# every permission check process-wide — a valid choice for setups like a
+# disposable CI container, but not the default. See
+# docs/security-model.md#headless-permission-options-for-the-claude-executor.
+executors:
+  claude:  { max_parallel: 3, flags: ["--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"] }
+  aider:   { max_parallel: 1, flags: ["--yes-always"] }
+  codex:   { max_parallel: 3, flags: ["--approval-policy=never"] }
+  ollama:  { max_parallel: 1, models: { analyze: llama3.1 } }  # text-only; see drivers: above for local coding
+
+# Optional: distribute tickets across more than one account of the same
+# executor type (see "Named executor instances" + "Executor pools" in
+# docs/config-reference.md). Uncomment and define named instances under
+# executors: (each needs its own `type:` and usually its own `api_key_env:`)
+# before enabling a pool that references them.
+# pools:
+#   default:
+#     executors: [claude-1, claude-2]
+#     strategy: least-loaded   # or round-robin
+# default_pool: default
+
+# Files/patterns where overlapping tickets cannot run in parallel.
+# Leave empty if your project has no shared core files.
+core_files: []
+core_patterns: []
+
+# Visual verification for UI-facing tickets. LaneGate does not run a browser or
+# a dev server itself — this only tells the implement/review prompts (a) which
+# touched files count as "UI" so the visual-verification instructions get
+# added, and (b) how to reach the running app. The agent still needs its own
+# browser/screenshot tooling (e.g. a Playwright MCP server, an in-session
+# browser subagent) configured on the executor side — that's outside LaneGate.
+# `groups` is a list because a monorepo can have several distinct UI areas
+# (separate frontend apps, or e.g. an AEM ui.frontend clientlib vs. the AEM
+# author/publish instance itself) each reachable at a different dev
+# server/URL. Leave groups empty (the default) to disable this entirely.
+verification:
+  groups: []
+  # groups:
+  #   - patterns: ["apps/web/**", "**/*.tsx"]
+  #     dev_server: "npm run dev"
+  #     url: "http://localhost:3000"
+  #   - patterns: ["apps/admin/**"]
+  #     dev_server: "npm run dev:admin"
+  #     url: "http://localhost:4000"
+
+# Repo-local coding practices to include in analyze/implement/review prompts.
+# By default LaneGate also discovers common files like AGENTS.md, CLAUDE.md,
+# .github/copilot-instructions.md, .cursorrules, and CONTRIBUTING.md.
+# Set `project_guidance: false` to disable this prompt context.
+project_guidance:
+  include_defaults: true
+  files: []
+  max_bytes: 20000
+
+# Statuses during which a ticket's `touches` stay locked (held until merge).
+lock_statuses: [in_progress, code_complete, in_review]
+
+# Deterministic checks before lifecycle transitions.
+# A failing command blocks the transition.
+# Supported examples include: pytest, npm test, cargo test, go test, make lint,
+# and executable scripts such as scripts/run-tests.sh.
+safeguards:
+  pre_complete:
+    - pytest
+  pre_merge:
+    - pytest
+  # Runs from the merged control checkout during `lanegate validate`.
+  # When configured, `lanegate done` requires validation first.
+  post_merge:
+    - pytest
+
+# ── Feature flags (optional) ─────────────────────────────────────────────────
+# Remove this section if you do not use feature flags.
+flag_file: ~/.lanegate/feature_flags.json
+
+# ── Deployment pipeline (optional) ───────────────────────────────────────────
+# Remove this section for projects with no deployment pipeline (libraries,
+# research, open-source). Add one entry per environment in promotion order.
+environments:
+  - name: staging
+    branch: staging
+    from: main                          # base branch for pending-diff + promotion
+    trigger: manual                     # manual | auto (auto = hook-driven, lanegate reports only)
+    sync: ff-only                       # ff-only | merge-no-ff
+    guard_script: null                  # path to script; exit 1 blocks promote
+    pre_promote: []                     # scripts to run before promote
+    post_promote: []                    # scripts to run after promote
+    flag_file: ~/.lanegate/staging.feature_flags.json
+
+  - name: production
+    branch: production
+    from: main
+    trigger: manual
+    sync: ff-only
+    guard_script: null
+    pre_promote: []
+    post_promote: []
+    flag_file: ~/.lanegate/feature_flags.json

@@ -1,0 +1,21 @@
+# Project-level gitleaks config. Extends the default ruleset and adds a narrow
+# allowlist for known false positives specific to this repo — do not use this
+# file to broadly disable a rule; scope every entry to the exact benign pattern.
+title = "lanegate gitleaks config"
+
+[extend]
+useDefault = true
+
+# lanegate's multi-account executor pooling (TICK-088/089) names credential env
+# vars ANTHROPIC_API_KEY_1, ANTHROPIC_API_KEY_2, ... and references the *name*
+# as a plain string in config/docs/tests (e.g. `api_key_env: "ANTHROPIC_API_KEY_1"`).
+# generic-api-key's low-entropy heuristic flags that identifier itself as if it
+# were a secret value. Real API keys (e.g. sk-ant-...) have far higher entropy
+# and are unaffected by this allowlist — only the literal env-var-name pattern
+# is excluded.
+[[rules]]
+id = "generic-api-key"
+
+[rules.allowlist]
+regexTarget = "match"
+regexes = ['''ANTHROPIC_API_KEY_\d+''']

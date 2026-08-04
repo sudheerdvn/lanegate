@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+venv/
+.venv/
+
+# LaneGate local state
+.lanegate/*
+!.lanegate/tickets/
+!.lanegate/tickets/*
+.lanegate/executor-runs/
+!.lanegate/notes/
+.lanegate/notes/*
+!.lanegate/notes/.gitkeep
+worktrees/
+*-context-log.jsonl
+
+# Go TUI compiled binary (go build -o lanegate-tui ./tui/cmd/lanegate-tui, run from repo root)
+/lanegate-tui
+
+# Claude Code local overrides (personal, never shared)
+.claude/settings.local.json

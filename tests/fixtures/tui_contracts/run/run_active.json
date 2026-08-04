@@ -1,0 +1,41 @@
+{
+  "run_id": "run-20260728T101500Z-abc12345",
+  "status": "running",
+  "started_at": 1785312900.0,
+  "started_at_iso": "2026-07-28T10:15:00Z",
+  "orchestrator_pid": 55123,
+  "process_alive": true,
+  "stop_requested": false,
+  "command": ["python3", "-m", "lanegate.cli", "orchestrate", "--max", "2"],
+  "cwd": ".",
+  "last_event": "orchestrator_started",
+  "updated_at": "2026-07-28T10:17:30Z",
+  "tickets": ["TICK-150"],
+  "workers": [
+    {
+      "ticket_id": "TICK-150",
+      "executor_pid": 55130,
+      "state": "running",
+      "reconciliation_state": "live",
+      "resolved_driver": "codex-implement",
+      "resolved_executor": "codex-a",
+      "resolved_model": "gpt-5.6-terra"
+    }
+  ],
+  "last_event_id": 3,
+  "orchestration": {
+    "active": true,
+    "state": "running",
+    "reconciliation_state": "live",
+    "ticket_id": "TICK-150",
+    "executor_pid": 55130,
+    "executor_session": "sess-abc123",
+    "elapsed_seconds": 150,
+    "elapsed": "2m30s",
+    "log_path": ".lanegate/logs/orchestrate-20260728T101500Z.log",
+    "heartbeat_count": 3,
+    "resolved_driver": "codex-implement",
+    "resolved_executor": "codex-a",
+    "resolved_model": "gpt-5.6-terra"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "repo_root": "/home/operator/lanegate-dev",
+  "ticket_prefix": "TICK",
+  "tickets_dir": ".lanegate/tickets",
+  "worktrees_dir": ".lanegate/worktrees",
+  "executor": "claude",
+  "executor_steps": {},
+  "executors": {},
+  "models": {
+    "claude": "claude-sonnet-5"
+  },
+  "max_parallel": 2,
+  "default_milestone": "v1.6",
+  "on_rate_limit": "halt",
+  "github_pr": false,
+  "commit_status_changes": true,
+  "environments": [
+    {
+      "name": "staging",
+      "branch": "staging",
+      "from": "main",
+      "trigger": "auto",
+      "sync": "ff-only"
+    }
+  ],
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8000
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "run_id": "run-20260728T101500Z-abc12345",
+  "events": [
+    {
+      "ts": "2026-07-28T10:15:02Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "implementing",
+        "activity": "planning",
+        "ts": "2026-07-28T10:15:02Z",
+        "activity_age": 0.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra"
+      }
+    },
+    {
+      "ts": "2026-07-28T10:15:06Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "implementing",
+        "activity": "reading_file",
+        "ts": "2026-07-28T10:15:06Z",
+        "activity_age": 4.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra",
+        "tool_category": "file_read",
+        "path": "lanegate/auth.py"
+      }
+    },
+    {
+      "ts": "2026-07-28T10:15:20Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "implementing",
+        "activity": "writing_file",
+        "ts": "2026-07-28T10:15:20Z",
+        "activity_age": 18.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra",
+        "tool_category": "file_write",
+        "path": "lanegate/auth.py"
+      }
+    },
+    {
+      "ts": "2026-07-28T10:15:45Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "testing",
+        "activity": "testing",
+        "ts": "2026-07-28T10:15:45Z",
+        "activity_age": 43.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra",
+        "tool_category": "pytest",
+        "test_summary": {
+          "category": "pytest",
+          "status": "running"
+        }
+      }
+    },
+    {
+      "ts": "2026-07-28T10:16:10Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "testing",
+        "activity": "testing",
+        "ts": "2026-07-28T10:16:10Z",
+        "activity_age": 68.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra",
+        "tool_category": "pytest",
+        "test_summary": {
+          "category": "pytest",
+          "status": "pass",
+          "passed": 12,
+          "failed": 0
+        }
+      }
+    },
+    {
+      "ts": "2026-07-28T10:16:30Z",
+      "event": "executor_progress",
+      "ticket_id": "TICK-150",
+      "progress": {
+        "phase": "implementing",
+        "activity": "heartbeat",
+        "ts": "2026-07-28T10:16:30Z",
+        "activity_age": 20.0,
+        "executor": "codex-a",
+        "model": "gpt-5.6-terra"
+      }
+    }
+  ]
+}

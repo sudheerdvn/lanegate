@@ -1,0 +1,40 @@
+{
+  "id": "TICK-145",
+  "title": "Database schema migration for multi-tenant support",
+  "status": "code_complete",
+  "priority": 1,
+  "milestone": "v1.5",
+  "touches": [
+    "migrations/0042_user_schema.sql",
+    "tests/test_migrations.py"
+  ],
+  "depends_on": [],
+  "branch": "tick-145-multi-tenant",
+  "worktree": "worktrees/tick-145",
+  "body": "## Background\n\nWe need to support multiple isolated tenants in the database. This requires adding a tenant_id column to all existing tables and implementing partition-level isolation.\n\n## What\n\n- Add tenant_id UUID column to users, accounts, and transactions tables\n- Create indexes on (tenant_id, id) for efficient queries\n- Implement migration with zero-downtime approach\n- Add rollback script for emergency revert\n\n## Close Criteria\n\n- Migration succeeds on 50M+ row production-like dataset in under 2 hours\n- Zero data corruption or loss\n- Rollback tested and verified\n",
+  "close_criteria": "Migration succeeds on 50M+ row production-like dataset in under 2 hours; zero data corruption or loss; rollback tested and verified",
+  "review_verdict": "changes_requested",
+  "review_summary": "Significant concerns about zero-downtime approach and missing rollback testing. Please revise.",
+  "lifecycle_events": [
+    {
+      "at": "2026-07-31T22:00:00Z",
+      "event": "implementation_started",
+      "from_status": "open",
+      "to_status": "in_progress",
+      "summary": "worktree claimed for implementation"
+    },
+    {
+      "at": "2026-07-31T22:10:00Z",
+      "event": "review_verdict",
+      "from_status": "code_complete",
+      "to_status": "code_complete",
+      "summary": "review verdict: changes_requested"
+    }
+  ],
+  "review_findings": [
+    "Migration lacks downtime strategy; need zero-downtime approach using online schema migration tools like online_alter",
+    "Missing rollback testing - unclear if rollback can succeed after partial migration",
+    "Performance on large datasets: need estimated time on test dataset with 100M rows",
+    "Documentation missing for operational runbook"
+  ]
+}

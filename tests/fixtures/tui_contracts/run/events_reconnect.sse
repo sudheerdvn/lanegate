@@ -1,0 +1,24 @@
+id: 1
+event: log
+data: {"id": "1", "type": "log", "timestamp": "2026-07-28T10:15:01Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] starting TICK-150", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+
+id: 2
+event: log
+data: {"id": "2", "type": "log", "timestamp": "2026-07-28T10:15:05Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] running pytest tests/test_auth.py", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+
+id: 3
+event: log
+data: {"id": "3", "type": "log", "timestamp": "2026-07-28T10:15:12Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] tests passed", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+
+id: 4
+event: log
+data: {"id": "4", "type": "log", "timestamp": "2026-07-28T10:16:40Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] lanegate complete TICK-150", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+
+id: 5
+event: log
+data: {"id": "5", "type": "log", "timestamp": "2026-07-28T10:16:55Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] review verdict: approved", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+
+id: 6
+event: log
+data: {"id": "6", "type": "log", "timestamp": "2026-07-28T10:17:10Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "[orchestrate] merged TICK-150", "data": {"path": ".lanegate/logs/orchestrate-20260728T101500Z.log"}}
+

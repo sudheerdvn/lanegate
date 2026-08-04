@@ -1,0 +1,104 @@
+{
+  "tickets": {
+    "open": [
+      {
+        "id": "TICK-150",
+        "title": "Implement auth middleware refactor",
+        "status": "open",
+        "priority": 1,
+        "milestone": "v1.6",
+        "touches": [
+          "src/middleware/auth.py",
+          "tests/test_auth.py"
+        ],
+        "depends_on": [],
+        "branch": "tick-150-auth-refactor",
+        "worktree": "worktrees/tick-150"
+      },
+      {
+        "id": "TICK-151",
+        "title": "Add rate limiting to the API",
+        "status": "open",
+        "priority": 2,
+        "milestone": "v1.6",
+        "touches": [
+          "src/api/middleware.py",
+          "tests/test_api.py"
+        ],
+        "depends_on": ["TICK-150"],
+        "branch": "tick-151-rate-limit",
+        "worktree": "worktrees/tick-151"
+      }
+    ],
+    "in_progress": [
+      {
+        "id": "TICK-149",
+        "title": "Database connection pooling",
+        "status": "in_progress",
+        "priority": 1,
+        "milestone": "v1.5",
+        "touches": [
+          "src/db/pool.py"
+        ],
+        "depends_on": [],
+        "branch": "tick-149-pool",
+        "worktree": "worktrees/tick-149"
+      }
+    ],
+    "code_complete": [
+      {
+        "id": "TICK-148",
+        "title": "CLI command for status reporting",
+        "status": "code_complete",
+        "priority": 2,
+        "milestone": "v1.5",
+        "touches": [
+          "lanegate/cli.py",
+          "lanegate/stats.py"
+        ],
+        "depends_on": [],
+        "review_verdict": "approved"
+      }
+    ],
+    "in_review": [
+      {
+        "id": "TICK-147",
+        "title": "Add comprehensive logging to orchestrate",
+        "status": "in_review",
+        "priority": 2,
+        "milestone": "v1.5",
+        "touches": [
+          "lanegate/orchestrate.py"
+        ],
+        "depends_on": [],
+        "review_verdict": null
+      }
+    ],
+    "merged": [
+      {
+        "id": "TICK-146",
+        "title": "Python API for board/tickets/diff endpoints",
+        "status": "merged",
+        "priority": 1,
+        "milestone": "v1.5",
+        "touches": [
+          "lanegate/api.py"
+        ],
+        "depends_on": []
+      }
+    ]
+  },
+  "pipeline": [
+    {
+      "env": "staging",
+      "base": "main",
+      "head": "staging",
+      "trigger": "auto",
+      "pending_count": 2,
+      "commits": [
+        "abc1234 TICK-146 API endpoints",
+        "def5678 TICK-147 logging"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "pools": [
+    {
+      "name": "default",
+      "strategy": "least-loaded",
+      "executors": ["claude-1", "claude-2"],
+      "dispatch_counts": {
+        "claude-1": 4,
+        "claude-2": 1
+      },
+      "rr_index": 0,
+      "default": true
+    },
+    {
+      "name": "local",
+      "strategy": "round-robin",
+      "executors": ["ollama-a", "ollama-b", "ollama-c"],
+      "dispatch_counts": {
+        "ollama-a": 2,
+        "ollama-b": 2,
+        "ollama-c": 1
+      },
+      "rr_index": 2,
+      "default": false
+    }
+  ]
+}

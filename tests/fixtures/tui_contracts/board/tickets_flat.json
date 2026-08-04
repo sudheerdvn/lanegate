@@ -1,0 +1,63 @@
+{
+  "tickets": [
+    {
+      "id": "TICK-150",
+      "title": "Implement auth middleware refactor",
+      "status": "open",
+      "priority": 1,
+      "milestone": "v1.6",
+      "touches": [
+        "src/middleware/auth.py",
+        "tests/test_auth.py"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "TICK-149",
+      "title": "Database connection pooling",
+      "status": "in_progress",
+      "priority": 1,
+      "milestone": "v1.5",
+      "touches": [
+        "src/db/pool.py"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "TICK-148",
+      "title": "CLI command for status reporting",
+      "status": "code_complete",
+      "priority": 2,
+      "milestone": "v1.5",
+      "touches": [
+        "lanegate/cli.py",
+        "lanegate/stats.py"
+      ],
+      "depends_on": [],
+      "review_verdict": "approved"
+    },
+    {
+      "id": "TICK-147",
+      "title": "Add comprehensive logging to orchestrate",
+      "status": "in_review",
+      "priority": 2,
+      "milestone": "v1.5",
+      "touches": [
+        "lanegate/orchestrate.py"
+      ],
+      "depends_on": [],
+      "review_verdict": null
+    },
+    {
+      "id": "TICK-146",
+      "title": "Python API for board/tickets/diff endpoints",
+      "status": "merged",
+      "priority": 1,
+      "milestone": "v1.5",
+      "touches": [
+        "lanegate/api.py"
+      ],
+      "depends_on": []
+    }
+  ]
+}

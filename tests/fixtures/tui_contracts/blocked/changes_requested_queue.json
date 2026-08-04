@@ -1,0 +1,16 @@
+{
+  "blocked": [
+    {
+      "id": "TICK-145",
+      "title": "Database schema migration for multi-tenant support",
+      "branch": "tick-145-multi-tenant",
+      "diff_cmd": "git diff main...tick-145-multi-tenant",
+      "priority": 1,
+      "milestone": "v1.5",
+      "findings": [
+        "Migration lacks downtime strategy; need zero-downtime approach",
+        "Missing rollback testing"
+      ]
+    }
+  ]
+}

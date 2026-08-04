@@ -1,0 +1,19 @@
+{
+  "id": "TICK-150",
+  "ticket_id": "TICK-150",
+  "branch": "tick-150-auth-refactor",
+  "base": "main",
+  "stat": " src/middleware/auth.py | 12 +++++++-----\n 1 file changed, 7 insertions(+), 5 deletions(-)\n",
+  "files": [
+    {
+      "path": "src/middleware/auth.py",
+      "status": "M",
+      "patch": "--- a/src/middleware/auth.py\n+++ b/src/middleware/auth.py\n@@ -10,7 +10,9 @@ class AuthHandler:\n-    def check(self, token):\n-        return self.validator.valid(token)\n+    def check(self, token, *, rotate=False):\n+        if rotate:\n+            token = self.validator.rotate(token)\n+        return self.validator.valid(token)\n",
+      "truncated": false
+    }
+  ],
+  "diff": "--- a/src/middleware/auth.py\n+++ b/src/middleware/auth.py\n@@ -10,7 +10,9 @@ class AuthHandler:\n-    def check(self, token):\n-        return self.validator.valid(token)\n+    def check(self, token, *, rotate=False):\n+        if rotate:\n+            token = self.validator.rotate(token)\n+        return self.validator.valid(token)\n",
+  "truncated": false,
+  "max_patch_chars": 20000,
+  "error": null
+}

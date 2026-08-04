@@ -1,0 +1,19 @@
+{
+  "id": "TICK-152",
+  "ticket_id": "TICK-152",
+  "branch": "tick-152-bulk-migration",
+  "base": "main",
+  "stat": " migrations/0042_bulk_backfill.sql | 4000 ++++++++++++++++++++++++++++++++++\n 1 file changed, 4000 insertions(+)\n",
+  "files": [
+    {
+      "path": "migrations/0042_bulk_backfill.sql",
+      "status": "A",
+      "patch": "--- /dev/null\n+++ b/migrations/0042_bulk_backfill.sql\n@@ -0,0 +1,4000 @@\n+-- generated backfill statements\n+UPDATE users SET migrated = true WHERE id = 1;\n+UPDATE users SET migrated = true WHERE id = 2;\n+UPDATE users SET migrated = true WHERE id = 3;\n... [truncated]\n",
+      "truncated": true
+    }
+  ],
+  "diff": "--- /dev/null\n+++ b/migrations/0042_bulk_backfill.sql\n@@ -0,0 +1,4000 @@\n+-- generated backfill statements\n+UPDATE users SET migrated = true WHERE id = 1;\n+UPDATE users SET migrated = true WHERE id = 2;\n+UPDATE users SET migrated = true WHERE id = 3;\n... [truncated]\n",
+  "truncated": true,
+  "max_patch_chars": 200,
+  "error": null
+}

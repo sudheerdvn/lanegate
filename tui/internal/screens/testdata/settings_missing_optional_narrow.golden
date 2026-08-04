@@ -1,0 +1,14 @@
+Repository
+Root:        /home/operator/lanegate-dev
+Tickets dir: .lanegate/tickets
+Worktrees:   .lanegate/worktrees
+Prefix:      TICK
+
+Execution
+Executor:      claude
+Max parallel:  2
+On rate limit: halt
+GitHub PR:     false
+Commit status: false
+
+API: 127.0.0.1:8000

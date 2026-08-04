@@ -1,0 +1,19 @@
+{
+  "id": "TICK-150",
+  "title": "Implement auth middleware refactor",
+  "status": "open",
+  "priority": 1,
+  "milestone": "v1.6",
+  "touches": [
+    "src/middleware/auth.py",
+    "tests/test_auth.py"
+  ],
+  "depends_on": [],
+  "branch": "tick-150-auth-refactor",
+  "worktree": "worktrees/tick-150",
+  "body": "## Background\n\nThe current auth middleware has grown organically and now contains both authentication and authorization logic in a monolithic file. This makes it difficult to test individual concerns and extend with new auth methods.\n\n## What\n\n- Separate concerns: AuthHandler, TokenValidator, PermissionChecker\n- Add support for JWT tokens with rotation\n- Implement cache layer for permission checks\n- Update all integration tests\n\n## Close Criteria\n\n- All tests pass with 100% coverage of new modules\n- Existing auth behavior is preserved\n- No performance regression\n",
+  "close_criteria": "All tests pass with 100% coverage of new modules; existing auth behavior is preserved; no performance regression",
+  "review_verdict": null,
+  "review_summary": null,
+  "review_findings": []
+}

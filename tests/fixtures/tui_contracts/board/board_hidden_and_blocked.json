@@ -1,0 +1,36 @@
+{
+  "tickets": {
+    "backlog": [
+      {
+        "id": "TICK-152",
+        "title": "Future feature for v2.0 roadmap",
+        "status": "backlog",
+        "priority": 3,
+        "milestone": "v2.0",
+        "touches": [],
+        "depends_on": [],
+        "branch": "tick-152-future",
+        "worktree": null
+      }
+    ],
+    "code_complete": [
+      {
+        "id": "TICK-145",
+        "title": "Blocked: database schema migration",
+        "status": "code_complete",
+        "priority": 1,
+        "milestone": "v1.5",
+        "touches": [
+          "migrations/0042_user_schema.sql"
+        ],
+        "depends_on": [],
+        "review_verdict": "changes_requested",
+        "review_findings": [
+          "Migration lacks downtime strategy; need zero-downtime approach",
+          "Missing rollback testing"
+        ]
+      }
+    ]
+  },
+  "pipeline": []
+}
