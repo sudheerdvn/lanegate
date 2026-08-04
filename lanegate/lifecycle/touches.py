@@ -25,7 +25,7 @@ def _get_touched_files(
     r = subprocess.run(
         ["git", "diff", "--name-only", f"{_trunk_branch(worktree_path, trunk_branch)}...{branch}"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=worktree_path,
     )
     if r.returncode != 0:
@@ -43,7 +43,7 @@ def _get_branch_wall_time_ms(worktree_path: Path, trunk_branch: str | None = Non
     r = subprocess.run(
         ["git", "log", "--format=%ct", f"{_trunk_branch(worktree_path, trunk_branch)}..HEAD"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=worktree_path,
     )
     if r.returncode != 0:
@@ -70,7 +70,7 @@ def _has_committed_changes(wt_path: Path) -> bool:
     r = subprocess.run(
         ["git", "diff", f"{_trunk_branch(wt_path)}...HEAD", "--name-only"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=wt_path,
     )
     if r.returncode != 0:
@@ -86,7 +86,7 @@ def _get_changed_files(wt_path: Path) -> set[str]:
     r = subprocess.run(
         ["git", "diff", f"{_trunk_branch(wt_path)}...HEAD", "--name-only"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=wt_path,
     )
     if r.returncode == 0:
@@ -96,7 +96,7 @@ def _get_changed_files(wt_path: Path) -> set[str]:
     r2 = subprocess.run(
         ["git", "diff", "HEAD", "--name-only"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=wt_path,
     )
     if r2.returncode == 0:

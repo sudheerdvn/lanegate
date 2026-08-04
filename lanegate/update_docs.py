@@ -35,7 +35,7 @@ def get_doc_watermark(
         cmd,
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode == 0:
         sha = result.stdout.strip()
@@ -60,7 +60,7 @@ def _is_ticket_newer_than_watermark(
             ["git", "log", "-1", "--format=%H", f"{watermark}..HEAD", "--", rel_path],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         if res.returncode == 0 and res.stdout.strip():
             return True
@@ -71,7 +71,7 @@ def _is_ticket_newer_than_watermark(
             ["git", "log", "-1", "--format=%H", "-i", f"--grep={tid}", f"{watermark}..HEAD"],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         if res.returncode == 0 and res.stdout.strip():
             return True
@@ -82,7 +82,7 @@ def _is_ticket_newer_than_watermark(
                 ["git", "log", "-1", "--format=%H", "-i", f"--grep={b}", f"{watermark}..HEAD"],
                 cwd=repo_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
             if res.returncode == 0 and res.stdout.strip():
                 return True
@@ -230,7 +230,7 @@ def cmd_update_docs(
             cwd=repo_root,
             env=executor_env,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         if res.returncode != 0:
             err = res.stderr or res.stdout
@@ -243,13 +243,13 @@ def cmd_update_docs(
             ["git", "diff", "--name-only", "--", p],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         status_check = subprocess.run(
             ["git", "status", "--porcelain", "--", p],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         if (diff.returncode == 0 and diff.stdout.strip()) or (status_check.returncode == 0 and status_check.stdout.strip()):
             modified_docs.append(p)
@@ -273,7 +273,7 @@ def cmd_update_docs(
         ["git", "commit", "-m", commit_msg],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if commit_res.returncode != 0:
         err = commit_res.stderr or commit_res.stdout

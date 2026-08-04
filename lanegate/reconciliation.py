@@ -45,7 +45,7 @@ def branch_reachable_from_main(
         ["git", "rev-parse", "--verify", "--quiet", branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if exists.returncode != 0:
         return None
@@ -61,7 +61,7 @@ def branch_reachable_from_main(
         ["git", "reflog", "show", "--format=%H%x00%gs", branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if reflog.returncode != 0:
         return None
@@ -86,7 +86,7 @@ def branch_reachable_from_main(
         ["git", "rev-list", "--count", f"{base}..{branch}"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     try:
         commit_count = int(ahead.stdout.strip())
@@ -99,7 +99,7 @@ def branch_reachable_from_main(
         ["git", "rev-parse", trunk_branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if main_tip.returncode != 0:
         return None
@@ -118,7 +118,7 @@ def branch_reachable_from_main(
         ["git", "rev-parse", branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if branch_tip.returncode != 0:
         return None
@@ -129,7 +129,7 @@ def branch_reachable_from_main(
         ["git", "merge-base", "--is-ancestor", branch, trunk_branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if ancestor.returncode != 0:
         return None

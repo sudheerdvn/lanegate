@@ -1,4 +1,4 @@
-# LaneGate — Architecture Reference
+# LaneGate, Architecture Reference
 
 > This document describes **built reality** plus settled design decisions.
 > Keep this file updated as new decisions are settled.
@@ -50,37 +50,17 @@
 
 ## 2. V1.5 Interface Boundaries
 
-LaneGate remains the local-first orchestration control plane, not a code-writing
-worker. The Python core owns tickets, locks, lifecycle transitions,
-orchestration decisions, prompts, executor routing, review gates, analytics,
-memory, MCP, and the CLI. The local API (`lanegate api`, built in TICK-146 against
-the TICK-107 design) exposes a subset of those core operations as structured
-JSON/SSE — board, tickets, diff, orchestration-run start/stop/status/logs —
-for a still-unbuilt UI add-on; the UI must not scrape terminal tables or prose
-CLI output. Per-ticket lifecycle endpoints and a few read endpoints from the
-original design remain unimplemented — see
-[V1.5 Interface Boundaries](v2-interface-boundaries.md) for the built-vs-design
-gap. A Rust runner remains optional and is only justified for
-security-sensitive process supervision or sandbox enforcement, not as a
-default rewrite of the Python control plane.
+LaneGate remains the local-first orchestration control plane, not a code-writing worker. The Python core owns tickets, locks, lifecycle transitions, orchestration decisions, prompts, executor routing, review gates, analytics, memory, MCP, and the CLI. The local API (`lanegate api`, built in TICK-146 against the TICK-107 design) exposes a subset of those core operations as structured JSON/SSE: board, tickets, diff, and orchestration-run start/stop/status/logs. It exists for a still-unbuilt UI add-on, and that UI must not scrape terminal tables or prose CLI output. Per-ticket lifecycle endpoints and a few read endpoints from the original design remain unimplemented. See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the built-vs-design gap. A Rust runner remains optional, and it's only justified for security-sensitive process supervision or sandbox enforcement, not as a default rewrite of the Python control plane.
 
-See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the full layer
-decision and the rule that older V2 implementation tickets must declare their
-target layer before work begins.
+See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the full layer decision and the rule that older V2 implementation tickets must declare their target layer before work begins.
 
-The same boundary applies to spec-driven development tools: LaneGate can consume
-and export spec artifacts, but it is not a spec-authoring IDE replacement. It
-keeps tickets, locks, worktrees, review gates, executor routing, and merge
-state as LaneGate-owned execution concerns while imported spec prose remains
-untrusted ticket context for executors. See
-[Spec Compatibility Boundary](spec-compatibility.md) for the product boundary,
-field mapping, trust model, and validation rules.
+The same boundary applies to spec-driven development tools: LaneGate can consume and export spec artifacts, but it is not a spec-authoring IDE replacement. It keeps tickets, locks, worktrees, review gates, executor routing, and merge state as LaneGate-owned execution concerns, while imported spec prose remains untrusted ticket context for executors. See [Spec Compatibility Boundary](spec-compatibility.md) for the product boundary, field mapping, trust model, and validation rules.
 
 ---
 
 ## 3. Code vs LLM Boundary
 
-**Principle:** LLM at three judgment nodes only. Every coordination and delivery step is deterministic code — you cannot have a flaky model decide whether a lock conflicts or a merge is safe.
+**Principle:** LLM judgment happens at exactly three nodes. Every coordination and delivery step past that is deterministic code, because a flaky model should never be the one deciding whether a lock conflicts or a merge is safe.
 
 | Step | Who | Notes |
 |---|---|---|
@@ -91,7 +71,7 @@ field mapping, trust model, and validation rules.
 | `claim-file` | **Code** | Lock check + extend: is file already locked? If no → add to touches, commit. |
 | implementation | **LLM** (configured executor) | Agent reads `touches`, plans, edits, tests. LaneGate scopes and gates it through `orchestrate`. |
 | `complete` | **Code** | Drift check (`git diff` vs touches) + status advance. |
-| `review` | **Code or LLM** | CLI records a review verdict; `orchestrate` can invoke a separate review executor in split mode or require the combined executor to call `lanegate review --verdict ...`. |
+| `review` | **Code or LLM** | CLI records a review verdict. `orchestrate` can invoke a separate review executor in split mode, or require the combined executor to call `lanegate review --verdict ...`. |
 | conflict resolution | **LLM / human** | Only triggered when drift breaks the no-conflict invariant. Lock exists so this rarely happens. |
 | `merge` | **Code** | `git merge --no-ff`. On conflict: `git merge --abort` + stay in `in_review`. |
 | `promote` / `flag` | **Code** | git ops, JSON flag files. |
@@ -158,15 +138,15 @@ LaneGate embeds no agent. The `executor` field in `.lanegate.yml` selects the pa
 | `executor` value | Strategy | Surface | Context model |
 |---|---|---|---|
 | `claude` / `claude-process` | **Process-per-ticket** (subprocess pool) | `-p <prompt>` argv | Each OS process is a fresh Claude Code session in the ticket's worktree |
-| `claude-subagent` | **In-session subagents** (Task tool) | `-p <prompt>` argv | Parent holds board + loop state; each subagent sees only its spec + `touches`, discarded on completion; `.session` marker file tracks continuity |
-| `aider` / `codex` / `ollama` | **Process-per-ticket** (subprocess pool) | executor-specific argv | Each OS process gets a fresh agent in the ticket's worktree; N run concurrently, capped at a pool limit |
+| `claude-subagent` | **In-session subagents** (Task tool) | `-p <prompt>` argv | Parent holds board + loop state. Each subagent sees only its spec + `touches` and is discarded on completion. A `.session` marker file tracks continuity |
+| `aider` / `codex` / `ollama` | **Process-per-ticket** (subprocess pool) | executor-specific argv | Each OS process gets a fresh agent in the ticket's worktree. N run concurrently, capped at a pool limit |
 | manual human handoff | Manual | CLI | Sequential or as-available outside `orchestrate` |
 
-Both concurrent strategies are **equally context-bounded** — each ticket gets a fresh agent seeing only its spec + `touches`. The file-level lock reduces overlapping edits, but it is not semantic dependency analysis. What `claude`/subagent wins over processes: unified auth boundary and no process management. What `process-per-ticket` wins: full agent-agnosticism.
+Both concurrent strategies are **equally context-bounded**: each ticket gets a fresh agent seeing only its spec + `touches`. The file-level lock reduces overlapping edits, but it is not semantic dependency analysis. The `claude`/subagent approach wins on unified auth boundary and no process management. `process-per-ticket` wins on full agent-agnosticism.
 
 Compact orchestrate runs keep terminal progress high-level while writing full executor output to `.lanegate/logs`.
 
-**The file-based touches lock is the foundation of agent-agnostic parallelism** — not a special case for Claude.
+**The file-based touches lock is the foundation of agent-agnostic parallelism.** It is not a special case for Claude.
 
 ---
 
@@ -177,15 +157,15 @@ Ticket status:   draft   open   in_progress   code_complete   in_review   merged
 Lock held?:       no      no        YES             YES            YES        no        no        no
 ```
 
-Side-states (not part of main flow, no lock held): `hibernated`, `needs_review`, `blocked`, `backlog`, `deferred`, `failed`, `closed` (set by `lanegate supersede` — a ticket whose work already exists elsewhere).
+Side-states (not part of main flow, no lock held): `hibernated`, `needs_review`, `blocked`, `backlog`, `deferred`, `failed`, `closed` (set by `lanegate supersede`, for a ticket whose work already exists elsewhere).
 
 Three guards enforce the lock:
 
-1. `create` writes `touches: []` — a draft has no lock; `next` skips it.
-2. `start` **refuses empty `touches`** — backstop against starting an un-analyzed ticket.
-3. `complete` **warns on drift** — compares actual changed files against declared `touches`.
+1. `create` writes `touches: []`. A draft has no lock, so `next` skips it.
+2. `start` **refuses empty `touches`**, as a backstop against starting an un-analyzed ticket.
+3. `complete` **warns on drift** by comparing actual changed files against declared `touches`.
 
-Dynamic expansion: `claim-file <file> <ticket>` lets an agent extend touches mid-session if the file is free. Hard-stops on conflict.
+Dynamic expansion: `claim-file <file> <ticket>` lets an agent extend touches mid-session if the file is free, and hard-stops on conflict.
 
 TOCTOU safety: `start` re-reads the ticket from disk inside the lock window before writing the new status. Two racing processes cannot both win.
 
@@ -193,7 +173,7 @@ TOCTOU safety: `start` re-reads the ticket from disk inside the lock window befo
 
 ## 7. Ticket Storage Model
 
-Source of truth: `<tickets_dir>/TICK-NNN.md` — YAML frontmatter + free-form markdown body. The default `tickets_dir` is `.lanegate/tickets`; projects can opt into git-tracked `tickets/`.
+Source of truth: `<tickets_dir>/TICK-NNN.md`, YAML frontmatter plus free-form markdown body. The default `tickets_dir` is `.lanegate/tickets`, and projects can opt into git-tracked `tickets/`.
 
 ```
 ---
@@ -213,12 +193,12 @@ Body prose: intent, notes, implementation hints.
 ```
 
 **Why markdown + YAML frontmatter (not JSON/DB):**
-- Status commits are `git commit` — cross-clone safety is `git fetch` + divergence detection
+- Status commits are `git commit`. Cross-clone safety comes from `git fetch` plus divergence detection
 - Free-form body is a feature: analysis and implementation models need prose context
 - Ticket files can be PR-reviewed, diffed, merged by git
-- Frontmatter is structured (schema-validated on load); body is expressive
+- Frontmatter is structured (schema-validated on load), while the body stays expressive
 
-Schema validation (`validate_ticket(meta) → [errors]`) enforces required keys, types, and enums on load. This is a function over plain dicts, not a class — preserves the "config is a dict" philosophy.
+Schema validation (`validate_ticket(meta) → [errors]`) enforces required keys, types, and enums on load. It's a function over plain dicts, not a class, which preserves the "config is a dict" philosophy.
 
 ---
 
@@ -248,5 +228,5 @@ Review policy (governs human touchpoints only):
 | `human_review: final` | One human pass at end of batch |
 | `human_review: per_ticket` with `reviewer: human` | Stop after each ticket for a human verdict |
 | `human_review: none` (Python/CLI default when neither `--human-review` nor `default_human_review` is set) | No human gate |
-| `default_human_review` (`.lanegate.yml`) | Project-wide fallback for `human_review` used only when `--human-review` isn't passed explicitly on the CLI; an explicit CLI flag (including `none`) always overrides it. See [config-reference.md](config-reference.md#default_human_review). |
-| `autonomy` (TICK-348) | On `changes_requested`, fix → drift-check → re-review **always runs**, regardless of `autonomy` — `autonomy` no longer gates whether the fix happens, only what happens to its result. `autonomy: full` proceeds straight to merge on re-review approval (unattended, unchanged from before). `autonomy: supervised` (default) and `autonomy: manual` both land the ticket at `in_review` awaiting an explicit human verdict instead of auto-merging. A drift-check failure (the fix diverges from the ticket's intent) or an exhausted `max_auto_fix_attempts` budget still escalates to a human in every mode — this gate is never bypassed. `lanegate fix TICK-NNN` runs this same cycle out-of-band, e.g. after a human ran `lanegate review` directly. |
+| `default_human_review` (`.lanegate.yml`) | Project-wide fallback for `human_review`, used only when `--human-review` isn't passed explicitly on the CLI. An explicit CLI flag (including `none`) always overrides it. See [config-reference.md](config-reference.md#default_human_review). |
+| `autonomy` (TICK-348) | On `changes_requested`, fix → drift-check → re-review **always runs**, regardless of `autonomy`. `autonomy` no longer gates whether the fix happens, only what happens to its result. `autonomy: full` proceeds straight to merge on re-review approval (unattended, unchanged from before). `autonomy: supervised` (default) and `autonomy: manual` both land the ticket at `in_review` awaiting an explicit human verdict instead of auto-merging. A drift-check failure (the fix diverges from the ticket's intent), or an exhausted `max_auto_fix_attempts` budget, still escalates to a human in every mode: this gate is never bypassed. `lanegate fix TICK-NNN` runs this same cycle out-of-band, e.g. after a human ran `lanegate review` directly. |

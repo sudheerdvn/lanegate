@@ -1260,6 +1260,7 @@ def test_get_touched_files_returns_list_from_git(tmp_path: Path) -> None:
         ["git", "diff", "--name-only", "main...tick-083"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=tmp_path,
     )
     assert files == ["lanegate/lifecycle.py", "lanegate/context_log.py", "tests/test_context_log.py"]

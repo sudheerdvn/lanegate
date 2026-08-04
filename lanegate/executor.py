@@ -844,7 +844,7 @@ def _repo_tracked_files(worktree_path: Path | None) -> list[str]:
             ["git", "ls-files"],
             cwd=root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):

@@ -208,7 +208,7 @@ def resolve_trunk_branch(cfg: dict, repo_root: Path) -> str:
             ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
     except OSError:
         return "main"

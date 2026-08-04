@@ -863,7 +863,7 @@ def _git_head_sha(worktree_path: Path) -> str | None:
         ["git", "rev-parse", "HEAD"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         return None

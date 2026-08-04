@@ -205,7 +205,7 @@ def _run_git_snapshot(worktree_path: Path, args: list[str]) -> str:
             ["git"] + args,
             cwd=str(worktree_path),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=30,
         )
     except Exception as exc:

@@ -1,8 +1,8 @@
 # Demo Walkthrough: Idea to Parallel Worktrees to Review
 
-This walkthrough shows LaneGate's core flow on a toy Python calculator project. It is self-contained — no private project context required. The only prerequisites are Python 3.11+, git, and LaneGate installed (see the README for the install command).
+This walkthrough shows LaneGate's core flow on a toy Python calculator project. It's self-contained, so you don't need any private project context. The only prerequisites are Python 3.11+, git, and LaneGate installed (see the README for the install command).
 
-> This is a preview build. Treat the workflow as working but evolving — V1 is not sandboxed at the OS level. See [Security Status](../README.md#security-status) before running agents on repositories you care about.
+> This is a preview build. The workflow works, but it's still evolving, and V1 is not sandboxed at the OS level. See [Security Status](../README.md#security-status) before running agents on repositories you care about.
 
 ---
 
@@ -42,7 +42,7 @@ Initialize LaneGate inside the project:
 lanegate init
 ```
 
-This scaffolds `.lanegate/` (tickets directory, worktrees directory) and drops a `.lanegate.yml` config file at the repo root. You can open `.lanegate.yml` to set your preferred executor, or leave the defaults for now — the dry-run path in step 5 works without any executor configured.
+This scaffolds `.lanegate/` (tickets directory, worktrees directory) and drops a `.lanegate.yml` config file at the repo root. You can open `.lanegate.yml` to set your preferred executor, or leave the defaults for now. The dry-run path in step 5 works without any executor configured.
 
 For this toy project, add a small safeguard so `complete` and `merge` are blocked if the tests fail:
 
@@ -81,7 +81,7 @@ lanegate open TICK-001          # touches already set — no new model call need
 # or: lanegate analyze TICK-001  # run analysis again and open the ticket
 ```
 
-If you want to skip analysis entirely and populate the ticket manually, pass `--no-analyze`. The ticket file is plain Markdown with YAML frontmatter — you can edit it directly.
+If you want to skip analysis entirely and populate the ticket manually, pass `--no-analyze`. The ticket file is plain Markdown with YAML frontmatter, so you can edit it directly.
 
 ---
 
@@ -135,7 +135,7 @@ The concurrency model is simple: LaneGate holds a per-file lock from `in_progres
 
 ---
 
-## 5. Run orchestration — dry run first
+## 5. Run orchestration (dry run first)
 
 Use `--dry-run` to see what LaneGate would do without touching any files or invoking any executor. This works even if you have no executor (Claude Code, aider, Codex, Ollama) configured.
 
@@ -154,7 +154,7 @@ lanegate orchestrate --dry-run --human-review final
 [dry-run] would run review for TICK-002
 ```
 
-When you have an executor configured, drop `--dry-run` and LaneGate drives the full loop: claim tickets, spawn worktrees, dispatch the executor, wait for completion, and route to review. The `--human-review final` flag tells LaneGate to pause after all implementations are done and wait for you to inspect diffs before any merge — this is not shown in the dry-run output, but takes effect in a live run.
+When you have an executor configured, drop `--dry-run` and LaneGate drives the full loop: claim tickets, spawn worktrees, dispatch the executor, wait for completion, and route to review. The `--human-review final` flag tells LaneGate to pause after all implementations are done and wait for you to inspect diffs before any merge. The dry-run output above doesn't show this, but it takes effect in a live run.
 
 ---
 
@@ -172,7 +172,7 @@ Started TICK-001
   branch:   tick-001
 ```
 
-The worktree is a standard git worktree on branch `tick-001`. Any work the agent (or you) commits there is isolated from `main`. You can open a second terminal and work in both worktrees simultaneously — neither sees the other's uncommitted changes.
+The worktree is a standard git worktree on branch `tick-001`. Any work the agent (or you) commits there is isolated from `main`. You can open a second terminal and work in both worktrees at the same time. Neither one sees the other's uncommitted changes.
 
 ```bash
 ls .lanegate/worktrees/
@@ -186,14 +186,7 @@ lanegate complete TICK-001
 lanegate review TICK-001
 ```
 
-`lanegate review` normally runs the configured review agent and records its
-verdict, so it can take time, consume model tokens, and requires that executor
-to be installed. It is not merely a state transition. If the project configures
-`reviewer: human`, `none`, or `auto-none`, it instead moves the ticket to
-`in_review` without a verdict; inspect the diff and explicitly record the
-human decision with `lanegate review TICK-001 --verdict approved` (or
-`changes_requested`). `--verdict` records a direct human decision; do not use
-it to skip a configured reviewer that would otherwise run.
+`lanegate review` normally runs the configured review agent and records its verdict, so it isn't merely a state transition: it can take time, consume model tokens, and requires that executor to be installed. If the project configures `reviewer: human`, `none`, or `auto-none`, it instead moves the ticket to `in_review` without a verdict. In that case, inspect the diff yourself and record the human decision explicitly with `lanegate review TICK-001 --verdict approved` (or `changes_requested`). Use `--verdict` to record a direct human decision, not to skip a configured reviewer that would otherwise run.
 
 Inspect the diff at any point:
 
@@ -205,9 +198,7 @@ git -C .lanegate/worktrees/tick-001 diff main...tick-001
 
 ## 7. Review and merge
 
-Merge only after the configured reviewer has approved, or after a human has
-recorded an explicit approved verdict. A `changes_requested` verdict is not
-mergeable: address the findings and review again.
+Merge only after the configured reviewer has approved, or after a human has recorded an explicit approved verdict. A `changes_requested` verdict is not mergeable: address the findings and review again.
 
 ```bash
 lanegate merge TICK-001

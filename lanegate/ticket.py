@@ -859,7 +859,7 @@ def _run_git(repo_root: Path, args: list[str]) -> subprocess.CompletedProcess[st
     return subprocess.run(
         ["git", *args],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=repo_root,
     )
 

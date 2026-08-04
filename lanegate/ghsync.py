@@ -39,7 +39,7 @@ def _find_issue(ticket_id: str, repo_root: Path) -> dict | None:
             "20",
         ],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=repo_root,
     )
     if r.returncode != 0:
@@ -88,7 +88,7 @@ def cmd_gh_sync(cfg: dict, repo_root: Path, *, dry_run: bool = False) -> None:
             r = subprocess.run(
                 ["gh", "issue", "create", "--title", title, "--body", body],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             )
             if r.returncode == 0:
@@ -109,7 +109,7 @@ def cmd_gh_sync(cfg: dict, repo_root: Path, *, dry_run: bool = False) -> None:
             subprocess.run(
                 ["gh", "issue", "edit", str(number), "--title", title, "--body", body],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             )
             # Close if terminal

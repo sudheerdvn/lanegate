@@ -454,7 +454,7 @@ def _call_model(
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         env=executor_env,
         **({"input": prompt} if use_stdin else {}),
     )
@@ -813,7 +813,7 @@ def _ripgrep_seed(intent: str, repo_root: Path) -> str:
             r = subprocess.run(
                 _ripgrep_cmd(word),
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             )
         except FileNotFoundError:
@@ -840,7 +840,7 @@ def _repo_structure(repo_root: Path) -> str:
     r = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=repo_root,
     )
     if r.returncode != 0:
@@ -1586,13 +1586,13 @@ def _worktree_diff_text(
     on its own branch, or git fails for any reason."""
     trunk_branch = trunk_branch or resolve_trunk_branch(load_config(repo_root), repo_root)
     base = subprocess.run(
-        ["git", "merge-base", trunk_branch, "HEAD"], cwd=repo_root, capture_output=True, text=True
+        ["git", "merge-base", trunk_branch, "HEAD"], cwd=repo_root, capture_output=True, text=True, encoding="utf-8"
     )
     if base.returncode != 0:
         return ""
     merge_base = base.stdout.strip()
     diff = subprocess.run(
-        ["git", "diff", merge_base, "HEAD"], cwd=repo_root, capture_output=True, text=True
+        ["git", "diff", merge_base, "HEAD"], cwd=repo_root, capture_output=True, text=True, encoding="utf-8"
     )
     if diff.returncode != 0:
         return ""

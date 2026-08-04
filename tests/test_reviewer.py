@@ -803,6 +803,7 @@ class TestGetWorktreeDiff:
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
 
     def test_raises_review_error_when_worktree_missing(self, tmp_path):
@@ -854,6 +855,7 @@ class TestGetWorktreeDiff:
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
 
 
@@ -873,6 +875,7 @@ class TestWorktreeHasCommits:
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
 
     def test_returns_true_for_commits_ahead_of_base(self, tmp_path):
@@ -905,6 +908,7 @@ class TestGetCommitMessages:
             cwd=str(tmp_path),
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
 
     def test_returns_empty_string_on_git_failure(self, tmp_path):

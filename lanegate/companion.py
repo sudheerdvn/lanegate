@@ -63,7 +63,7 @@ def companion_branch_create(
         r = subprocess.run(
             ["git", "checkout", branch],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=wt_path,
         )
         if r.returncode != 0:
@@ -80,7 +80,7 @@ def companion_branch_create(
     r = subprocess.run(
         ["git", "worktree", "add", "-b", branch, str(wt_path), base],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=companion_root,
     )
     if r.returncode != 0:
@@ -88,7 +88,7 @@ def companion_branch_create(
         r2 = subprocess.run(
             ["git", "worktree", "add", str(wt_path), branch],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=companion_root,
         )
         if r2.returncode != 0:
@@ -135,7 +135,7 @@ def companion_branch_merge(
     check = subprocess.run(
         ["git", "rev-parse", "--verify", branch],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=companion_root,
     )
     if check.returncode != 0:
@@ -157,7 +157,7 @@ def companion_branch_merge(
     co = subprocess.run(
         ["git", "worktree", "add", "--detach", str(merge_wt_path), base],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=companion_root,
     )
     if co.returncode != 0:
@@ -172,7 +172,7 @@ def companion_branch_merge(
         r = subprocess.run(
             ["git", "merge", "--no-ff", branch, "-m", f"Merge {ticket_id}: {title}"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=merge_wt_path,
         )
         if r.returncode != 0:
@@ -185,7 +185,7 @@ def companion_branch_merge(
         merged_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=merge_wt_path,
         ).stdout.strip()
 
@@ -197,7 +197,7 @@ def companion_branch_merge(
         mv = subprocess.run(
             ["git", "update-ref", f"refs/heads/{base}", merged_sha],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=companion_root,
         )
         if mv.returncode != 0:

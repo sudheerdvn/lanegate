@@ -189,7 +189,7 @@ def _is_git_worktree(repo_root: Path) -> bool:
         ["git", "rev-parse", "--is-inside-work-tree"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     return r.returncode == 0 and r.stdout.strip() == "true"
 
@@ -207,7 +207,7 @@ def _commit_status(repo_root: Path, ticket_path: Path, ticket_id: str, to_status
             ],
             cwd=repo_root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         return r.returncode == 0
 
@@ -1491,14 +1491,14 @@ def cmd_merge(ticket_id: str, cfg: dict, repo_root: Path) -> None:
                 ],
                 cwd=repo_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
 
         _merged_into_branch = (
             subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             ).stdout.strip()
             or resolve_trunk_branch(cfg, repo_root)
@@ -1507,7 +1507,7 @@ def cmd_merge(ticket_id: str, cfg: dict, repo_root: Path) -> None:
         _pre_merge_head = None
         if branch:
             _pre_merge_head = subprocess.run(
-                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=repo_root
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", cwd=repo_root
             ).stdout.strip()
 
             r = subprocess.run(
@@ -1520,7 +1520,7 @@ def cmd_merge(ticket_id: str, cfg: dict, repo_root: Path) -> None:
                     f"Merge {tid}: {ticket.get('title', '')}",
                 ],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             )
             if r.returncode != 0:
@@ -1577,7 +1577,7 @@ def cmd_merge(ticket_id: str, cfg: dict, repo_root: Path) -> None:
                 ["git", "reset", "--hard", _pre_merge_head],
                 cwd=repo_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
             if reset.returncode != 0:
                 detail = "\n".join(s for s in (reset.stdout.strip(), reset.stderr.strip()) if s)

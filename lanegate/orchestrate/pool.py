@@ -369,7 +369,7 @@ def _invoke_ollama(prompt: str, driver_cfg: dict, worktree_path: Path) -> int:
                 payload_str,
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=300,
         )
         if result.returncode != 0:
@@ -899,7 +899,7 @@ def _committed_files(worktree_path: Path) -> set[str]:
             ["git", "diff", "--name-only", f"{trunk_branch}...HEAD"],
             cwd=str(worktree_path),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
     except OSError:
         return set()
@@ -939,7 +939,7 @@ def check_worktree_has_commits(worktree_path: Path) -> bool:
         ["git", "log", f"{trunk_branch}..HEAD", "--oneline"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         return False
@@ -968,7 +968,7 @@ def commit_worktree_changes(
         ["git", "status", "--porcelain"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if status.returncode != 0 or not status.stdout.strip():
         return False
@@ -981,7 +981,7 @@ def commit_worktree_changes(
         ["git", "add", "-A", "--", ".", ":(exclude).lanegate/**"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if add.returncode != 0:
         return False
@@ -990,7 +990,7 @@ def commit_worktree_changes(
         ["git", "diff", "--cached", "--quiet"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if staged.returncode == 0:
         return False
@@ -1001,6 +1001,6 @@ def commit_worktree_changes(
         ["git", "commit", "-m", message or f"feat: implement {ticket_id}"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     return commit.returncode == 0

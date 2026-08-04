@@ -73,7 +73,7 @@ def get_worktree_diff(worktree_path: Path, branch: str, base: str | None = None)
         ["git", "diff", f"{base}..{branch}"],
         cwd=str(worktree_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise ReviewError(
@@ -113,7 +113,7 @@ def worktree_has_commits(ticket: dict, repo_root: Path, base: str | None = None)
         ["git", "rev-list", "--count", f"{base}..{branch}"],
         cwd=str(wt_path),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         return False
@@ -138,7 +138,7 @@ def get_commit_messages(worktree_path: Path, branch: str, base: str | None = Non
             ["git", "log", f"{base}..{branch}", "--format=%B%n---"],
             cwd=str(worktree_path),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -629,7 +629,7 @@ def run_review_agent(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=300,
         )
         if result.returncode != 0:

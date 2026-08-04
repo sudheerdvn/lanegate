@@ -1,40 +1,26 @@
 # Spec Compatibility Boundary
 
-LaneGate should be compatible with external spec-driven development tools without
-becoming one of them. Its product identity is the repo-local execution control
-plane: scoped tickets, deterministic lifecycle state, file locks, worktrees,
-review gates, executor routing, and merge control.
+LaneGate should be compatible with external spec-driven development tools without becoming one of them. Its product identity is the repo-local execution control plane: scoped tickets, deterministic lifecycle state, file locks, worktrees, review gates, executor routing, and merge control.
 
-External spec tools can shape the work. LaneGate turns that work into executable
-units and records what happened.
+External spec tools can shape the work. LaneGate turns that work into executable units and records what happened.
 
 ## Product Boundary
 
-LaneGate is **not a spec-authoring IDE replacement** and should not compete to be
-the canonical place where teams write requirements, product requirements
-documents, design docs, or task breakdowns. IDEs, CLIs, agent frameworks, issue
-trackers, and research tools can keep owning authoring, discussion, and design
-exploration.
+LaneGate is **not a spec-authoring IDE replacement** and should not compete to be the canonical place where teams write requirements, product requirements documents, design docs, or task breakdowns. IDEs, CLIs, agent frameworks, issue trackers, and research tools can keep owning authoring, discussion, and design exploration.
 
 LaneGate owns the part after intent becomes executable work:
 
 - converting imported artifacts into one or more repo-local tickets
 - validating ticket metadata before lifecycle actions run
-- passing scoped context to the configured executor during `analyze`,
-  `implement`, and review flows
+- passing scoped context to the configured executor during `analyze`, `implement`, and review flows
 - recording executor planning output as ticket metadata or ticket notes
-- enforcing file locks, worktree isolation, status transitions, review gates,
-  and merge state
+- enforcing file locks, worktree isolation, status transitions, review gates, and merge state
 
-The important distinction is judgment versus control. Agents and executors do
-planning and design judgment. LaneGate records, validates, and gates workflow
-state with deterministic code.
+The important distinction is judgment versus control. Agents and executors do planning and design judgment. LaneGate records, validates, and gates workflow state with deterministic code.
 
 ## Artifact Families
 
-LaneGate should consider accepting external artifacts when they can be preserved
-as source context and mapped into tickets without pretending to understand the
-entire external product model.
+LaneGate should consider accepting external artifacts when they can be preserved as source context and mapped into tickets without pretending to understand the entire external product model.
 
 Likely import families:
 
@@ -45,72 +31,51 @@ Likely import families:
 | Task breakdowns | Generated task lists, milestones, issue epics, agent-produced plans | Accept as ticket candidates, dependencies, priority hints, and body context. |
 | Issue tracker records | GitHub Issues, Linear/Jira tickets, labels, comments, links | Accept as source-linked ticket drafts with trusted orchestration fields re-derived by LaneGate. |
 | Agent planning output | Analyze plans, implementation outlines, risk notes, test plans | Record as ticket metadata or notes after executor runs, not as authoritative lifecycle state. |
-| Machine-readable specs | OpenAPI, GraphQL schemas, AsyncAPI, JSON Schema, protobuf IDLs | Accept as referenced context for executors; LaneGate should not become the semantic validator for each domain. |
+| Machine-readable specs | OpenAPI, GraphQL schemas, AsyncAPI, JSON Schema, protobuf IDLs | Accept as referenced context for executors. LaneGate should not become the semantic validator for each domain. |
 | Test and behavior specs | Gherkin, markdown acceptance tests, example fixtures | Accept as close-criteria candidates and executor context. |
 
-LaneGate should reject or defer imports that require it to become the canonical
-editor, reviewer, or semantic engine for that format. For example, accepting an
-OpenAPI file as context is in scope; becoming an OpenAPI design studio is out
-of scope.
+LaneGate should reject or defer imports that require it to become the canonical editor, reviewer, or semantic engine for that format. For example, accepting an OpenAPI file as context is in scope, but becoming an OpenAPI design studio is out of scope.
 
 ## Export Surface
 
-LaneGate may export artifacts that help external tools understand execution state
-without making those tools the source of truth for LaneGate-owned fields.
+LaneGate may export artifacts that help external tools understand execution state without making those tools the source of truth for LaneGate-owned fields.
 
 Useful exports:
 
-- ticket summaries with id, title, status, priority, dependencies, close
-  criteria, touches, branch, worktree, executor, reviewer, and review verdict
+- ticket summaries with id, title, status, priority, dependencies, close criteria, touches, branch, worktree, executor, reviewer, and review verdict
 - board snapshots grouped by status for dashboards or spec tools
 - execution logs and executor planning notes for traceability
 - review summaries and merge outcomes
-- generated issue comments or backlinks that point from an external spec to
-  the LaneGate ticket that executed it
+- generated issue comments or backlinks that point from an external spec to the LaneGate ticket that executed it
 - machine-readable JSON for local API or MCP consumers
 
-Exported data is descriptive. Importing it back later must still pass LaneGate's
-schema validation and lifecycle checks.
+Exported data is descriptive. Importing it back later must still pass LaneGate's schema validation and lifecycle checks.
 
 ## Mapping Specs To Tickets
 
-External artifacts map into LaneGate tickets through a narrow translation layer.
-That layer should preserve source context, derive safe metadata, and leave
-implementation judgment to the configured executor.
+External artifacts map into LaneGate tickets through a narrow translation layer. That layer should preserve source context, derive safe metadata, and leave implementation judgment to the configured executor.
 
 | External artifact field | LaneGate ticket field | Rule |
 |---|---|---|
 | Source id, URL, tool name, version | `source`, body links, optional import metadata | Preserve for audit and round-trip context. |
 | Title or summary | `title` | Copy or summarize as untrusted text. |
 | Problem statement, requirements, design notes | Markdown body | Preserve as untrusted context. |
-| Acceptance criteria, expected behavior, test scenarios | `close_criteria` | Import as candidates; executor or human analysis may refine. |
+| Acceptance criteria, expected behavior, test scenarios | `close_criteria` | Import as candidates that executor or human analysis may refine. |
 | File hints, component names, changed areas | `touches` candidates | Treat as hints until `analyze` or a human validates concrete paths. |
-| Priority, labels, milestone | `priority`, milestone-like metadata when supported | Map only recognized values; preserve unknown labels in body/import metadata. |
+| Priority, labels, milestone | `priority`, milestone-like metadata when supported | Map only recognized values and preserve unknown labels in body/import metadata. |
 | Blocking relationships, task order | `depends_on` candidates | Validate referenced LaneGate ticket ids before enabling dependency gates. |
 | Proposed executor, model, assignee | `executor`, `reviewer` candidates | Accept only configured and allowed values. |
 | Task list or implementation plan | one or more tickets | Split when work has distinct close criteria or non-overlapping `touches`. |
 
-One spec can map to many LaneGate tickets when it contains independently
-reviewable work, risky sequencing, or files that should run in parallel under
-separate locks. Many specs can map to one ticket only when they describe one
-coherent change with one close-criteria set and one scoped `touches` list.
+One spec can map to many LaneGate tickets when it contains independently reviewable work, risky sequencing, or files that should run in parallel under separate locks. Many specs can map to one ticket only when they describe one coherent change with one close-criteria set and one scoped `touches` list.
 
-Ticket creation should preserve enough provenance that a user can answer:
-"which external artifact caused this ticket, and what imported text did the
-executor see?"
+Ticket creation should preserve enough provenance that a user can answer: "which external artifact caused this ticket, and what imported text did the executor see?"
 
 ## Executor Handoff
 
-During `analyze`, LaneGate passes imported spec content to the configured executor
-as untrusted ticket content. The executor may propose `touches`,
-`close_criteria`, dependencies, risks, and a plan. LaneGate then records the
-structured parts only after validation.
+During `analyze`, LaneGate passes imported spec content to the configured executor as untrusted ticket content. The executor may propose `touches`, `close_criteria`, dependencies, risks, and a plan. LaneGate then records the structured parts only after validation.
 
-During implementation, LaneGate does not do design judgment itself. It passes the
-ticket body, close criteria, touches, dependency context, and relevant imported
-spec text to the executor. The executor plans, edits, and tests inside the
-ticket worktree. LaneGate enforces the declared scope and lifecycle transitions
-around that work.
+During implementation, LaneGate does not do design judgment itself. It passes the ticket body, close criteria, touches, dependency context, and relevant imported spec text to the executor. The executor plans, edits, and tests inside the ticket worktree. LaneGate enforces the declared scope and lifecycle transitions around that work.
 
 This keeps the responsibilities crisp:
 
@@ -128,8 +93,7 @@ This keeps the responsibilities crisp:
 
 ## LaneGate-Owned Fields
 
-Imported specs may suggest values, but the following are LaneGate-owned execution
-concerns once a ticket exists:
+Imported specs may suggest values, but the following are LaneGate-owned execution concerns once a ticket exists:
 
 - `touches`: concrete repo paths used for locks and drift checks
 - `status`: lifecycle state
@@ -142,9 +106,7 @@ concerns once a ticket exists:
 - dependency gates and merge eligibility
 - merge commit/state
 
-Spec imports can populate drafts or candidates for these fields, but LaneGate must
-validate them before claiming support. A spec tool's status, task ownership, or
-review state is not automatically LaneGate's lifecycle state.
+Spec imports can populate drafts or candidates for these fields, but LaneGate must validate them before claiming support. A spec tool's status, task ownership, or review state is not automatically LaneGate's lifecycle state.
 
 ## Trust Boundary
 
@@ -281,10 +243,10 @@ Mapping:
 | Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
 |---|---|---|
 | Feature directory name | Source grouping and default parent title. | Emit as source reference, not as a LaneGate-owned id. |
-| Requirement headings and acceptance criteria | Copy into untrusted ticket body; import explicit criteria as close-criteria candidates. | Include ticket close criteria and provenance links in markdown or JSON. |
-| Design sections and implementation notes | Copy into untrusted body context; treat file paths as `touches` candidates. | Export implementation notes only when they came from LaneGate notes or reviewed ticket content. |
-| Task checkboxes or numbered tasks | Create many tickets when tasks have separate acceptance criteria or scopes; otherwise create one parent ticket with task context. | Export LaneGate tickets as task entries with id, status, title, dependencies, close criteria, and touched paths. |
-| `Task 1`, `1.2`, or checkbox labels | Preserve as external task references; do not treat as stable LaneGate ids. | Include original external refs in source metadata for round-trip context. |
+| Requirement headings and acceptance criteria | Copy into untrusted ticket body. Import explicit criteria as close-criteria candidates. | Include ticket close criteria and provenance links in markdown or JSON. |
+| Design sections and implementation notes | Copy into untrusted body context. Treat file paths as `touches` candidates. | Export implementation notes only when they came from LaneGate notes or reviewed ticket content. |
+| Task checkboxes or numbered tasks | Create many tickets when tasks have separate acceptance criteria or scopes. Otherwise create one parent ticket with task context. | Export LaneGate tickets as task entries with id, status, title, dependencies, close criteria, and touched paths. |
+| `Task 1`, `1.2`, or checkbox labels | Preserve as external task references. Do not treat as stable LaneGate ids. | Include original external refs in source metadata for round-trip context. |
 | Mentions such as "after task 1" | Import as dependency candidates only when the referenced task can be resolved within the same import batch. | Export validated `depends_on` values as LaneGate ticket ids. |
 
 Trust and metadata boundary:
@@ -323,14 +285,14 @@ Mapping:
 | Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
 |---|---|---|
 | `spec.md` title and behavior sections | Ticket title and untrusted body context. | Export as a source summary plus LaneGate ticket title/body excerpt when supported. |
-| Acceptance criteria in `spec.md` | Close-criteria candidates; preserve original wording in body. | Export validated close criteria as the execution contract. |
+| Acceptance criteria in `spec.md` | Close-criteria candidates. Preserve original wording in body. | Export validated close criteria as the execution contract. |
 | `plan.md` implementation sections | Untrusted planning context for executor handoff. | Export executor analysis notes separately from original imported plan text. |
 | `tasks.md` steps | Split into child tickets when each step has independent scope, dependencies, or close criteria. | Export one task row per LaneGate ticket, including parent/source grouping. |
-| Paths in plan or tasks | `touches` candidates only; validate against the repo before lock use. | Export concrete validated `touches`, not unvalidated source hints. |
+| Paths in plan or tasks | `touches` candidates only. Validate against the repo before lock use. | Export concrete validated `touches`, not unvalidated source hints. |
 
 Import should default to a parent/child grouping when the directory describes a
 feature plus several reviewable implementation tasks. The parent represents
-source provenance and shared acceptance context; children represent executable
+source provenance and shared acceptance context. Children represent executable
 LaneGate tickets. A single ticket is appropriate when `tasks.md` is a short
 checklist for one coherent change.
 
@@ -359,7 +321,7 @@ Mapping:
 | Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
 |---|---|---|
 | Document title | Parent ticket title or import batch label. | Export as a generated markdown checklist only when the user requests a low-structure view. |
-| Checkbox text | One ticket per checkbox only when the user chooses a split import; otherwise one ticket with checklist context. | Export LaneGate ticket status as `[ ]` or `[x]` only as a presentation layer, not as source of truth. |
+| Checkbox text | One ticket per checkbox only when the user chooses a split import. Otherwise one ticket with checklist context. | Export LaneGate ticket status as `[ ]` or `[x]` only as a presentation layer, not as source of truth. |
 | Nested bullets | Preserve under the related checkbox as untrusted body context. | Preserve as descriptive notes when round-tripping to markdown. |
 | Inline file names | `touches` candidates after path normalization and repo validation. | Export validated paths under each generated task. |
 
@@ -391,10 +353,10 @@ Mapping:
 
 | Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
 |---|---|---|
-| Issue number and URL | Source reference only; never reused as the LaneGate ticket id. | Export backlink metadata and optional issue comment body. |
+| Issue number and URL | Source reference only. Never reused as the LaneGate ticket id. | Export backlink metadata and optional issue comment body. |
 | Title and body | Ticket title and untrusted body context. | Export ticket summary, status, review result, and links back to LaneGate state. |
-| Labels and milestone | Map recognized labels to candidate priority or grouping; preserve unknown labels. | Export LaneGate labels only if a stable mapping is configured. |
-| Issue state and board column | Preserve as source context; do not import as LaneGate lifecycle status. | Export LaneGate status descriptively without mutating the external board unless an integration owns that action. |
+| Labels and milestone | Map recognized labels to candidate priority or grouping. Preserve unknown labels. | Export LaneGate labels only if a stable mapping is configured. |
+| Issue state and board column | Preserve as source context. Do not import as LaneGate lifecycle status. | Export LaneGate status descriptively without mutating the external board unless an integration owns that action. |
 | Body checklists | Close-criteria candidates or child ticket candidates depending on structure. | Export close criteria and task status using documented markdown or JSON shape. |
 
 Support tier: **unsupported** as a broad claim. LaneGate can preserve copied issue
@@ -428,8 +390,8 @@ Mapping:
 | Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
 |---|---|---|
 | Ticket-like id in heading | Preserve as external id unless it was allocated by the current LaneGate repo. | Export LaneGate id as authoritative for this repo. |
-| `TOUCHES` block | Path candidates; validate existence, normalization, and lock eligibility. | Export validated `touches` exactly as LaneGate stores them. |
-| `CLOSE CRITERIA` block | Close-criteria candidates; require lifecycle validation before use. | Export validated criteria in stable markdown and JSON forms. |
+| `TOUCHES` block | Path candidates. Validate existence, normalization, and lock eligibility. | Export validated `touches` exactly as LaneGate stores them. |
+| `CLOSE CRITERIA` block | Close-criteria candidates. Require lifecycle validation before use. | Export validated criteria in stable markdown and JSON forms. |
 | Dependencies block, if present | Validate references to existing or same-batch LaneGate ticket ids. | Export validated `depends_on` ids only. |
 | Body text | Untrusted ticket body context. | Export body text according to the selected export policy. |
 
@@ -445,9 +407,9 @@ specific parser and lifecycle reason:
 
 | Artifact family | Tier | Reason |
 |---|---|---|
-| Screenshots, images, whiteboards, and diagrams without structured text | Unsupported | Preserve as attachments or links only; no reliable field mapping. |
+| Screenshots, images, whiteboards, and diagrams without structured text | Unsupported | Preserve as attachments or links only. No reliable field mapping. |
 | Chat transcripts and agent conversations | Unsupported | Useful as body context, but too ambiguous for trusted ids, status, dependencies, or close criteria. |
-| Domain schemas such as OpenAPI, GraphQL, protobuf, or JSON Schema | Unsupported for ticket metadata | Accept as executor context; LaneGate should not infer lifecycle tickets from domain semantics without an explicit adapter. |
+| Domain schemas such as OpenAPI, GraphQL, protobuf, or JSON Schema | Unsupported for ticket metadata | Accept as executor context. LaneGate should not infer lifecycle tickets from domain semantics without an explicit adapter. |
 | Vendor project databases without exported schema/version | Unsupported | Field meaning, permissions, and status semantics cannot be validated. |
 
 ### Fixture Corpus Plan

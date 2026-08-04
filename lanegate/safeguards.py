@@ -160,7 +160,7 @@ def _run_one_guard(
                 cmd,
                 cwd=worktree,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 timeout=timeout_s,
                 start_new_session=True,
             )

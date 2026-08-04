@@ -105,7 +105,7 @@ def _control_repo_root(repo_root: Path) -> Path:
         ["git", "rev-parse", "--git-common-dir"],
         cwd=root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         return root
@@ -296,7 +296,7 @@ def _push_branch_and_open_pr(
         ["git", "remote", "get-url", "origin"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if r.returncode != 0:
         return None
@@ -306,7 +306,7 @@ def _push_branch_and_open_pr(
         ["git", "push", "--force-with-lease", "-u", "origin", branch],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if push.returncode != 0:
         print(f"WARNING: could not push {branch} to origin: {push.stderr.strip()}", file=sys.stderr)
@@ -320,7 +320,7 @@ def _push_branch_and_open_pr(
         ["gh", "pr", "view", branch, "--json", "url,number"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if view.returncode == 0 and view.stdout.strip():
         try:
@@ -349,7 +349,7 @@ def _push_branch_and_open_pr(
         ],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if create.returncode != 0:
         print(f"WARNING: gh pr create failed: {create.stderr.strip()}", file=sys.stderr)
@@ -438,7 +438,7 @@ def cmd_hibernate(
                 ["git", "branch", "-D", branch],
                 cwd=repo_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
         for companion in ticket.get("companion_repos") or []:
             companion_worktree_cleanup(repo_root, companion, tid)

@@ -333,7 +333,7 @@ def check_local_not_behind_remote(repo_root: Path, branch: str) -> None:
         ["git", "rev-parse", "--verify", f"origin/{branch}"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if check.returncode != 0:
         return  # remote branch doesn't exist — first claim, safe
@@ -343,7 +343,7 @@ def check_local_not_behind_remote(repo_root: Path, branch: str) -> None:
         ["git", "rev-list", "--count", f"HEAD..origin/{branch}"],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if behind.returncode == 0 and behind.stdout.strip() != "0":
         raise RuntimeError(

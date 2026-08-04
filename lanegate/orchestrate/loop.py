@@ -915,7 +915,7 @@ def _conflicted_files(worktree_path: Path) -> list[str]:
             ["git", "diff", "--name-only", "--diff-filter=U"],
             cwd=worktree_path,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
     except FileNotFoundError:
         return []
@@ -985,7 +985,7 @@ def _worktree_is_dirty(worktree_path: Path) -> bool:
         ["git", "status", "--porcelain"],
         cwd=worktree_path,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     return any(line and not line.startswith("??") for line in result.stdout.splitlines())
 
@@ -1020,7 +1020,7 @@ def _run_rebase(worktree_path: Path, *, base: str | None = None) -> tuple[str, s
         ["git", "rebase", base],
         cwd=worktree_path,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     if result.returncode == 0:
         return "clean", result.stdout.strip()
@@ -1038,7 +1038,7 @@ def _continue_rebase(worktree_path: Path, conflict_files: list[str]) -> tuple[bo
         return False, f"missing worktree: {worktree_path}"
     try:
         add_cmd = ["git", "add", "--", *conflict_files] if conflict_files else ["git", "add", "-u"]
-        add_result = subprocess.run(add_cmd, cwd=worktree_path, capture_output=True, text=True)
+        add_result = subprocess.run(add_cmd, cwd=worktree_path, capture_output=True, text=True, encoding="utf-8")
     except FileNotFoundError:
         return False, f"missing worktree: {worktree_path}"
     if add_result.returncode != 0:
@@ -1052,7 +1052,7 @@ def _continue_rebase(worktree_path: Path, conflict_files: list[str]) -> tuple[bo
             ["git", "rebase", "--continue"],
             cwd=worktree_path,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             env=env,
         )
     except FileNotFoundError:
@@ -1065,7 +1065,7 @@ def _continue_rebase(worktree_path: Path, conflict_files: list[str]) -> tuple[bo
 
 def _abort_rebase(worktree_path: Path) -> None:
     try:
-        subprocess.run(["git", "rebase", "--abort"], cwd=worktree_path, capture_output=True, text=True)
+        subprocess.run(["git", "rebase", "--abort"], cwd=worktree_path, capture_output=True, text=True, encoding="utf-8")
     except FileNotFoundError:
         pass
 
@@ -1396,7 +1396,7 @@ def cmd_orchestrate(
             ["git", "status", "--porcelain"],
             cwd=str(repo_root),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
         )
         tickets_dir = cfg.get("tickets_dir", ".lanegate/tickets")
         worktrees_dir = cfg.get("worktrees_dir", ".lanegate/worktrees")

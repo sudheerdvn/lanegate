@@ -73,14 +73,14 @@ def _run_promotion(env: dict, cfg: dict, repo_root: Path) -> bool:
         r = subprocess.run(
             ["git", "worktree", "add", str(env_wt), branch],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=repo_root,
         )
         if r.returncode != 0:
             r2 = subprocess.run(
                 ["git", "worktree", "add", "-b", branch, str(env_wt), from_branch],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=repo_root,
             )
             if r2.returncode != 0:
@@ -107,14 +107,14 @@ def _run_promotion(env: dict, cfg: dict, repo_root: Path) -> bool:
         r = subprocess.run(
             ["git", "merge", "--ff-only", from_branch],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=env_wt,
         )
     else:  # merge-no-ff
         r = subprocess.run(
             ["git", "merge", "--no-ff", from_branch, "-m", f"Promote {from_branch} → {branch}"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=env_wt,
         )
 

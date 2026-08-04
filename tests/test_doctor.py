@@ -305,7 +305,7 @@ class TestGetVersion:
             result = _get_version("gitleaks", ("version",))
         assert result == "(gitleaks 8.18.0)"
         run.assert_called_once_with(
-            ["gitleaks", "version"], capture_output=True, text=True, timeout=3
+            ["gitleaks", "version"], capture_output=True, text=True, encoding="utf-8", timeout=3
         )
 
     def test_truncates_long_version_strings(self):

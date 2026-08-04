@@ -3,6 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/lanegate?cacheSeconds=3600)](https://pypi.org/project/lanegate/)
 [![CI](https://github.com/sudheerdvn/lanegate/actions/workflows/ci.yml/badge.svg)](https://github.com/sudheerdvn/lanegate/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Go 1.24+](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](https://go.dev/dl/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Local Ollama](https://img.shields.io/badge/local-Ollama-4b5563)](https://ollama.com/)
 [![MCP](https://img.shields.io/badge/MCP-ready-7c3aed)](https://modelcontextprotocol.io/)
@@ -12,9 +13,9 @@ Every agent gets a lane. Nothing ships without a gate.
 
 LaneGate helps coding agents (Claude, Codex, Ollama, aider, etc.) work on the same repo with less manual juggling. Tickets live as local Markdown files, agents claim them, worktrees keep changes separate, and file-level locks reduce overlapping edits. No SaaS, no subscriptions, no external project state.
 
-LaneGate is not a replacement for coding agents, IDEs, or spec-driven planning tools. Those tools do the planning and implementation work; LaneGate records scoped work as repo-local state and coordinates the execution loop around it.
+LaneGate is not a replacement for coding agents, IDEs, or spec-driven planning tools. Those tools do the planning and implementation work. LaneGate records scoped work as repo-local state and coordinates the execution loop around it.
 
-> **Security note.** V1 provides git-level isolation and diff inspection; it does not sandbox agents at the OS level. Agents run as host processes. See [Security Status](#security-status) and [Known Limitations](#known-limitations) before running it on repositories you care about.
+> **Security note.** V1 provides git-level isolation and diff inspection. It does not sandbox agents at the OS level. Agents run as host processes. See [Security Status](#security-status) and [Known Limitations](#known-limitations) before running it on repositories you care about.
 
 ---
 
@@ -37,18 +38,11 @@ LaneGate is useful when you already use coding agents and want a small local wor
 
 It is intentionally smaller than a company issue tracker and less ambitious than an IDE. Use those for planning, discussion, and implementation. Use LaneGate when you want repo-local execution state around agent runs.
 
-By default, LaneGate commits ticket specs and review verdicts to git as they change — tickets are a git-native artifact, not local-only state. Executor transcripts, logs, cooldowns, locks, and worktrees stay local under `.lanegate/`. Set `commit_status_changes: false` to opt back into fully zero-footprint local state.
+By default, LaneGate commits ticket specs and review verdicts to git as they change. Tickets are a git-native artifact, not local-only state. Executor transcripts, logs, cooldowns, locks, and worktrees stay local under `.lanegate/`. Set `commit_status_changes: false` to opt back into fully zero-footprint local state.
 
-MCP is built in — run `lanegate mcp` to expose LaneGate commands as native tools for any MCP-compatible agent (Claude, Cursor, etc.), no shell commands required.
+MCP is built in. Run `lanegate mcp` to expose LaneGate commands as native tools for any MCP-compatible agent (Claude, Cursor, etc.), with no shell commands required.
 
-LaneGate's loopback Python API (`lanegate api`) is built and running today, serving
-board, ticket, diff, and orchestration-run state as JSON/SSE. The first local
-UI is still planned as a small add-on launched with `lanegate ui`: a bundled
-TypeScript frontend over that API for board scanning, ticket detail,
-blocked/review triage, diffs, orchestration logs, and read-only settings
-preview. The CLI remains the complete fallback for advanced or custom
-workflows; the UI is not a SaaS service and does not move project state out of
-your checkout.
+LaneGate's loopback Python API (`lanegate api`) is built and running today, serving board, ticket, diff, and orchestration-run state as JSON/SSE. The first local UI is still planned as a small add-on launched with `lanegate ui`: a bundled TypeScript frontend over that API for board scanning, ticket detail, blocked/review triage, diffs, orchestration logs, and read-only settings preview. The CLI remains the complete fallback for advanced or custom workflows. The UI is not a SaaS service and does not move project state out of your checkout.
 
 ---
 
@@ -71,9 +65,9 @@ Main command groups:
 
 | Group | Commands |
 |---|---|
-| **Scoping** — record work as tickets and ask an executor to infer `touches` / `close_criteria` | `create`, `analyze` |
-| **Execution** — who works on what without colliding | `board`, `next`, `start`, `complete`, `review`, `merge` |
-| **Delivery** — how merged code reaches environments | `promote`, `pipeline-status`, `flag` |
+| **Scoping**: record work as tickets and ask an executor to infer `touches` / `close_criteria` | `create`, `analyze` |
+| **Execution**: who works on what without colliding | `board`, `next`, `start`, `complete`, `review`, `merge` |
+| **Delivery**: how merged code reaches environments | `promote`, `pipeline-status`, `flag` |
 
 ---
 
@@ -90,12 +84,12 @@ LaneGate is experimental software for coordinating coding agents on a local repo
 - Runs configured `safeguards` such as tests or scripts before `complete` and `merge`
 
 **What LaneGate does NOT do:**
-- MCP is not a sandbox. `lanegate mcp` exposes ticket lifecycle commands as native tools; an agent with access to those tools can claim tickets, create branches, and trigger merges. The MCP server authenticates nothing beyond what the MCP client config enforces.
+- MCP is not a sandbox. `lanegate mcp` exposes ticket lifecycle commands as native tools, and an agent with access to those tools can claim tickets, create branches, and trigger merges. The MCP server authenticates nothing beyond what the MCP client config enforces.
 - Host executors inherit host permissions. Agents (Claude Code, aider, Codex) run as the invoking OS user with full filesystem and network access. There is no bwrap, seccomp, or container wrapping.
 - The file-based lock is single-machine, single-checkout. Two separate clones on two machines can both claim the same ticket.
 - File-level locks are not semantic dependency analysis. Two tickets can touch different files and still break each other through shared APIs, imports, types, schemas, or runtime behavior. Treat `touches` as a practical coordination boundary, not a proof of correctness.
 
-**Recommendation:** use `--human-review final` when running `lanegate orchestrate` on any repository with production code. This stops after implementation and requires `lanegate merge <id>` to be run manually after you inspect the diff. To make this the safe default without depending on every invocation remembering the flag, set `default_human_review: final` (or `per_ticket`) in `.lanegate.yml` — an explicit `--human-review` flag still overrides it. Note that this is unrelated to a ticket's `autonomy` field, which only governs auto-fix-retry behavior, not the merge gate.
+**Recommendation:** use `--human-review final` when running `lanegate orchestrate` on any repository with production code. This stops after implementation and requires `lanegate merge <id>` to be run manually after you inspect the diff. To make this the safe default without depending on every invocation remembering the flag, set `default_human_review: final` (or `per_ticket`) in `.lanegate.yml`. An explicit `--human-review` flag still overrides it. Note that this is unrelated to a ticket's `autonomy` field, which only governs auto-fix-retry behavior, not the merge gate.
 
 For the full threat model, executor permissions, and safe usage notes, see [SECURITY.md](SECURITY.md) and [docs/security-model.md](docs/security-model.md).
 
@@ -104,8 +98,8 @@ For the full threat model, executor permissions, and safe usage notes, see [SECU
 ## Known Limitations
 
 - **Lock scope is single-machine, single-checkout.** The file-based concurrency lock at `.lanegate/orchestrator.lock` prevents two `lanegate orchestrate` runs on the same checkout from racing, but does not coordinate across separate clones or machines.
-- **No OS-level sandbox in V1.** Agents run as child processes with full user permissions — no bwrap, seccomp, or container wrapping — regardless of which Claude Code permission mode is configured (see the next bullet for that separate, application-level choice). LaneGate inspects the git diff after the agent exits; it cannot observe what the agent read or sent over the network during execution.
-- **Executor permissions come from the executor runtime, not from LaneGate.** `lanegate init` configures Claude Code with a scoped `--allowedTools` set by default so the agent can run headless without interactive prompts, while tools outside that list stay gated. You can instead configure `flags: ["--dangerously-skip-permissions"]`, which disables Claude Code's per-action approval prompts entirely — a valid choice for setups like a sandboxed CI runner, but means the agent acts on anything without confirmation. See [Security Status](docs/security-model.md#headless-permission-options-for-the-claude-executor) for the full set of options.
+- **No OS-level sandbox in V1.** Agents run as child processes with full user permissions (no bwrap, seccomp, or container wrapping), regardless of which Claude Code permission mode is configured (see the next bullet for that separate, application-level choice). LaneGate inspects the git diff after the agent exits. It cannot observe what the agent read or sent over the network during execution.
+- **Executor permissions come from the executor runtime, not from LaneGate.** `lanegate init` configures Claude Code with a scoped `--allowedTools` set by default so the agent can run headless without interactive prompts, while tools outside that list stay gated. You can instead configure `flags: ["--dangerously-skip-permissions"]`, which disables Claude Code's per-action approval prompts entirely. That's a valid choice for setups like a sandboxed CI runner, but it means the agent acts on anything without confirmation. See [Security Status](docs/security-model.md#headless-permission-options-for-the-claude-executor) for the full set of options.
 
 ---
 
@@ -113,9 +107,9 @@ For the full threat model, executor permissions, and safe usage notes, see [SECU
 
 | Platform | Status |
 |---|---|
-| Linux | Supported — primary development platform |
-| macOS | Supported — CI-verified on every push |
-| Windows | Core functionality works; projects using `.sh` executor scripts require WSL |
+| Linux | Supported, primary development platform |
+| macOS | Supported, CI-verified on every push |
+| Windows | Core functionality works, but projects using `.sh` executor scripts require WSL |
 
 ---
 
@@ -128,9 +122,7 @@ lanegate init    # scaffold .lanegate/ + .lanegate.yml in your repo
 
 `lgt` is installed alongside `lanegate` as a short alias for the same command (e.g. `lgt board`, `lgt next`).
 
-LaneGate is a standalone CLI, not a library you import into a project — [pipx](https://pipx.pypa.io/)
-is the recommended way to install it, since it isolates the tool's own dependencies
-from whatever Python environment your project uses:
+LaneGate is a standalone CLI, not a library you import into a project. [pipx](https://pipx.pypa.io/) is the recommended way to install it, since it isolates the tool's own dependencies from whatever Python environment your project uses:
 
 ```bash
 pipx install lanegate
@@ -254,19 +246,11 @@ lanegate flag disable new_checkout_flow --env production
 lanegate mcp    # start stdio MCP server; attach any MCP-compatible client
 ```
 
-Exposed tools include `board`, `next_ticket`, `pipeline_status`, `flag_list`,
-`flag_set`, `repo_status`, `recent_logs`, `continuation_context`, `start`,
-`orchestrate`, `complete`, `review`, `merge`, `promote`, `hibernate`,
-`needs_review`, `fail`, `reopen`, `validate`, `done`, and `stats`. Agent-facing
-action and log tools are bounded: lifecycle output is byte-capped, log excerpts
-are line- and byte-capped, and continuation state is reconstructed from durable
-repo data instead of chat context.
+Exposed tools include `board`, `next_ticket`, `pipeline_status`, `flag_list`, `flag_set`, `repo_status`, `recent_logs`, `continuation_context`, `start`, `orchestrate`, `complete`, `review`, `merge`, `promote`, `hibernate`, `needs_review`, `fail`, `reopen`, `validate`, `done`, and `stats`. Agent-facing action and log tools are bounded: lifecycle output is byte-capped, log excerpts are line- and byte-capped, and continuation state is reconstructed from durable repo data instead of chat context.
 
 ### Local API / UI preview
 
-`lanegate api` is built: a loopback-only (`127.0.0.1`) JSON/SSE server over board,
-ticket, diff, and orchestration-run state. `lanegate ui` (a bundled UI served by
-that API) is still planned:
+`lanegate api` is built: a loopback-only (`127.0.0.1`) JSON/SSE server over board, ticket, diff, and orchestration-run state. `lanegate ui` (a bundled UI served by that API) is still planned:
 
 ```bash
 lanegate api    # built — start the loopback JSON/SSE API for local clients
@@ -283,7 +267,7 @@ Current `lanegate api` surface:
 - `GET /api/status`
 - `GET /api/config`
 - `GET /api/pools`
-- `PUT /api/pools/{name}/executors` — reorders a pool's executor list
+- `PUT /api/pools/{name}/executors` (reorders a pool's executor list)
 - `GET /api/runs`
 - `GET /api/runs/current`
 - `GET /api/runs/current/logs`
@@ -292,7 +276,7 @@ Current `lanegate api` surface:
 - `POST /api/orchestrate/stop`
 
 Per-ticket lifecycle mutation endpoints (`start`/`complete`/`review`/`merge`) are
-still design-only — see
+still design-only. See
 [docs/v2-interface-boundaries.md](docs/v2-interface-boundaries.md).
 
 `lanegate ui` will use this API for common board, ticket, diff, review, and
@@ -309,7 +293,7 @@ screen can reorder a pool's executor list and persist it via
 [docs/v2-interface-boundaries.md](docs/v2-interface-boundaries.md#tick-118-go-tui-runtime-spike-result)
 for its current scope and limits.
 
-`lanegate tui` is a separate Go binary, not part of the `lanegate` Python package — a
+`lanegate tui` is a separate Go binary, not part of the `lanegate` Python package. A
 plain `pip install` does not give you `lanegate-tui`. To use it:
 
 - **Build from source** (this repo ships the Go module at `tui/`): `go build -o
@@ -320,12 +304,12 @@ plain `pip install` does not give you `lanegate-tui`. To use it:
   `lanegate-tui` binary is found on `PATH` or via `LANEGATE_TUI_BIN`.
 
 If neither a binary nor the Go source is available, `lanegate tui` exits with an error
-telling you to set `LANEGATE_TUI_BIN` — see
+telling you to set `LANEGATE_TUI_BIN`. See
 [Troubleshooting](docs/troubleshooting.md#lanegate-tui-fails-go-tui-binary-or-source-not-found).
 
 ### Monitoring & auto-resume
 
-Three detached background daemons for runs you're not watching live — each has its own PID/log file under `.lanegate/` and a `--status`/`--stop` pair:
+Three detached background daemons cover runs you're not watching live, each with its own PID/log file under `.lanegate/` and a `--status`/`--stop` pair:
 
 ```bash
 lanegate watch                  # poll PR review decisions, auto-merge on approval
@@ -352,7 +336,7 @@ lanegate gh-sync --dry-run  # preview what would be created or updated
 
 ## Configuration
 
-`.lanegate.yml` in your repo root (walk-up discovery — run from any subdirectory):
+`.lanegate.yml` in your repo root, with walk-up discovery so it works from any subdirectory:
 
 ### Executors
 
@@ -375,7 +359,7 @@ executors:
 
 ```
 
-Per-executor `bin` overrides the binary name for a supported executor; `flags` are prepended before the prompt.
+Per-executor `bin` overrides the binary name for a supported executor. `flags` are prepended before the prompt.
 
 For V1.5 multi-executor routing, set per-step executors:
 
@@ -386,9 +370,9 @@ executor_steps:
   review: claude
 ```
 
-When `implement` and `review` resolve to the same executor, LaneGate uses combined mode. When they differ, LaneGate implements first and then runs the resolved review route. A ticket-level `executor:` overrides implementation only; `reviewer:` controls review routing, including `reviewer: human`. Multi-executor routing is not OS/container sandboxing and does not isolate tools from the checkout.
+When `implement` and `review` resolve to the same executor, LaneGate uses combined mode. When they differ, LaneGate implements first and then runs the resolved review route. A ticket-level `executor:` overrides implementation only. `reviewer:` controls review routing, including `reviewer: human`. Multi-executor routing is not OS/container sandboxing and does not isolate tools from the checkout.
 
-For a batch-level human gate, run `lanegate orchestrate --human-review final`. For per-ticket human verdicts, set `reviewer: human` and run `lanegate orchestrate --human-review per_ticket`; LaneGate will wait for `lanegate review <ticket> --verdict approved` or a changes-requested verdict before merge.
+For a batch-level human gate, run `lanegate orchestrate --human-review final`. For per-ticket human verdicts, set `reviewer: human` and run `lanegate orchestrate --human-review per_ticket`. LaneGate will wait for `lanegate review <ticket> --verdict approved` or a changes-requested verdict before merge.
 
 Use `safeguards` to run deterministic checks before a ticket is marked complete,
 merged, or closed after merge:
@@ -404,12 +388,12 @@ safeguards:
     - pytest
 ```
 
-Supported guard commands include `pytest`, `npm test`, `cargo test`, `go test`, `make ...`, and executable scripts. A failing guard blocks the transition. `post_merge` runs from the merged control checkout during `lanegate validate`; when it is configured, `lanegate done` requires validation first.
+Supported guard commands include `pytest`, `npm test`, `cargo test`, `go test`, `make ...`, and executable scripts. A failing guard blocks the transition. `post_merge` runs from the merged control checkout during `lanegate validate`, and when it is configured, `lanegate done` requires validation first.
 
-`pre_merge` guards also re-run automatically a second time, right after the `git merge` lands, against the merged `main` checkout itself — not just the ticket's isolated worktree. This catches the case where two independently-approved tickets each pass their own worktree's tests but break something once combined. If that second run fails, `lanegate merge` resets `main` back to its pre-merge commit and routes the ticket to `needs_review` instead of leaving a broken commit on `main`. See [config-reference.md](docs/config-reference.md#pre_merge-re-verification-against-the-actual-merge-result) for details. This does not replace running the full suite on `main` yourself after merging a whole backlog in one sitting — it only re-checks after each individual merge.
+`pre_merge` guards also re-run automatically a second time, right after the `git merge` lands, against the merged `main` checkout itself, not just the ticket's isolated worktree. This catches the case where two independently-approved tickets each pass their own worktree's tests but break something once combined. If that second run fails, `lanegate merge` resets `main` back to its pre-merge commit and routes the ticket to `needs_review` instead of leaving a broken commit on `main`. See [config-reference.md](docs/config-reference.md#pre_merge-re-verification-against-the-actual-merge-result) for details. This does not replace running the full suite on `main` yourself after merging a whole backlog in one sitting, it only re-checks after each individual merge.
 
 For fully local/offline runs, use `executor: aider` with a local Ollama model as
-aider's backend — this is the validated path, since Aider has a real read/edit/commit
+aider's backend. This is the validated path, since Aider has a real read/edit/commit
 loop:
 
 ```yaml
@@ -420,20 +404,20 @@ models:
   review: qwen2.5-coder
 ```
 
-Aider talks to Ollama's own local API; install and pull those models with Ollama first
+Aider talks to Ollama's own local API. Install and pull those models with Ollama first
 (locally, or on whatever host aider's model route points at). See
 [executor-capabilities.md](docs/executor-capabilities.md#aider) for `context_window_tokens`
 and other local-model-specific settings.
 
 `executor: ollama` (`type: ollama`) is a separate, more limited option: LaneGate posts
 directly to Ollama's REST API (`{base_url}/api/generate}`) and gets back a single text
-completion — Ollama itself has no file-editing or commit capability, so this cannot
+completion. Ollama itself has no file-editing or commit capability, so this cannot
 complete an `implement`/`review` step (it will produce zero commits and fail). It's
 only useful for text-only steps like `analyze`. See
 [executor-capabilities.md](docs/executor-capabilities.md#ollama) for the full caveat.
 
 For a rented/remote GPU box (e.g. a cloud instance running Ollama), tunnel its port
-instead of exposing it — Ollama's API is unauthenticated:
+instead of exposing it, since Ollama's API is unauthenticated:
 
 ```bash
 ssh -N -L 11435:localhost:11434 <user>@<remote-host>
@@ -441,7 +425,7 @@ export OLLAMA_API_BASE=http://localhost:11435   # aider reads this directly; Lan
 lanegate orchestrate
 ```
 
-Use `verification.groups` to tell the implement/review prompts when a UI check is expected and where to find the running app. LaneGate never runs a browser itself — the executor needs its own tooling (a Playwright MCP server, an in-session browser subagent) wired up separately. `groups` is a list because one repo can have more than one UI area, each with its own dev server and URL — separate frontend apps in a monorepo, or e.g. an AEM `ui.frontend` clientlib served by webpack alongside the actual AEM author instance:
+Use `verification.groups` to tell the implement/review prompts when a UI check is expected and where to find the running app. LaneGate never runs a browser itself. The executor needs its own tooling (a Playwright MCP server, an in-session browser subagent) wired up separately. `groups` is a list because one repo can have more than one UI area, each with its own dev server and URL: separate frontend apps in a monorepo, or e.g. an AEM `ui.frontend` clientlib served by webpack alongside the actual AEM author instance:
 
 ```yaml
 verification:
@@ -508,7 +492,7 @@ environments:
 **Scope: single git checkout, single machine.**
 
 The `touches` list in each ticket is a pessimistic file-level lock. LaneGate holds
-the lock from `in_progress` through `in_review` — releasing only at `merged`.
+the lock from `in_progress` through `in_review`, releasing only at `merged`.
 This reduces edit collisions when multiple agents work in parallel.
 
 ```
@@ -519,7 +503,7 @@ Agent C: TICK-009  touches: [src/auth.py]    status: open         → BLOCKED (o
 
 **What this does NOT prevent:** semantic conflicts. If one ticket changes an exported API and another ticket changes a caller in a different file, both tickets may be touch-disjoint and still incompatible. LaneGate relies on safeguards, static checks, and review to catch integration problems before they land.
 
-It also does not prevent two separate git clones on two machines from claiming the same ticket. `check_local_not_behind_remote` runs on every `start` to reduce this window, but it does not close it entirely — this is a V1 limitation covered in [Known Limitations](#known-limitations).
+It also does not prevent two separate git clones on two machines from claiming the same ticket. `check_local_not_behind_remote` runs on every `start` to reduce this window, but it does not close it entirely. This is a V1 limitation covered in [Known Limitations](#known-limitations).
 
 Five concurrency bugs fixed versus the original orchestrator:
 
@@ -539,7 +523,7 @@ Five concurrency bugs fixed versus the original orchestrator:
 python3 -m pytest tests/ -q
 ```
 
-Most tests are fast unit-style checks and mock git-facing subprocess calls where needed to isolate edge cases. `tests/test_e2e_lifecycle.py` is the real lifecycle integration suite: it creates a temporary git repository with `git init`, makes real commits, creates a real linked worktree, runs the ticket from draft through done, and verifies actual branch, merge, and worktree state. That suite still runs under the default `pytest` invocation; only the model response is stubbed to avoid nondeterminism and external cost.
+Most tests are fast unit-style checks and mock git-facing subprocess calls where needed to isolate edge cases. `tests/test_e2e_lifecycle.py` is the real lifecycle integration suite: it creates a temporary git repository with `git init`, makes real commits, creates a real linked worktree, runs the ticket from draft through done, and verifies actual branch, merge, and worktree state. That suite still runs under the default `pytest` invocation. Only the model response is stubbed, to avoid nondeterminism and external cost.
 
 The release-artifact gate builds a wheel/sdist in a temporary copy, uses a clean
 non-editable installation, and exercises the CLI in throwaway repositories:
@@ -571,7 +555,7 @@ Add to your MCP client config:
 
 The server starts on stdio. An AI agent can then call `board()`, `next_ticket()`,
 `repo_status()`, `recent_logs()`, `orchestrate(dry_run=true)`,
-`start("TICK-007")`, etc. as native tools — no shell commands required. Run
+`start("TICK-007")`, etc. as native tools, with no shell commands required. Run
 `lanegate install-agent-tools` to write Claude slash commands and reusable Codex or
 generic MCP config snippets into the repo. See
 [`docs/agent-tools.md`](docs/agent-tools.md) for the supported agent surfaces

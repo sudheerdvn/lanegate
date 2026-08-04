@@ -525,7 +525,7 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
                 cmd,
                 cwd=repo_root,
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
             tail = "\n".join((result.stdout + result.stderr).splitlines()[-20:])
             log(f"[resume-watch] orchestrate exited {result.returncode}\n{tail}")

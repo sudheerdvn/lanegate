@@ -113,7 +113,7 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
             result = subprocess.run(
                 ["gh", "pr", "view", str(ticket["pr_number"]), "--json", "reviewDecision"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
             )
             if result.returncode != 0:
                 log(f"[watch] {ticket['id']}: gh pr view failed — {result.stderr.strip()}")

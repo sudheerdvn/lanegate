@@ -39,7 +39,7 @@ def _get_project_id(repo_root: Path) -> str:
     r = subprocess.run(
         ["git", "remote", "get-url", "origin"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=repo_root,
     )
     if r.returncode == 0:

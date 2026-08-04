@@ -273,7 +273,7 @@ def _setup_bundle(system: str, *, has_apt: bool | None = None) -> _SetupBundle:
 def _get_version(binary: str, version_args: tuple[str, ...] = ("--version",)) -> str:
     try:
         r = subprocess.run(
-            [binary, *version_args], capture_output=True, text=True, timeout=3
+            [binary, *version_args], capture_output=True, text=True, encoding="utf-8", timeout=3
         )
         returncode = getattr(r, "returncode", 0)
         if isinstance(returncode, int) and returncode != 0:

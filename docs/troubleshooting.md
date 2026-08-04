@@ -12,11 +12,11 @@ LaneGate is not on your PATH.
 
 - If you installed via pip: check that your Python scripts directory is on `PATH`. Run `python -m lanegate --version` as a workaround, or add the scripts directory (e.g. `~/.local/bin` on Linux) to `PATH`.
 - If you installed in a virtualenv: activate it first (`source venv/bin/activate`).
-- If you installed from source with `pip install -e .`: same as above — activate the venv, or use `python -m lanegate` to invoke subcommands directly.
+- If you installed from source with `pip install -e .`: the fix is the same as above. Activate the venv, or use `python -m lanegate` to invoke subcommands directly.
 
 ### `lanegate init` says a tickets directory already exists
 
-Re-init safety is intentional. If `.lanegate/tickets/` or a custom `tickets_dir` already has files, LaneGate prints a warning and preserves the existing directory rather than overwriting it. Your tickets are safe — read the warning, confirm the path is correct, and continue.
+Re-init safety is intentional. If `.lanegate/tickets/` or a custom `tickets_dir` already has files, LaneGate prints a warning and preserves the existing directory rather than overwriting it. Your tickets are safe. Read the warning, confirm the path is correct, and continue.
 
 If you previously used a different location (e.g. `tickets/`) and want to switch to the new default, migrate the files manually and update `tickets_dir` in `.lanegate.yml`.
 
@@ -28,24 +28,24 @@ LaneGate requires Python 3.11 or later. Check with `python --version`. If your s
 
 ## Configuration
 
-### `.lanegate.yml` not found — LaneGate ignores my config
+### `.lanegate.yml` not found, so LaneGate ignores my config
 
 LaneGate uses walk-up discovery: it searches the current directory and each parent until it finds `.lanegate.yml`. Run `lanegate board` from inside the repo root or any subdirectory. If the file is not being picked up, verify the file name is exactly `.lanegate.yml` (leading dot, no extra extension).
 
-Note: `lanegate init` adds `.lanegate.yml` to `.gitignore` by default. The file is local — check that it actually exists and was not deleted.
+Note: `lanegate init` adds `.lanegate.yml` to `.gitignore` by default. The file is local, so check that it actually exists and was not deleted.
 
 ### Config change has no effect
 
-LaneGate reads `.lanegate.yml` on every command invocation — there is no running daemon to restart. If a change appears to have no effect, check:
+LaneGate reads `.lanegate.yml` on every command invocation, so there is no running daemon to restart. If a change appears to have no effect, check:
 
 1. You are editing the right file (walk-up discovery may be picking up a file in a parent directory).
-2. The YAML is valid — a parse error will cause LaneGate to exit with a traceback. Run `python -c "import yaml; yaml.safe_load(open('.lanegate.yml'))"` to check for syntax errors.
+2. The YAML is valid. A parse error causes LaneGate to exit with a traceback. Run `python -c "import yaml; yaml.safe_load(open('.lanegate.yml'))"` to check for syntax errors.
 
 ---
 
 ## Ticket issues
 
-### Ticket is stuck in `draft` — `lanegate board` shows it but `lanegate next` skips it
+### Ticket is stuck in `draft`, so `lanegate board` shows it but `lanegate next` skips it
 
 `draft` tickets are intentionally skipped by `lanegate next` until they are opened. A draft ticket needs a non-empty `touches` list and `open` status before an agent can claim it.
 
@@ -67,7 +67,7 @@ When a milestone filter is active, the board shows only tickets whose `milestone
 
 ### `lanegate start` fails: "ticket has no touches"
 
-A ticket without a `touches` list cannot be started — the lock has nothing to hold. Populate touches first:
+A ticket without a `touches` list cannot be started, because the lock has nothing to hold. Populate touches first:
 
 ```bash
 lanegate analyze TICK-NNN   # fill touches and open the ticket
@@ -88,7 +88,7 @@ lanegate open TICK-NNN      # flip to open once touches are set
 After `lanegate merge`, the lock is released. If a ticket still shows as blocked, check two things:
 
 1. The merged ticket's status in `.lanegate/tickets/` is actually `merged` (not stuck in `in_review`).
-2. The `touches` lists genuinely overlap — use `lanegate board` to see which locks are held and by which ticket.
+2. The `touches` lists genuinely overlap. Use `lanegate board` to see which locks are held and by which ticket.
 
 If a ticket's status is stuck at `in_progress` because the executor crashed, reset it manually in the frontmatter and clean up its worktree directory.
 
@@ -96,7 +96,7 @@ If a ticket's status is stuck at `in_progress` because the executor crashed, res
 
 ## Executor issues
 
-### The agent hangs and never finishes — orchestration stalls
+### The agent hangs and never finishes, so orchestration stalls
 
 The most common cause is missing headless flags. Executors block on interactive prompts unless told not to:
 
@@ -137,7 +137,7 @@ Ollama is a model server, not a coding agent. It returns text but does not edit 
 
 ### Aider is very slow on a large repo or warns that its context is too large
 
-Aider's repo-map scans the entire repository to build context. On large repos this can take minutes per ticket, and the selected files, project guidance, and Aider overhead can exceed a local model's context window. Always include a non-empty `touches` list in the ticket frontmatter; LaneGate passes those files as explicit Aider file arguments.
+Aider's repo-map scans the entire repository to build context. On large repos this can take minutes per ticket, and the selected files, project guidance, and Aider overhead can exceed a local model's context window. Always include a non-empty `touches` list in the ticket frontmatter. LaneGate passes those files as explicit Aider file arguments.
 
 For a local route, configure the model's usable input budget so LaneGate fails before launching Aider instead of leaving partial Aider changes in the worktree:
 
@@ -155,9 +155,9 @@ The preflight estimates the rendered prompt and selected files conservatively an
 
 ### `lanegate tui` fails: "Go TUI binary or source not found"
 
-`lanegate tui` is a separate Go binary (`tui/` in this repo) — it is not part of the `lanegate` Python package, so `pip install lanegate` alone does not provide it. `lanegate tui` looks for a binary in this order: `LANEGATE_TUI_BIN` env var, `lanegate-tui` on `PATH`, then `go run ./cmd/lanegate-tui` if you have a checkout of this repo with the Go toolchain installed. If none of those resolve, it raises this error.
+`lanegate tui` is a separate Go binary (`tui/` in this repo). It is not part of the `lanegate` Python package, so `pip install lanegate` alone does not provide it. `lanegate tui` looks for a binary in this order: `LANEGATE_TUI_BIN` env var, `lanegate-tui` on `PATH`, then `go run ./cmd/lanegate-tui` if you have a checkout of this repo with the Go toolchain installed. If none of those resolve, it raises this error.
 
-Fix: build the binary — `go build -o lanegate-tui ./tui/cmd/lanegate-tui` from a checkout of this repo — then either put it on `PATH` or point `LANEGATE_TUI_BIN` at it. If the error instead says the Go toolchain isn't on `PATH` (source is present but `go` is missing), install Go or build the binary elsewhere and set `LANEGATE_TUI_BIN`.
+Fix: build the binary with `go build -o lanegate-tui ./tui/cmd/lanegate-tui` from a checkout of this repo, then either put it on `PATH` or point `LANEGATE_TUI_BIN` at it. If the error instead says the Go toolchain isn't on `PATH` (source is present but `go` is missing), install Go or build the binary elsewhere and set `LANEGATE_TUI_BIN`.
 
 ---
 
@@ -165,7 +165,7 @@ Fix: build the binary — `go build -o lanegate-tui ./tui/cmd/lanegate-tui` from
 
 ### `lanegate orchestrate` exits immediately with no tickets processed
 
-Check `lanegate board` — there may be no tickets in `open`, `hibernated`, or `needs_review` status. Drafts and tickets with empty `touches` are skipped. If the board shows open tickets but orchestrate skips them, check whether there is a lock collision (overlapping `touches`) preventing all of them from starting. (A `max_parallel` of `0` or any other non-positive value is not a silent cause here — LaneGate rejects it at config-load time with `max_parallel must be a positive integer`, before orchestrate can run at all.)
+Check `lanegate board`: there may be no tickets in `open`, `hibernated`, or `needs_review` status. Drafts and tickets with empty `touches` are skipped. If the board shows open tickets but orchestrate skips them, check whether there is a lock collision (overlapping `touches`) preventing all of them from starting. (A `max_parallel` of `0` or any other non-positive value is not a silent cause here: LaneGate rejects it at config-load time with `max_parallel must be a positive integer`, before orchestrate can run at all.)
 
 ### Orchestration loop runs forever on one ticket (does not advance)
 
@@ -178,7 +178,7 @@ Causes:
 
 Fix: inspect the executor log in `.lanegate/logs/`, check whether the process ran the lifecycle commands, and reset the ticket status manually if needed. For local models, consider using `reviewer: human` to separate implementation from review and reduce the chance of the model forgetting the combined-mode instructions.
 
-### Combined-mode executor leaves ticket in incomplete state — touches stay locked
+### Combined-mode executor leaves ticket in incomplete state, so touches stay locked
 
 In combined mode, if the executor exited 0 but did not run the full `lanegate complete && lanegate review --verdict ...` sequence, the ticket may end up in an intermediate state (e.g. `code_complete` with no verdict, `needs_review`, or `failed`). Orchestrate will detect this unhandled state, pause the ticket, and report an error:
 
@@ -202,7 +202,7 @@ Alternatively, if the ticket changes look wrong, reset it manually: edit `.laneg
 
 ### `lanegate merge` fails with a merge conflict
 
-LaneGate runs `git merge --no-ff` and aborts on conflict, leaving the ticket in `in_review`. The worktree branch diverged from `main` while the ticket was in progress — another ticket that was merged in parallel modified one of the same files.
+LaneGate runs `git merge --no-ff` and aborts on conflict, leaving the ticket in `in_review`. The worktree branch diverged from `main` while the ticket was in progress, because another ticket that was merged in parallel modified one of the same files.
 
 To resolve: go into the worktree (`cd .lanegate/worktrees/tick-NNN`), rebase or merge `main` into the branch, resolve conflicts, commit, then re-run `lanegate merge <id>` from the repo root.
 
@@ -218,7 +218,7 @@ Do not delete it while another orchestrate process is actively running.
 
 ### How do I know if an overnight `lanegate orchestrate` run got stuck?
 
-Left alone, orchestrate can wedge on any of the causes above (executor hang, lock collision, one ticket stalling the loop) with no visible sign until you come back and look. `lanegate notify-watch` is a small daemon that polls `.lanegate/active-orchestrate.json`, the orchestrator lock, and the ticket board, and pushes a phone notification (via ntfy.sh) the moment something looks wrong — dead executor process, no heartbeat for a while, or the loop stopped with tickets still sitting in `needs_review` / `blocked` / `failed` / hibernated. See [Phone alerts for stuck runs](config-reference.md#phone-alerts-for-stuck-runs-notify-watch) in the config reference for setup.
+Left alone, orchestrate can wedge on any of the causes above (executor hang, lock collision, one ticket stalling the loop) with no visible sign until you come back and look. `lanegate notify-watch` is a small daemon that polls `.lanegate/active-orchestrate.json`, the orchestrator lock, and the ticket board, and pushes a phone notification (via ntfy.sh) the moment something looks wrong: a dead executor process, no heartbeat for a while, or the loop stopped with tickets still sitting in `needs_review` / `blocked` / `failed` / hibernated. See [Phone alerts for stuck runs](config-reference.md#phone-alerts-for-stuck-runs-notify-watch) in the config reference for setup.
 
 If the stall was actually a rate limit and `on_rate_limit: resume` is set, check what `resume-watch` has been doing:
 
@@ -235,7 +235,7 @@ lanegate resume-watch --history   # hibernated -> retrying -> resumed/gave_up, w
 
 LaneGate uses `git worktree add`. This requires:
 - Git 2.15 or later.
-- A clean working tree in the main checkout — `git status` should show no uncommitted changes (especially no conflicting untracked files in the worktrees directory).
+- A clean working tree in the main checkout: `git status` should show no uncommitted changes (especially no conflicting untracked files in the worktrees directory).
 
 If the worktree creation fails, the most likely cause is a stale worktree directory or branch from a previous crashed run. Clean up manually:
 
@@ -276,7 +276,7 @@ The MCP server runs on stdio. Verify your MCP client config is pointing to the `
 
 If `lanegate` is inside a virtualenv, use the full path to the binary instead of the bare name, or activate the venv before starting the MCP client.
 
-To test that the server starts correctly, run `lanegate mcp` directly in your terminal — it should block waiting for JSON-RPC input without printing any errors.
+To test that the server starts correctly, run `lanegate mcp` directly in your terminal. It should block waiting for JSON-RPC input without printing any errors.
 
 ---
 
@@ -316,7 +316,7 @@ git -C .lanegate/worktrees/tick-NNN diff main...tick-NNN
 cat .lanegate/tickets/TICK-NNN.md
 ```
 
-The YAML frontmatter contains `status`, `touches`, and any reviewer verdict. If a field looks wrong, you can edit it directly — LaneGate reads the file on every command.
+The YAML frontmatter contains `status`, `touches`, and any reviewer verdict. If a field looks wrong, you can edit it directly. LaneGate reads the file on every command.
 
 **Check which files are currently locked:**
 

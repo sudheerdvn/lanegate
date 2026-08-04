@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lanegate"
-version = "1.0.0"
+version = "1.0.1"
 description = "Git-native agentic delivery engine — queue, parallel agents, quality gates, staged deployment"
 readme = "README.md"
 license = { file = "LICENSE" }

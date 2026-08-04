@@ -15,7 +15,7 @@ from lanegate.config import resolve_trunk_branch
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", cwd=cwd)
 
 
 def worktree_path(worktrees_dir: Path, ticket_id: str) -> Path:
@@ -66,7 +66,7 @@ def remove_worktree(
     branch_check = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=path,
     )
     branch = branch_check.stdout.strip() if branch_check.returncode == 0 else ""
@@ -97,7 +97,7 @@ def prune_worktrees(repo_root: Path, protected: set[str], worktrees_dir: Path) -
             branch_check = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True,
-                text=True,
+                text=True, encoding="utf-8",
                 cwd=wt,
             )
             branch = branch_check.stdout.strip() if branch_check.returncode == 0 else ""
