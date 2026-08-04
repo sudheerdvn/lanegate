@@ -2,6 +2,18 @@
 
 All notable changes to LaneGate are logged here. Dates are the day a change merged to `main`.
 
+## v1.0.3 (2026-08-04): fixture redaction, docs
+
+- A test fixture (`tests/fixtures/captured_output/tick-349-nested-brace-review.txt`) was a
+  real captured Claude Code session transcript: real session IDs, timestamps, cost data, and
+  internal file paths. The test only needs one JSONL line, so replaced the 162-line real
+  transcript with a small synthetic one carrying the same structural shape.
+- README now documents the `treesitter` optional extra (`pip install "lanegate[treesitter]"`)
+  for non-Python projects — without it, analyze's non-Python symbol matching silently falls
+  back to plain ripgrep text search, which is less precise and pushes more exploration (and
+  token cost) onto the analyzing agent. Python-only projects don't need it. This extra already
+  shipped in earlier versions; it just wasn't documented.
+
 ## v1.0.2 (2026-08-04): docs cleanup
 
 - Removed a migration doc that referenced this project's working name before its first

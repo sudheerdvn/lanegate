@@ -122,12 +122,22 @@ lanegate init    # scaffold .lanegate/ + .lanegate.yml in your repo
 
 `lgt` is installed alongside `lanegate` as a short alias for the same command (e.g. `lgt board`, `lgt next`).
 
+If your project has non-Python source (JS/TS, Go, Rust, Java, Ruby, C/C++), install the `treesitter` extra too:
+
+```bash
+pip install "lanegate[treesitter]"
+```
+
+Ticket analysis matches candidate files by parsing real symbols — via stdlib `ast` for Python, and tree-sitter for everything else. Without the extra, non-Python files fall back to a plain ripgrep text search instead of real symbol matching, which is less precise and pushes more exploration (and token cost) onto the analyzing agent. Python-only projects don't need it — stdlib `ast` covers `.py` files either way.
+
 LaneGate is a standalone CLI, not a library you import into a project. [pipx](https://pipx.pypa.io/) is the recommended way to install it, since it isolates the tool's own dependencies from whatever Python environment your project uses:
 
 ```bash
 pipx install lanegate
 lanegate init
 ```
+
+(`pipx install "lanegate[treesitter]"` for the non-Python symbol matching noted above.)
 
 To run from source:
 
