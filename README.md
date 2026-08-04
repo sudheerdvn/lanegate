@@ -587,4 +587,3 @@ See [ROADMAP.md](ROADMAP.md) for details.
 - `docs/executor-capabilities.md` — capability matrix comparing Claude, Codex, Aider, and Ollama across headless support, prompt transport, local model support, auto-commit behavior, and sandbox status
 - `docs/v2-interface-boundaries.md` — V1.5 layer boundaries (Python core / local API / UI add-on / optional runner), the `lanegate api` endpoint contract and what's built vs. still design-only, and the Go TUI spike result
 - `.lanegate.yml.example` — annotated example configuration
-- `docs/migration-vyuha-to-lanegate.md` — upgrading an existing repo that still has a `.vyuha/` directory or `.vyuha.yml` from before the project was renamed

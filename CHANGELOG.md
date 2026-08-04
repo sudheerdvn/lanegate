@@ -2,6 +2,12 @@
 
 All notable changes to LaneGate are logged here. Dates are the day a change merged to `main`.
 
+## v1.0.2 (2026-08-04): docs cleanup
+
+- Removed a migration doc that referenced this project's working name before its first
+  public release. It didn't apply to anyone: there was no prior public release to migrate
+  from.
+
 ## v1.0.1 (2026-08-03): Windows encoding fix
 
 - Explicit `encoding="utf-8"` on the remaining ~85 `subprocess.run`/`Popen` call sites that
@@ -12,15 +18,6 @@ All notable changes to LaneGate are logged here. Dates are the day a change merg
   Issues mirror) and `lanegate/agent_tools.py` (Claude/Codex/MCP installer).
 
 ## v1.0.0 (2026-08-03): first public release
-
-### Renamed from Vyuha to LaneGate
-
-The project was renamed to LaneGate before this release (TICK-384/385) after a direct
-domain/naming conflict with an unrelated company. The Python package is now `lanegate`,
-the CLI is `lanegate` (short alias `lgt`), and the config filename/state directory follow
-from that (`.lanegate.yml`, `.lanegate/`). If you have an existing repo initialized with
-an older `vyuha` install, see `docs/migration-vyuha-to-lanegate.md` for the one-time
-manual move.
 
 ### Defaults changed from earlier development
 
