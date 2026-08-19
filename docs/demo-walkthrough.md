@@ -2,7 +2,7 @@
 
 This walkthrough shows LaneGate's core flow on a toy Python calculator project. It's self-contained, so you don't need any private project context. The only prerequisites are Python 3.11+, git, and LaneGate installed (see the README for the install command).
 
-> This is a preview build. The workflow works, but it's still evolving, and V1 is not sandboxed at the OS level. See [Security Status](../README.md#security-status) before running agents on repositories you care about.
+> This is a preview build. The workflow works, but it's still evolving, and V1 is not sandboxed at the OS level. See [Security Status](../README.md#security-status) before running automated coding executors on repositories you care about.
 
 ---
 
@@ -15,6 +15,7 @@ mkdir calc && cd calc
 git init
 git commit --allow-empty -m "initial"
 mkdir src tests
+touch src/__init__.py tests/__init__.py
 cat > src/calc.py << 'EOF'
 def add(a, b):
     return a + b
@@ -42,9 +43,9 @@ Initialize LaneGate inside the project:
 lanegate init
 ```
 
-This scaffolds `.lanegate/` (tickets directory, worktrees directory) and drops a `.lanegate.yml` config file at the repo root. You can open `.lanegate.yml` to set your preferred executor, or leave the defaults for now. The dry-run path in step 5 works without any executor configured.
+This scaffolds `.lanegate/` (tickets directory, worktrees directory), updates `.gitignore` with `.lanegate/` and Python bytecode entries (`__pycache__/`, `*.pyc`) so subsequent test runs do not produce untracked files, and drops a `.lanegate.yml` config file at the repo root. You can open `.lanegate.yml` to set your preferred executor, or leave the defaults for now. The dry-run path in step 5 works without any executor configured.
 
-For this toy project, add a small safeguard so `complete` and `merge` are blocked if the tests fail:
+For this toy project, add a small safeguard so `complete` and `merge` are blocked if the tests fail. This runs `pytest` as a subprocess in your project's own environment, not LaneGate's — if you're in a fresh venv, `pip install pytest` first or `pre_complete` will fail before the executor gets a chance to fix anything:
 
 ```yaml
 safeguards:
@@ -69,7 +70,7 @@ Sample output:
 ```
 [TICK-001] draft created
 Analyzing TICK-001...
-TICK-001: touches populated (status: draft — run `lanegate analyze TICK-001` to open)
+TICK-001: touches populated (status: draft - run `lanegate analyze TICK-001` to open)
   touches: src/calc.py, tests/test_calc.py
   close_criteria: multiply(a, b) returns a*b; divide(a, b) returns a/b and raises ValueError on b==0
 ```
@@ -77,7 +78,7 @@ TICK-001: touches populated (status: draft — run `lanegate analyze TICK-001` t
 Review the ticket at `.lanegate/tickets/TICK-001.md`, then flip it to `open`:
 
 ```bash
-lanegate open TICK-001          # touches already set — no new model call needed
+lanegate open TICK-001          # touches already set - no new model call needed
 # or: lanegate analyze TICK-001  # run analysis again and open the ticket
 ```
 
@@ -96,34 +97,29 @@ lanegate create "add a README.md describing the calculator API" --no-analyze
 Edit the resulting draft at `.lanegate/tickets/TICK-002.md` and set `touches: [README.md]` in the frontmatter, then open it:
 
 ```bash
-lanegate open TICK-002          # touches set manually above — open without re-analyzing
+lanegate open TICK-002          # touches set manually above - open without re-analyzing
 # or: lanegate analyze TICK-002  # run analysis to fill or update touches, then open
 ```
 
-At this point the board shows two open tickets:
+---
+
+## 4. Check the board
 
 ```bash
 lanegate board
 ```
 
-```
- ID       P  MS  Age  Title                              Flags
- TICK-001 1      —    add multiply and divide …          
- TICK-002 2      —    add a README.md describing …       
-```
-
----
-
-## 4. Inspect the non-overlapping batch
-
-Before dispatching anything, ask LaneGate which tickets are non-overlapping by declared `touches`:
-
-```bash
-lanegate next
-```
+Sample output:
 
 ```
-Next: TICK-001 — add multiply and divide operations to calc.py
+Ticket Board
+
+open: 2  -  total: 2
+
+OPEN (2)
+ TICK-001 1      -    add multiply and divide …          
+ TICK-002 2      -    add a README.md describing …       
+Next: TICK-001: add multiply and divide operations to calc.py
   priority=1  parallel_safe=True  autonomy=supervised
 
 Non-overlapping batch (can start simultaneously):
@@ -135,12 +131,12 @@ The concurrency model is simple: LaneGate holds a per-file lock from `in_progres
 
 ---
 
-## 5. Run orchestration (dry run first)
+## 5. Run the board (dry run first)
 
 Use `--dry-run` to see what LaneGate would do without touching any files or invoking any executor. This works even if you have no executor (Claude Code, aider, Codex, Ollama) configured.
 
 ```bash
-lanegate orchestrate --dry-run --human-review final
+lanegate run --dry-run --human-review final --all
 ```
 
 ```
@@ -172,7 +168,7 @@ Started TICK-001
   branch:   tick-001
 ```
 
-The worktree is a standard git worktree on branch `tick-001`. Any work the agent (or you) commits there is isolated from `main`. You can open a second terminal and work in both worktrees at the same time. Neither one sees the other's uncommitted changes.
+The worktree is a standard git worktree on branch `tick-001`. Any work the executor (or you) commits there is isolated from `main`. You can open a second terminal and work in both worktrees at the same time. Neither one sees the other's uncommitted changes.
 
 ```bash
 ls .lanegate/worktrees/
@@ -186,7 +182,15 @@ lanegate complete TICK-001
 lanegate review TICK-001
 ```
 
-`lanegate review` normally runs the configured review agent and records its verdict, so it isn't merely a state transition: it can take time, consume model tokens, and requires that executor to be installed. If the project configures `reviewer: human`, `none`, or `auto-none`, it instead moves the ticket to `in_review` without a verdict. In that case, inspect the diff yourself and record the human decision explicitly with `lanegate review TICK-001 --verdict approved` (or `changes_requested`). Use `--verdict` to record a direct human decision, not to skip a configured reviewer that would otherwise run.
+`lanegate review` normally runs the configured reviewer and records its verdict, so it isn't merely a state transition: it can take time, consume model tokens, and requires that executor to be installed. If the project configures `reviewer: human`, `none`, or `auto-none`, it instead moves the ticket to `in_review` without a verdict. In that case, inspect the diff yourself and record the human decision explicitly with `lanegate review TICK-001 --verdict approved` (or `changes_requested`). Use `--verdict` to record a direct human decision, not to skip a configured reviewer that would otherwise run.
+
+If no independent reviewer is available at all (a single-account/single-model setup with no second pool member and `review_fallback` at its default `needs_review`), the ticket escalates straight to `needs_review` instead — a plain `lanegate review TICK-001 --verdict approved` is rejected there with `ERROR: TICK-001 is 'needs_review'`. Clear it with the human escalation command the error names:
+
+```bash
+lanegate human-review TICK-001 --rationale "reviewed the diff myself, looks correct"
+```
+
+This records your rationale and returns the ticket to `code_complete` — it doesn't jump straight to merge. Run `lanegate review TICK-001` (or `--verdict approved`) again afterward to continue through the normal review → merge flow. To stop hitting this on every ticket in a single-account project, set `review_fallback: same_model` in `.lanegate.yml` (accepts same-model self-review) or add a second reviewer/pool member instead of clearing each ticket by hand.
 
 Inspect the diff at any point:
 
@@ -205,7 +209,7 @@ lanegate merge TICK-001
 ```
 
 ```
-[TICK-001] merged → main
+[TICK-001] merged -> main
   worktree .lanegate/worktrees/tick-001 removed
 ```
 
@@ -228,25 +232,28 @@ lanegate board
 Once you have an executor installed and configured in `.lanegate.yml`, you can run the full loop with one command:
 
 ```bash
-lanegate orchestrate --human-review final
+lanegate run --human-review final
 ```
+
+This toy project's tickets have no `milestone` set (nothing in this walkthrough assigned one), so a bare `lanegate run` clears all of them — there's no milestone to scope by. The moment any ticket in a project gets a `milestone` field, `lanegate run` requires an explicit `--milestone <name>` (or a `default_milestone` in `.lanegate.yml`, or `--all` to sweep every milestone), since at that point the scope becomes ambiguous and erroring beats guessing wrong.
 
 LaneGate picks up all open tickets, dispatches the non-overlapping batch, monitors completion, then pauses for your review before merge. To pause after each individual ticket, set `reviewer: human` and use `--human-review per_ticket`.
 
-For a fully local/offline run with Ollama, set this in `.lanegate.yml` before orchestrating:
+For a fully local/offline run with Ollama, set this in `.lanegate.yml` before orchestrating. Raw `executor: ollama` has no file-editing or commit capability and is rejected at dispatch time for anything but `analyze` — use `executor: aider` with an `ollama`/`ollama_chat`-prefixed model instead, since Aider is the one that actually applies and commits the edits (see [executor-capabilities.md](executor-capabilities.md#ollama)):
 
 ```yaml
-executor: ollama
+executor: aider
 models:
-  implement: qwen2.5-coder
-  review: qwen2.5-coder
+  analyze: ollama/qwen2.5-coder                 # any executor works for analyze -- text-only, no file edits
+  implement: ollama_chat/qwen2.5-coder          # must include ollama/ or ollama_chat/ prefix
+  review: ollama_chat/qwen2.5-coder
 ```
 
 Then pull the model and orchestrate:
 
 ```bash
 ollama pull qwen2.5-coder
-lanegate orchestrate --human-review final
+lanegate run --human-review final --all
 ```
 
 ---
@@ -261,8 +268,8 @@ lanegate open <id>                # review analysis, then flip draft → open (n
 # or: lanegate analyze <id>       # run analysis again and open the ticket
 lanegate board                    # see the queue for the active milestone
 lanegate next                     # which tickets can run in parallel right now
-lanegate orchestrate --dry-run    # preview actions without touching files
-lanegate orchestrate --human-review final   # full run: worktrees → impl → review gate
+lanegate run --dry-run --all    # preview actions without touching files
+lanegate run --human-review final --all   # full run: worktrees → impl → review gate
 ```
 
 Each ticket stays in its own git branch and worktree from `start` through `merge`. Parallel tickets with disjoint `touches` lists do not block each other at the file-lock layer, though tests and review are still needed for semantic conflicts. Human review gates (`--human-review final`, or `--human-review per_ticket` with `reviewer: human`) let you inspect diffs before they land on `main`.

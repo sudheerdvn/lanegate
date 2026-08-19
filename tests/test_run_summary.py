@@ -20,6 +20,7 @@ from lanegate.orchestrate.run_summary import (
     RunSummary,
     TicketOutcome,
     TicketOutcomeStatus,
+    list_run_summaries,
 )
 
 
@@ -80,12 +81,39 @@ def test_run_summary_defaults_to_empty_batch_tickets():
     assert r.batch_tickets == []
 
 
+def test_run_summary_round_trips_triggered_by():
+    r_default = RunSummary(
+        run_id="run-1",
+        timestamp=datetime.datetime.now(datetime.UTC),
+        reason=RunReason.SUCCESS,
+    )
+    assert r_default.triggered_by == "manual"
+    assert r_default.trigger_reason is None
+
+    r_custom = RunSummary(
+        run_id="run-2",
+        timestamp=datetime.datetime.now(datetime.UTC),
+        reason=RunReason.SUCCESS,
+        triggered_by="resume-watch",
+        trigger_reason="rate limit on TICK-1",
+    )
+    d = r_custom.to_dict()
+    assert d["triggered_by"] == "resume-watch"
+    assert d["trigger_reason"] == "rate limit on TICK-1"
+
+    restored = RunSummary.from_dict(d)
+    assert restored.triggered_by == "resume-watch"
+    assert restored.trigger_reason == "rate limit on TICK-1"
+
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
         TicketOutcomeStatus.SUCCESS,
         TicketOutcomeStatus.FAILURE,
         TicketOutcomeStatus.CHANGES_REQUESTED,
+        TicketOutcomeStatus.AWAITING_MERGE,
         TicketOutcomeStatus.SKIPPED,
         TicketOutcomeStatus.IN_PROGRESS,
         TicketOutcomeStatus.INTERRUPTED,
@@ -96,7 +124,9 @@ def test_ticket_outcome_enum_values_round_trip(outcome):
     assert TicketOutcomeStatus(t.to_dict()["outcome"]) == outcome
 
 
-@pytest.mark.parametrize("reason", [RunReason.SUCCESS, RunReason.FAILURE, RunReason.STOPPED])
+@pytest.mark.parametrize(
+    "reason", [RunReason.RUNNING, RunReason.SUCCESS, RunReason.FAILURE, RunReason.STOPPED]
+)
 def test_run_summary_enum_values_round_trip(reason):
     r = _make_run_summary(reason=reason)
     assert RunReason(r.to_dict()["reason"]) == reason
@@ -181,3 +211,160 @@ def test_run_summary_to_dict_is_json_serializable():
 
     r = _make_run_summary()
     json.dumps(r.to_dict())  # must not raise
+
+
+def test_list_run_summaries_includes_direct_actions(tmp_path):
+    from lanegate.orchestrate.run_report import begin_direct_action, record_direct_action_event
+
+    tracking = begin_direct_action(tmp_path, "merge", ticket_id="TICK-099", executor="cli")
+    record_direct_action_event(
+        tmp_path, tracking["action_id"], "action_end", action_type="merge",
+        ticket_id="TICK-099", status="success",
+    )
+    summaries = list_run_summaries({"tickets_dir": "tickets", "ticket_prefix": "TICK"}, tmp_path)
+    summary = next(s for s in summaries if s.run_id == tracking["action_id"])
+    assert summary.reason == RunReason.SUCCESS
+    assert summary.batch_tickets[0].ticket_id == "TICK-099"
+    assert summary.batch_tickets[0].executor == "direct:merge"
+
+
+def test_list_run_summaries_reports_interrupted_for_ticket_without_outcome_event(tmp_path):
+    import json
+
+    tickets_dir = tmp_path / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+    (tickets_dir / "TICK-101.md").write_text("---\nid: TICK-101\ntitle: Test Ticket 101\nstatus: merged\n---\n", encoding="utf-8")
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    events_path = logs_dir / "orchestrate-20260811-010000.events.jsonl"
+    events = [
+        {"ts": "2026-08-11T01:00:00Z", "event": "run_start"},
+        {"ts": "2026-08-11T01:00:01Z", "event": "ticket_dispatch", "ticket_id": "TICK-101", "executor": "claude"},
+        {"ts": "2026-08-11T01:00:02Z", "event": "run_end", "status": "completed"},
+    ]
+    events_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    cfg = {"tickets_dir": ".lanegate/tickets", "ticket_prefix": "TICK"}
+    summaries = list_run_summaries(cfg, tmp_path)
+    assert len(summaries) == 1
+    s = summaries[0]
+    assert len(s.batch_tickets) == 1
+    assert s.batch_tickets[0].ticket_id == "TICK-101"
+    assert s.batch_tickets[0].outcome == TicketOutcomeStatus.INTERRUPTED
+
+
+def test_build_run_summary_preserves_recorded_failure_for_merged_ticket(tmp_path):
+    import json
+    from lanegate.orchestrate.run_summary import build_run_summary
+
+    tickets_dir = tmp_path / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+    (tickets_dir / "TICK-102.md").write_text("---\nid: TICK-102\ntitle: Test Ticket 102\nstatus: merged\n---\n", encoding="utf-8")
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    events_path = logs_dir / "orchestrate-20260811-010000.events.jsonl"
+    events = [
+        {"ts": "2026-08-11T01:00:00Z", "event": "run_start"},
+        {"ts": "2026-08-11T01:00:01Z", "event": "ticket_dispatch", "ticket_id": "TICK-102", "executor": "claude"},
+        {"ts": "2026-08-11T01:00:02Z", "event": "ticket_outcome", "ticket_id": "TICK-102", "outcome": "failure", "reason": "pytest failed"},
+        {"ts": "2026-08-11T01:00:03Z", "event": "run_end", "status": "completed"},
+    ]
+    events_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    cfg = {"tickets_dir": ".lanegate/tickets", "ticket_prefix": "TICK"}
+    summary = build_run_summary(cfg, tmp_path, session_ts="20260811-010000")
+    assert summary is not None
+    assert summary.batch_tickets[0].outcome == TicketOutcomeStatus.FAILURE
+    assert "pytest failed" in (summary.batch_tickets[0].failure_reason or "")
+
+
+def test_list_run_summaries_preserves_direct_merge_action_for_supervised_run(tmp_path):
+    import json
+
+    tickets_dir = tmp_path / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+    (tickets_dir / "TICK-103.md").write_text("---\nid: TICK-103\ntitle: Test Ticket 103\nstatus: merged\n---\n", encoding="utf-8")
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    events_path = logs_dir / "orchestrate-20260811-010000.events.jsonl"
+    events = [
+        {"ts": "2026-08-11T01:00:00Z", "event": "run_start"},
+        {"ts": "2026-08-11T01:00:01Z", "event": "ticket_dispatch", "ticket_id": "TICK-103", "executor": "claude"},
+        {"ts": "2026-08-11T01:00:02Z", "event": "ticket_outcome", "ticket_id": "TICK-103", "outcome": "awaiting_human_review"},
+        {"ts": "2026-08-11T01:00:03Z", "event": "run_end", "status": "completed"},
+    ]
+    events_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    action_path = logs_dir / "action-20260811-020000.events.jsonl"
+    action_events = [
+        {"ts": "2026-08-11T02:00:00Z", "event": "action_start", "action_id": "action-20260811-020000", "action_type": "merge", "ticket_id": "TICK-103"},
+        {"ts": "2026-08-11T02:00:05Z", "event": "action_end", "action_id": "action-20260811-020000", "action_type": "merge", "ticket_id": "TICK-103", "status": "success"},
+    ]
+    action_path.write_text("\n".join(json.dumps(e) for e in action_events) + "\n", encoding="utf-8")
+
+    cfg = {"tickets_dir": ".lanegate/tickets", "ticket_prefix": "TICK"}
+    summaries = list_run_summaries(cfg, tmp_path)
+    assert len(summaries) == 2
+    action_summary = next(s for s in summaries if s.run_id == "action-20260811-020000")
+    assert action_summary.batch_tickets[0].ticket_id == "TICK-103"
+    assert action_summary.batch_tickets[0].executor == "direct:merge"
+
+
+def test_build_direct_action_summary_review_changes_requested_is_not_failure(tmp_path):
+    import json
+    from lanegate.orchestrate.run_summary import _build_direct_action_summary
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    action_id = "action-20260811-030000"
+    action_path = logs_dir / f"{action_id}.events.jsonl"
+    action_events = [
+        {"ts": "2026-08-11T03:00:00Z", "event": "action_start", "action_id": action_id, "action_type": "review", "ticket_id": "TICK-104"},
+        {
+            "ts": "2026-08-11T03:00:05Z",
+            "event": "action_end",
+            "action_id": action_id,
+            "action_type": "review",
+            "ticket_id": "TICK-104",
+            "status": "failed",
+            "verdict": "changes_requested",
+            "review_summary": "Needs tests",
+        },
+    ]
+    action_path.write_text("\n".join(json.dumps(e) for e in action_events) + "\n", encoding="utf-8")
+
+    summary = _build_direct_action_summary(tmp_path, action_id)
+    assert summary is not None
+    assert summary.batch_tickets[0].outcome == TicketOutcomeStatus.CHANGES_REQUESTED
+    assert summary.batch_tickets[0].review_reason == "Needs tests"
+
+
+def test_build_direct_action_summary_review_approved_is_success(tmp_path):
+    import json
+    from lanegate.orchestrate.run_summary import _build_direct_action_summary
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    action_id = "action-20260811-030100"
+    action_path = logs_dir / f"{action_id}.events.jsonl"
+    action_events = [
+        {"ts": "2026-08-11T03:01:00Z", "event": "action_start", "action_id": action_id, "action_type": "review", "ticket_id": "TICK-105"},
+        {
+            "ts": "2026-08-11T03:01:05Z",
+            "event": "action_end",
+            "action_id": action_id,
+            "action_type": "review",
+            "ticket_id": "TICK-105",
+            "status": "success",
+            "verdict": "approved",
+        },
+    ]
+    action_path.write_text("\n".join(json.dumps(e) for e in action_events) + "\n", encoding="utf-8")
+
+    summary = _build_direct_action_summary(tmp_path, action_id)
+    assert summary is not None
+    assert summary.batch_tickets[0].outcome == TicketOutcomeStatus.SUCCESS
+

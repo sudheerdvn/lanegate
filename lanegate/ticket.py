@@ -14,7 +14,12 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from lanegate.config import load_config, resolve_trunk_branch
+from lanegate.config import (
+    is_auto_fix_lane,
+    is_high_reasoning_ticket,
+    load_config,
+    resolve_trunk_branch,
+)
 
 # Ordered frontmatter keys for clean round-trip dumps
 _FRONTMATTER_KEY_ORDER = [
@@ -22,6 +27,7 @@ _FRONTMATTER_KEY_ORDER = [
     "title",
     "status",
     "status_changed_at",
+    "lifecycle_events_summary",
     "lifecycle_events",
     "milestone",
     "batch",
@@ -30,6 +36,12 @@ _FRONTMATTER_KEY_ORDER = [
     "file_skeletons_ref",
     "file_skeletons_summary",
     "file_skeletons",
+    "change_notes_summary",
+    "change_notes",
+    "acceptance_matrix",
+    "overlap_review",
+    "acceptance_contract_audit_summary",
+    "acceptance_contract_audit",
     "parallel_safe",
     "autonomy",
     "source",
@@ -38,7 +50,10 @@ _FRONTMATTER_KEY_ORDER = [
     "executor",
     "reviewer",
     "analyze_session_id",
+    "analyzed_at_sha",
+    "pre_complete_verified_sha",
     "implement_session_id",
+    "implement_mode",
     "fix_session_id",
     "feature_flag",
     "depends_on",
@@ -49,13 +64,19 @@ _FRONTMATTER_KEY_ORDER = [
     "invariants",
     "review_driver",
     "review_model",
+    "review_model_pin",
     "review_independence",
     "reviewed_at",
     "review_verdict",
     "review_summary",
     "review_findings",
+    "review_retry_after",
+    "review_retry_attempt",
     "verification",
     "auto_fix_attempts",
+    "requires_human_merge",
+    "human_merge_reason",
+    "rebase_conflict_files",
 ]
 
 # Frontmatter needs to remain compact and safely serializable even when an
@@ -99,7 +120,87 @@ DEPENDENCY_SATISFIED_STATUSES = frozenset({"merged", "validated", "done"})
 _ATTENTION_SECTION_HEADERS = (
     "## Needs Review Reason",
     "## Failure Reason",
+    "## Hibernation Reason",
 )
+
+# A hibernation carrying this marker is retried by resume-watch rather than
+# requiring an operator decision.  The classifier lives here because both the
+# orchestrator and human-attention views must make exactly the same split.
+_RATE_LIMIT_MARKER = "rate limit or quota interruption"
+
+# A hibernation carrying this marker means every eligible independent
+# reviewer was cooling down (not a subprocess rate-limit response) -- a
+# ticket-level state resolvable by waiting out review_retry_after, distinct
+# from both _RATE_LIMIT_MARKER above and the permanent no-reviewer-available
+# needs_review escalation.
+_REVIEWER_COOLDOWN_MARKER = "temporarily unavailable"
+_NON_RATE_LIMIT_HARD_ERROR_PATTERNS = (
+    r"\binvalid_request_error\b",
+    r"\bstatus[\"']?\s*:\s*400\b",
+    r"\brequires a newer version of codex\b",
+    r"\bmodel metadata\b.{0,120}\bnot found\b",
+    r"\bunknown model\b",
+    r"\bmodel .* does not exist\b",
+)
+
+
+def _has_non_rate_limit_hard_error(text: str) -> bool:
+    """Return whether a rate-limit-looking hibernation is actually fatal."""
+    lowered = text.lower()
+    return any(re.search(pattern, lowered) for pattern in _NON_RATE_LIMIT_HARD_ERROR_PATTERNS)
+
+
+def _active_rate_limit_hibernation(ticket: dict) -> bool:
+    """Whether resume-watch, rather than a human, should resume this hibernation.
+
+    The rate-limit marker can land in the ticket body (## Hibernation Reason)
+    or, for a hibernated review_pending ticket, in the review_pending_reason
+    frontmatter field instead — both must be checked or such tickets get
+    misclassified as needing a human.
+    """
+    text = "\n".join(
+        part for part in (ticket.get("_body") or "", ticket.get("review_pending_reason") or "") if part
+    )
+    return _RATE_LIMIT_MARKER in text and not _has_non_rate_limit_hard_error(text)
+
+
+def _active_reviewer_cooldown_hibernation(ticket: dict) -> bool:
+    """Whether a hibernated review_pending ticket is waiting out a reviewer cooldown.
+
+    Distinct from ``_active_rate_limit_hibernation``: this marks every
+    eligible independent reviewer cooling down, not a genuine subprocess
+    rate-limit response, so next_batch/cmd_next can gate dispatch on the
+    recorded ``review_retry_after`` window instead of resume-watch's
+    rate-limit handling.
+    """
+    return _REVIEWER_COOLDOWN_MARKER in (ticket.get("review_pending_reason") or "")
+
+
+def reviewer_cooldown_retry_pending(ticket: dict, *, now: datetime.datetime | None = None) -> bool:
+    """Whether a reviewer-cooldown hibernation's retry window hasn't elapsed.
+
+    next_batch/cmd_next call this to decide whether a hibernated
+    review_pending ticket is still eligible for dispatch. Fails closed to
+    "retry eligible now" -- returns False, same as before review_retry_after
+    existed -- for a pre-migration ticket with no recorded retry time and for
+    a malformed/unparsable timestamp, rather than skipping the ticket forever
+    or raising.
+    """
+    if not _active_reviewer_cooldown_hibernation(ticket):
+        return False
+    raw = ticket.get("review_retry_after")
+    if not raw:
+        return False
+    text = str(raw).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        retry_at = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=datetime.UTC)
+    return retry_at > (now or datetime.datetime.now(datetime.UTC))
 
 # Statuses shown on the board — unknown statuses are bucketed under OTHER
 # draft: intent captured, analysis not yet done. Not terminal, not a lock status.
@@ -123,7 +224,10 @@ _STANDARD_STATUSES = [
     "closed",
 ]
 
-_VALID_AUTONOMY = frozenset({"full", "supervised", "manual"})
+# "green"/"yellow"/"red" are risk-based autonomy lanes (TICK-467): green and
+# yellow stay on the automatic amend/re-analyze -> fix -> re-review path like
+# "full", while red always escalates to a human regardless of retry budget.
+_VALID_AUTONOMY = frozenset({"full", "supervised", "manual", "green", "yellow", "red"})
 _VALID_EXECUTOR_TYPES = frozenset(
     {
         "claude",
@@ -222,6 +326,43 @@ def _validate_safeguards(safeguards: dict | None) -> list[str]:
     return errors
 
 
+_ACCEPTANCE_MATRIX_FIELDS = (
+    "invariants", "adversarial_cases", "compatibility_cases", "regression_tests",
+)
+def validate_acceptance_matrix(matrix: object, *, required: bool = False) -> list[str]:
+    """Validate the analyzer-produced contract retained on high-risk tickets."""
+    if matrix is None:
+        return ["acceptance_matrix is required for this high-risk ticket"] if required else []
+    if not isinstance(matrix, dict):
+        return ["acceptance_matrix must be a mapping"]
+    errors: list[str] = []
+    for field in _ACCEPTANCE_MATRIX_FIELDS:
+        value = matrix.get(field)
+        if value is None and not required:
+            continue
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            errors.append(f"acceptance_matrix.{field} must be a list of non-empty strings")
+        elif required and not value:
+            errors.append(f"acceptance_matrix.{field} must be a non-empty list of non-empty strings")
+    return errors
+
+
+def validate_overlap_review(review: object) -> list[str]:
+    """Validate an ordering or stacked-review declaration for an overlap."""
+    if not isinstance(review, dict):
+        return ["overlap_review must be a mapping"]
+    if review.get("mode") not in {"dependencies", "stacked_review"}:
+        return ["overlap_review.mode must be 'dependencies' or 'stacked_review'"]
+    ticket_ids = review.get("ticket_ids")
+    if not isinstance(ticket_ids, list) or not ticket_ids or not all(
+        isinstance(ticket_id, str) and ticket_id.strip() for ticket_id in ticket_ids
+    ):
+        return ["overlap_review.ticket_ids must be a non-empty list of ticket IDs"]
+    return []
+
+
 def validate_ticket(meta: dict, cfg: dict | None = None) -> list[str]:
     """Return a list of error strings for a ticket meta dict; [] means valid."""
     errors: list[str] = []
@@ -247,6 +388,10 @@ def validate_ticket(meta: dict, cfg: dict | None = None) -> list[str]:
     touches = meta.get("touches")
     if touches is not None and not isinstance(touches, list):
         errors.append(f"touches must be a list, got: {type(touches).__name__}")
+
+    errors.extend(validate_acceptance_matrix(meta.get("acceptance_matrix")))
+    if meta.get("overlap_review") is not None:
+        errors.extend(validate_overlap_review(meta["overlap_review"]))
 
     file_skeletons = meta.get("file_skeletons")
     if file_skeletons is not None:
@@ -321,6 +466,10 @@ def validate_ticket(meta: dict, cfg: dict | None = None) -> list[str]:
     if analyze_session_id is not None and not isinstance(analyze_session_id, str):
         errors.append("analyze_session_id must be a string if present")
 
+    analyzed_at_sha = meta.get("analyzed_at_sha")
+    if analyzed_at_sha is not None and not isinstance(analyzed_at_sha, str):
+        errors.append("analyzed_at_sha must be a string if present")
+
     implement_session_id = meta.get("implement_session_id")
     if implement_session_id is not None and not isinstance(implement_session_id, str):
         errors.append("implement_session_id must be a string if present")
@@ -328,6 +477,12 @@ def validate_ticket(meta: dict, cfg: dict | None = None) -> list[str]:
     fix_session_id = meta.get("fix_session_id")
     if fix_session_id is not None and not isinstance(fix_session_id, str):
         errors.append("fix_session_id must be a string if present")
+
+    review_model_pin = meta.get("review_model_pin")
+    if review_model_pin is not None and (
+        not isinstance(review_model_pin, str) or not review_model_pin.strip()
+    ):
+        errors.append("review_model_pin must be a non-empty string if present")
 
     safeguards = meta.get("safeguards")
     if safeguards is not None:
@@ -398,12 +553,21 @@ def ticket_glob(tickets_dir: Path, prefix: str) -> list[Path]:
     return sorted(p for p in tickets_dir.iterdir() if p.is_file() and pat.match(p.name))
 
 
+def _isoformat_date(val: datetime.date | datetime.datetime | str) -> str:
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        s = val.isoformat()
+        if s.endswith("+00:00"):
+            s = s[:-6] + "Z"
+        return s
+    return str(val)
+
+
 def _normalize_dates(meta: dict) -> dict:
     """Coerce any date/datetime scalar YAML implicitly typed (e.g. `created: 2026-07-03`)
     back to an ISO string, so every ticket dict is JSON-serializable by construction."""
     for key, value in meta.items():
         if isinstance(value, (datetime.date, datetime.datetime)):
-            meta[key] = value.isoformat()
+            meta[key] = _isoformat_date(value)
     return meta
 
 
@@ -425,6 +589,19 @@ def parse_ticket(path: Path) -> dict | None:
     meta = _normalize_dates(meta)
     meta["_body"] = body
     meta["_path"] = path
+
+    cnotes = load_change_notes(meta)
+    if cnotes:
+        meta["change_notes"] = cnotes
+
+    audit = load_acceptance_contract_audit(meta)
+    if audit:
+        meta["acceptance_contract_audit"] = audit
+
+    l_events = load_lifecycle_events(meta)
+    if l_events:
+        meta["lifecycle_events"] = l_events
+
     return meta
 
 
@@ -438,6 +615,12 @@ _REVIEW_FINDINGS_HEADER_RE = re.compile(
 )
 
 
+def _find_next_h2_heading(text: str) -> int:
+    """Return character index of next H2 section header (``\\n## `` not ``\\n###``) in ``text``, or -1."""
+    match = re.search(r"\n##(?![#])", text)
+    return match.start() if match else -1
+
+
 def review_findings_sections(body: str) -> list[tuple[str, str]]:
     """Return ``(header, text)`` for each review-findings section, oldest first.
 
@@ -449,7 +632,7 @@ def review_findings_sections(body: str) -> list[tuple[str, str]]:
     sections: list[tuple[str, str]] = []
     for match in _REVIEW_FINDINGS_HEADER_RE.finditer(body or ""):
         rest = body[match.end():]
-        next_heading = rest.find("\n##")
+        next_heading = _find_next_h2_heading(rest)
         end = len(rest) if next_heading == -1 else next_heading
         sections.append((match.group(0).strip(), rest[:end].strip()))
     return sections
@@ -478,8 +661,370 @@ def _body_section(ticket: dict, header: str) -> str:
         return ""
     _, _, rest = body.partition(header)
     after = rest.lstrip("\n")
-    next_heading = after.find("\n##")
+    next_heading = _find_next_h2_heading(after)
     return after if next_heading == -1 else after[:next_heading]
+
+
+def _upsert_body_section(body: str, header: str, new_section_text: str) -> str:
+    """Replace or append a section in ticket body."""
+    if not new_section_text:
+        return body
+    if header in body:
+        before, _, after = body.partition(header)
+        next_heading = _find_next_h2_heading(after)
+        tail = "" if next_heading == -1 else after[next_heading:]
+        return before.rstrip() + "\n\n" + new_section_text.strip() + "\n" + tail
+    else:
+        return body.rstrip() + "\n\n" + new_section_text.strip() + "\n"
+
+
+def render_change_notes_section(change_notes: dict[str, str]) -> str:
+    """Render structured change_notes dict into readable '## Change Notes' markdown section."""
+    if not isinstance(change_notes, dict) or not change_notes:
+        return ""
+    lines = ["## Change Notes"]
+    for path, note in change_notes.items():
+        if isinstance(path, str) and isinstance(note, str):
+            lines.append(f"**{path}**: {note}")
+    return "\n".join(lines)
+
+
+def load_change_notes(ticket: dict) -> dict[str, str]:
+    """Return change_notes dict from ticket (legacy frontmatter dict or hydrated from body)."""
+    raw = ticket.get("change_notes")
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    sec = _body_section(ticket, "## Change Notes")
+    if not sec:
+        return {}
+    res: dict[str, str] = {}
+    for line in sec.splitlines():
+        line_str = line.strip()
+        if not line_str:
+            continue
+        line_str = re.sub(r"^[-*]\s+", "", line_str)
+        m = re.match(r"^(?:\*\*(.*?)\*\*|([^\n:]+))\s*:\s*(.*)$", line_str)
+        if m:
+            path = (m.group(1) or m.group(2) or "").strip()
+            note = (m.group(3) or "").strip()
+            if path and note:
+                res[path] = note
+    return res
+
+
+_CROSS_TICKET_NOTES_STATUSES = frozenset({"merged", "done"})
+_CROSS_TICKET_NOTES_BUDGET_BYTES = 4000
+
+
+def find_control_plane_touch_overlaps(
+    ticket: dict, tickets_dir: Path, cfg: dict | None = None, *, exclude_id: str | None = None,
+) -> list[dict[str, object]]:
+    """Return active high-risk tickets sharing an exact declared touch.
+
+    High-risk classification comes from portable ticket metadata rather than
+    package-specific paths, so projects embedding LaneGate use the same gate.
+    """
+    ticket_id = exclude_id or ticket.get("id")
+    touches = {str(path) for path in (ticket.get("touches") or [])}
+    if not is_high_reasoning_ticket(ticket) or not touches or not tickets_dir.exists():
+        return []
+    prefix = (cfg or {}).get("ticket_prefix", "TICK")
+    all_tickets, _ = load_all_tickets(tickets_dir, prefix, cfg)
+    overlaps: list[dict[str, object]] = []
+    for other in all_tickets:
+        other_id = other.get("id")
+        if not other_id or other_id == ticket_id or other.get("status") in TERMINAL_STATUSES:
+            continue
+        if not is_high_reasoning_ticket(other):
+            continue
+        shared = sorted(touches & {str(path) for path in (other.get("touches") or [])})
+        if shared:
+            overlaps.append({"ticket_id": other_id, "paths": shared})
+    return overlaps
+
+
+def collect_cross_ticket_change_notes(
+    ticket: dict,
+    tickets_dir: Path,
+    cfg: dict | None = None,
+    exclude_id: str | None = None,
+) -> str:
+    """Return a bounded '## Prior Change Notes' section surfacing what earlier
+    merged/done tickets recorded (via change_notes) about files *ticket* also
+    touches.
+
+    This is the git-tracked replacement for the old per-file
+    ``.lanegate/notes/<flat_path>.md`` mechanism (dead: written only in the
+    ticket's own worktree, never at the repo_root the reader used, and
+    gitignored besides). change_notes lives in ticket frontmatter, which is
+    git-tracked and survives worktree merges, so cross-ticket lookup over it
+    works from any repo_root without extra plumbing.
+
+    Returns "" when there is nothing relevant to surface.
+    """
+    from lanegate.prompts import truncate_to_budget
+
+    exclude = exclude_id or ticket.get("id")
+    touches = [str(p) for p in (ticket.get("touches") or []) if p]
+    if not touches or not tickets_dir.exists():
+        return ""
+    touches_set = set(touches)
+
+    prefix = (cfg or {}).get("ticket_prefix", "TICK") if cfg else "TICK"
+    all_tickets, _ = load_all_tickets(tickets_dir, prefix, cfg)
+
+    entries: list[str] = []
+    for other in all_tickets:
+        other_id = other.get("id")
+        if not other_id or other_id == exclude:
+            continue
+        if other.get("status") not in _CROSS_TICKET_NOTES_STATUSES:
+            continue
+        other_touches = set(str(p) for p in (other.get("touches") or []) if p)
+        overlap = sorted(touches_set & other_touches)
+        if not overlap:
+            continue
+        other_notes = load_change_notes(other)
+        for path in overlap:
+            note = other_notes.get(path)
+            if note:
+                entries.append(f"**{path}** ({other_id}): {note}")
+
+    if not entries:
+        return ""
+
+    section = "## Prior Change Notes\n" + "\n".join(entries)
+    section, _ = truncate_to_budget(section, _CROSS_TICKET_NOTES_BUDGET_BYTES)
+    return section
+
+
+def render_acceptance_contract_audit_section(audit: dict) -> str:
+    """Render structured acceptance_contract_audit dict into readable '## Acceptance Contract Audit' markdown section."""
+    if not isinstance(audit, dict) or not audit:
+        return ""
+    ok = bool(audit.get("ok"))
+    findings = [str(f) for f in audit.get("findings") or []]
+    omitted = [str(item) for item in audit.get("omitted_items") or []]
+    checked = [str(item) for item in audit.get("checked_items") or []]
+    sources = [str(s) for s in audit.get("sources") or []]
+
+    status_str = f"ok ({len(findings)} findings)" if ok else f"failed ({len(findings)} findings)"
+    lines = ["## Acceptance Contract Audit", f"**Status**: {status_str}"]
+
+    if findings:
+        lines.append("\n**Findings**:")
+        for f in findings:
+            lines.append(f"- {f}")
+
+    if omitted:
+        lines.append("\n**Omitted Items**:")
+        for item in omitted:
+            lines.append(f"- {item}")
+
+    if checked:
+        lines.append("\n**Checked Items**:")
+        for item in checked:
+            lines.append(f"- {item}")
+
+    if sources:
+        lines.append("\n**Sources**:")
+        for s in sources:
+            lines.append(f"- {s}")
+
+    return "\n".join(lines)
+
+
+def load_acceptance_contract_audit(ticket: dict) -> dict:
+    """Return acceptance_contract_audit dict from ticket (legacy frontmatter dict or hydrated from body)."""
+    raw = ticket.get("acceptance_contract_audit")
+    if isinstance(raw, dict) and "ok" in raw and isinstance(raw["ok"], bool):
+        return raw
+    sec = _body_section(ticket, "## Acceptance Contract Audit")
+    if not sec:
+        return {}
+
+    ok = True
+    findings: list[str] = []
+    omitted_items: list[str] = []
+    checked_items: list[str] = []
+    sources: list[str] = []
+
+    current_target: list[str] | None = None
+    for line in sec.splitlines():
+        lstr = line.strip()
+        if not lstr:
+            continue
+        if lstr.startswith("**Status**:") or lstr.startswith("Status:"):
+            status_text = lstr.partition(":")[2].strip().lower()
+            if "failed" in status_text:
+                ok = False
+            elif "ok" in status_text:
+                ok = True
+            continue
+
+        lowered = lstr.lower()
+        if "findings" in lowered and (lstr.startswith("**") or lstr.startswith("###") or lstr.endswith(":")):
+            current_target = findings
+            continue
+        elif "omitted" in lowered and (lstr.startswith("**") or lstr.startswith("###") or lstr.endswith(":")):
+            current_target = omitted_items
+            continue
+        elif "checked" in lowered and (lstr.startswith("**") or lstr.startswith("###") or lstr.endswith(":")):
+            current_target = checked_items
+            continue
+        elif "sources" in lowered and (lstr.startswith("**") or lstr.startswith("###") or lstr.endswith(":")):
+            current_target = sources
+            continue
+
+        if current_target is not None and (lstr.startswith("-") or lstr.startswith("*")):
+            item = lstr.lstrip("-* ").strip()
+            if item and item.lower() != "none":
+                current_target.append(item)
+
+    if "failed" not in sec.lower() and not findings:
+        ok = True
+    elif findings and "ok" not in sec.lower().split("\n")[0]:
+        ok = False
+
+    return {
+        "ok": ok,
+        "findings": findings,
+        "omitted_items": omitted_items,
+        "checked_items": checked_items,
+        "sources": sources,
+    }
+
+
+def render_lifecycle_timeline_section(events: list[dict]) -> str:
+    """Render structured lifecycle_events list into readable '## Lifecycle Timeline' markdown section."""
+    if not isinstance(events, list) or not events:
+        return ""
+    lines = ["## Lifecycle Timeline"]
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        stamp = evt.get("at", "")
+        if stamp:
+            stamp = _isoformat_date(stamp)
+        else:
+            stamp = ""
+        from_status = evt.get("from_status")
+        to_status = evt.get("to_status")
+        summary = evt.get("summary", "")
+        evt_name = evt.get("event", "")
+
+        transition = ""
+        if from_status and to_status:
+            transition = f"{from_status} → {to_status}"
+        elif to_status:
+            transition = to_status
+
+        if evt_name and summary and evt_name != summary:
+            detail = f"{evt_name}: {summary}"
+        else:
+            detail = summary or evt_name
+
+        text = " — ".join(part for part in (transition, detail) if part)
+        if stamp:
+            lines.append(f"- {stamp}: {text}")
+        else:
+            lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
+def load_lifecycle_events(ticket: dict) -> list[dict]:
+    """Return lifecycle_events list from ticket (legacy frontmatter list or hydrated from body)."""
+    raw = ticket.get("lifecycle_events")
+    if isinstance(raw, list) and raw and all(isinstance(x, dict) for x in raw):
+        res = []
+        for x in raw:
+            item = dict(x)
+            at_val = item.get("at")
+            if at_val is not None:
+                item["at"] = _isoformat_date(at_val)
+            res.append(item)
+        return res
+    sec = _body_section(ticket, "## Lifecycle Timeline")
+    if not sec:
+        return []
+    events: list[dict] = []
+    for line in sec.splitlines():
+        lstr = line.strip()
+        if not (lstr.startswith("-") or lstr.startswith("*")):
+            continue
+        entry_text = lstr.lstrip("-* ").strip()
+        if not entry_text:
+            continue
+        stamp = ""
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)?)\s*:\s*(.*)$", entry_text)
+        if m:
+            stamp = m.group(1)
+            rest = m.group(2)
+        else:
+            rest = entry_text
+
+        summary = ""
+        trans_part = rest
+        detail_part = ""
+        if " — " in rest:
+            trans_part, _, detail_part = rest.partition(" — ")
+        elif " - " in rest:
+            trans_part, _, detail_part = rest.partition(" - ")
+
+        from_status = None
+        to_status = None
+        if " → " in trans_part:
+            fs, _, ts = trans_part.partition(" → ")
+            from_status = fs.strip()
+            to_status = ts.strip()
+        elif " -> " in trans_part:
+            fs, _, ts = trans_part.partition(" -> ")
+            from_status = fs.strip()
+            to_status = ts.strip()
+        elif trans_part.strip() in {"open", "in_progress", "code_complete", "in_review", "hibernated", "done", "merged", "validated", "failed", "closed", "needs_review"}:
+            to_status = trans_part.strip()
+        else:
+            if not detail_part:
+                detail_part = trans_part
+                trans_part = ""
+
+        evt_name = ""
+        summary = ""
+        detail_str = detail_part.strip()
+        if ": " in detail_str:
+            evt_name, _, summary = detail_str.partition(": ")
+            evt_name = evt_name.strip()
+            summary = summary.strip()
+        elif detail_str:
+            summary = detail_str
+            if summary in {"implementation_started", "status_changed", "needs_review", "review_verdict", "review_started", "review_completed", "merged", "hibernated", "reopened", "superseded", "failed"}:
+                evt_name = summary
+            elif summary == "worktree claimed for implementation" or (from_status == "open" and to_status == "in_progress" and "claimed" in summary):
+                evt_name = "implementation_started"
+            elif summary == "merge completed on main" or to_status == "merged":
+                evt_name = "merged"
+            elif summary == "lifecycle transition":
+                evt_name = "status_changed"
+            else:
+                evt_name = summary
+        elif from_status or to_status:
+            evt_name = to_status or "transition"
+            summary = ""
+        else:
+            evt_name = "transition"
+            summary = ""
+
+        if not evt_name:
+            evt_name = summary or (trans_part.strip() if trans_part else "transition")
+
+        events.append({
+            "at": stamp,
+            "event": evt_name,
+            "from_status": from_status,
+            "to_status": to_status,
+            "summary": summary,
+        })
+    return events
 
 
 def _summary_line(text: str, *, limit: int = 180) -> str:
@@ -506,6 +1051,12 @@ def _clean_attention_reason(reason: str) -> str:
             return f"Reviewer process timed out after {match.group(1)}"
         return "Reviewer subprocess execution failed"
 
+    lowered = reason.lower()
+    if "rate limit" in lowered or "quota" in lowered:
+        # The rate-limit/quota phrase is more actionable than a generic exit-code
+        # translation, and callers rely on this text to detect is_rate_limited.
+        return reason
+
     match = re.search(r"executor exited (?:with code|code)?\s*(-?\d+)", reason)
     if match:
         code = int(match.group(1))
@@ -530,13 +1081,26 @@ def _clean_attention_reason(reason: str) -> str:
     return reason
 
 
+def _reason_section_applies(status: str | None, verdict: str | None) -> bool:
+    """Whether a ## Needs/Failure/Hibernation Reason body section still describes
+    the ticket's *current* state.
+
+    A ticket resumed via ``lanegate start`` (which bypasses ``cmd_reopen``'s
+    body-stripping) can carry an old reason section through to a later, healthy
+    status -- these are exactly the statuses/verdict where that section is still
+    live. Shared by attention_summary() and get_ticket_summary() so the board's
+    one-line reason and `lanegate summary`'s detailed reason never disagree
+    about which tickets show one.
+    """
+    return status in {"needs_review", "failed", "hibernated"} or verdict == "changes_requested"
+
 
 def attention_summary(ticket: dict) -> str:
     """Return a one-line reason why a ticket needs operator attention."""
     status = ticket.get("status")
     verdict = ticket.get("review_verdict")
 
-    if status in {"needs_review", "failed"} or verdict == "changes_requested":
+    if _reason_section_applies(status, verdict):
         for header in _ATTENTION_SECTION_HEADERS:
             summary = _summary_line(_body_section(ticket, header))
             if summary:
@@ -556,8 +1120,199 @@ def attention_summary(ticket: dict) -> str:
     if status == "failed" and ticket.get("review_summary"):
         return _clean_attention_reason(_summary_line(str(ticket["review_summary"]).strip(), limit=140))
 
+    if status == "hibernated" and ticket.get("review_summary"):
+        return _clean_attention_reason(_summary_line(str(ticket["review_summary"]).strip(), limit=140))
+
+    if status == "hibernated" and ticket.get("review_pending") and ticket.get("review_pending_reason"):
+        return _clean_attention_reason(
+            _summary_line(str(ticket["review_pending_reason"]).strip(), limit=140)
+        )
+
+    if status == "merged" and ticket.get("post_merge_diagnostic"):
+        return _clean_attention_reason(_summary_line(str(ticket["post_merge_diagnostic"]).strip()))
+
+    category = attention_category(ticket)
+    if category == "awaiting_merge":
+        if ticket.get("requires_human_merge"):
+            files = ", ".join(ticket.get("rebase_conflict_files") or [])
+            suffix = f"; inspect recovered files: {files}" if files else ""
+            return f"Automated rebase conflict recovery; human merge approval required{suffix}"
+        return "Approved; awaiting human merge decision"
+
+    if category == "stuck":
+        return "Hibernated for a non-rate-limit reason"
+
+    default_reasons = {
+        "escalated": "Manual review required",
+        "failed": "Ticket failed; inspect log and worktree",
+        "rejected": "Review changes requested",
+        "merged_diagnostic": "Post-merge verification diagnostic recorded",
+    }
+    if category and category in default_reasons:
+        return default_reasons[category]
+
     return ""
 
+
+def attention_category(ticket: dict) -> str:
+    """Return the operator-remediation category for a ticket, or ``""``.
+
+    The category deliberately describes the next human decision instead of a
+    lifecycle status: the Blocked screen combines several status families.
+    """
+    status = ticket.get("status")
+    verdict = ticket.get("review_verdict")
+
+    # These statuses represent an agent actively doing work.  An old verdict
+    # must not make an in-flight ticket look like a queue item.
+    if status == "in_progress":
+        return ""
+    if status == "in_review":
+        autonomy = ticket.get("_effective_autonomy", ticket.get("autonomy", "supervised"))
+        if verdict == "approved" and (
+            ticket.get("requires_human_merge") or not is_auto_fix_lane(autonomy)
+        ):
+            return "awaiting_merge"
+        return ""
+
+    if status == "needs_review":
+        return "escalated"
+    if status == "failed":
+        return "failed"
+    # A resolved terminal status (closed/merged/validated/done) means the
+    # ticket is done needing action, full stop -- a stale review_verdict left
+    # over from before it reached that status (e.g. `lanegate supersede`
+    # flips status without clearing review_verdict) must not resurrect it as
+    # "rejected" forever. `failed` is excluded: it's terminal but still
+    # actionable, handled explicitly above.
+    if status in TERMINAL_STATUSES and status != "failed":
+        if status == "merged" and ticket.get("post_merge_diagnostic"):
+            return "merged_diagnostic"
+        return ""
+    if verdict == "changes_requested":
+        return "rejected"
+    if (
+        status == "hibernated"
+        and not _active_rate_limit_hibernation(ticket)
+        and not _active_reviewer_cooldown_hibernation(ticket)
+    ):
+        return "stuck"
+    return ""
+
+
+def needs_attention(ticket: dict) -> bool:
+    """Return whether a ticket is waiting for a human decision or intervention."""
+    return bool(attention_category(ticket))
+
+
+# Ordered most-specific-first: several needs_review paths share the same
+# generic review_verdict=changes_requested/review_summary="blocked by
+# orchestrate gate" shape (see downgrade_approved_review_to_needs_review in
+# orchestrate/loop.py), so only the free-text reason recorded in the
+# ## Needs Review Reason section reliably distinguishes *why* a ticket
+# landed there. Patterns are matched against that text, lower-cased.
+_NEEDS_REVIEW_CAUSE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("protected_path", ("hard-blocked categories", "security_sensitive_paths", "human review required")),
+    ("scope_drift", ("outside touches list", "could not auto-claim")),
+    ("static_analysis", ("static analysis findings", "safeguards failed", "safeguards unavailable")),
+    ("conflict", ("conflict", "rebase")),
+    (
+        "auto_fix_exhausted",
+        (
+            "bounded auto-fix/re-review exhausted",
+            "drift check failed after bounded auto-fix",
+            "auto-fix attempts exhausted",
+        ),
+    ),
+    (
+        "no_independent_reviewer",
+        ("no healthy independent reviewer is available", "retry budget exhausted"),
+    ),
+    ("review_rejection", ("reviewer", "review harness error")),
+)
+
+_NEEDS_REVIEW_RECOVERY_ADVICE: dict[str, str] = {
+    "protected_path": (
+        "hard-blocked path — human review required; inspect the diff, then: "
+        "lanegate human-review {tid} --rationale \"...\""
+    ),
+    "scope_drift": (
+        "extra files outside touches — claim them, then: "
+        "lanegate reopen {tid} && lanegate run"
+    ),
+    "static_analysis": (
+        "automated safeguard/static-analysis finding — fix it, then: "
+        "lanegate reopen {tid} && lanegate run"
+    ),
+    "conflict": "merge conflict — resolve it: lanegate resolve-conflict {tid}",
+    "auto_fix_exhausted": (
+        "bounded auto-fix exhausted — make a targeted worktree repair; when ready, "
+        "run: lanegate reopen {tid}, then lanegate review {tid}"
+    ),
+    "review_rejection": (
+        "reviewer could not produce a verdict — inspect the log, then: "
+        "lanegate reopen {tid} && lanegate run"
+    ),
+    "no_independent_reviewer": (
+        "no independent reviewer configured or all eligible reviewers stayed "
+        "unavailable past the retry budget. To clear just this ticket: "
+        "lanegate human-review {tid} --rationale \"...\". A single-account "
+        "setup will hit this on every ticket until the config changes: set "
+        "review_fallback: same_model in .lanegate.yml (accepts same-model "
+        "self-review) or configure a second reviewer/pool member."
+    ),
+    "rate_limit": (
+        "reviewer/executor was rate limited — next: "
+        "lanegate recover-rate-limited-reviews {tid} or lanegate run (auto-recovers on quota reset)"
+    ),
+    "rate_limit_auto_fix_attempted": (
+        "reviewer/executor was rate limited, but this ticket already used an "
+        "auto-fix attempt so unattended recovery is skipped — fix it, then: "
+        "lanegate reopen {tid} && lanegate run"
+    ),
+    "unknown": "inspect worktree, then: lanegate reopen {tid} && lanegate run",
+}
+
+
+def classify_needs_review_cause(ticket: dict) -> str:
+    """Structurally classify why a ``needs_review`` ticket landed there.
+
+    Returns "" for a ticket that isn't currently needs_review. Otherwise one
+    of: protected_path, scope_drift, static_analysis, conflict,
+    auto_fix_exhausted, review_rejection, rate_limit, unknown. Board/API/orchestrator surfaces
+    use this instead of a blanket "reopen && orchestrate" so a hard-blocked
+    change (protected path, security-sensitive file) is routed to
+    ``lanegate human-review`` rather than silently resubmitted for another
+    automatic pass.
+    """
+    if ticket.get("status") != "needs_review":
+        return ""
+    text = "\n".join(
+        part
+        for part in (
+            _body_section(ticket, "## Needs Review Reason"),
+            str(ticket.get("review_summary") or ""),
+        )
+        if part
+    ).lower()
+    for cause, needles in _NEEDS_REVIEW_CAUSE_PATTERNS:
+        if any(needle in text for needle in needles):
+            return cause
+    if _active_rate_limit_hibernation(ticket):
+        return "rate_limit"
+    return "unknown"
+
+
+def needs_review_recovery_advice(ticket: dict) -> str:
+    """Return a cause-specific recovery instruction for a needs_review ticket, or ""."""
+    cause = classify_needs_review_cause(ticket)
+    if not cause:
+        return ""
+    advice_key = cause
+    if cause == "rate_limit" and ticket.get("auto_fix_attempts"):
+        advice_key = "rate_limit_auto_fix_attempted"
+    tid = ticket.get("id", "")
+    return _NEEDS_REVIEW_RECOVERY_ADVICE[advice_key].format(tid=tid)
 
 
 def append_status_history(ticket: dict, from_status: str, to_status: str, reason: str) -> None:
@@ -582,7 +1337,7 @@ def append_status_history(ticket: dict, from_status: str, to_status: str, reason
         ticket["_body"] = body.rstrip() + f"\n\n{header}\n{line}\n"
         return
     before, _, after = body.partition(header)
-    next_heading = after.find("\n##")
+    next_heading = _find_next_h2_heading(after)
     section, tail = (after, "") if next_heading == -1 else (after[:next_heading], after[next_heading:])
     ticket["_body"] = before + header + section.rstrip("\n") + f"\n{line}\n" + tail
 
@@ -614,34 +1369,62 @@ def append_lifecycle_event(
     events.append(record)
     ticket["lifecycle_events"] = events
 
-    transition = ""
-    if from_status and to_status:
-        transition = f"{from_status} → {to_status}"
-    elif to_status:
-        transition = to_status
-    text = " — ".join(part for part in (transition, summary or event) if part)
-    line = f"- {stamp}: {text}"
-    body = ticket.get("_body", "")
-    header = "## Lifecycle Timeline"
-    if header not in body:
-        ticket["_body"] = body.rstrip() + f"\n\n{header}\n{line}\n"
-        return
-    before, _, after = body.partition(header)
-    next_heading = after.find("\n##")
-    section, tail = (after, "") if next_heading == -1 else (after[:next_heading], after[next_heading:])
-    ticket["_body"] = before + header + section.rstrip("\n") + f"\n{line}\n" + tail
+    sec_text = render_lifecycle_timeline_section(events)
+    ticket["_body"] = _upsert_body_section(ticket.get("_body", ""), "## Lifecycle Timeline", sec_text)
 
 
 def write_ticket(ticket: dict) -> None:
     """Serialise ticket back to file preserving frontmatter key order."""
     path: Path = ticket["_path"]
     body: str = ticket.get("_body", "")
+
+    cnotes = load_change_notes(ticket)
+    if cnotes:
+        sec_text = render_change_notes_section(cnotes)
+        body = _upsert_body_section(body, "## Change Notes", sec_text)
+        ticket["_body"] = body
+        ticket["change_notes_summary"] = len(cnotes)
+        ticket["change_notes"] = cnotes
+
+    audit = load_acceptance_contract_audit(ticket)
+    if audit:
+        sec_text = render_acceptance_contract_audit_section(audit)
+        body = _upsert_body_section(body, "## Acceptance Contract Audit", sec_text)
+        ticket["_body"] = body
+        ok = bool(audit.get("ok"))
+        findings_count = len(audit.get("findings") or [])
+        ticket["acceptance_contract_audit_summary"] = (
+            f"ok ({findings_count} findings)" if ok else f"failed ({findings_count} findings)"
+        )
+        ticket["acceptance_contract_audit"] = audit
+
+    l_events = load_lifecycle_events(ticket)
+    if l_events:
+        sec_text = render_lifecycle_timeline_section(l_events)
+        body = _upsert_body_section(body, "## Lifecycle Timeline", sec_text)
+        ticket["_body"] = body
+        ticket["lifecycle_events_summary"] = len(l_events)
+        ticket["lifecycle_events"] = l_events
+
     ordered: dict = {}
     for k in _FRONTMATTER_KEY_ORDER:
         if k in ticket:
-            ordered[k] = ticket[k]
+            v = ticket[k]
+            if k == "change_notes" and isinstance(v, dict):
+                continue
+            if k == "acceptance_contract_audit" and isinstance(v, dict):
+                continue
+            if k == "lifecycle_events" and isinstance(v, list):
+                continue
+            ordered[k] = v
     for k, v in ticket.items():
         if not k.startswith("_") and k not in ordered:
+            if k == "change_notes" and isinstance(v, dict):
+                continue
+            if k == "acceptance_contract_audit" and isinstance(v, dict):
+                continue
+            if k == "lifecycle_events" and isinstance(v, list):
+                continue
             ordered[k] = v
     for key, value in ordered.items():
         if isinstance(value, str) and len(value) > _MAX_SCALAR_LEN:
@@ -680,13 +1463,54 @@ def write_file_skeletons_sidecar(
     return ref
 
 
-def load_file_skeletons(ticket: dict, project_root: Path | None = None) -> dict[str, str]:
+def regenerate_file_skeletons(
+    touches: list[str], project_root: Path
+) -> dict[str, str]:
+    """Build skeletons from the files as they are on disk right now.
+
+    Analyze-time skeletons are a snapshot: by the time implement or a fix pass
+    runs, an earlier step may have changed the very signatures the skeleton
+    describes, and a stale skeleton is worse than none because the agent
+    believes it (TICK-412). Regenerating costs one AST parse per touched file.
+
+    Files that cannot be parsed are skipped rather than reported empty, letting
+    the caller fall back to the stored snapshot.
+    """
+    from lanegate.analyze import _build_file_skeleton
+
+    skeletons: dict[str, str] = {}
+    for rel in touches:
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        path = project_root / rel
+        if not path.is_file():
+            continue
+        try:
+            skeletons[rel] = _build_file_skeleton(Path(rel), project_root)
+        except Exception:
+            # Skeletons are an optimization; never let one bad file stop a step.
+            continue
+    return skeletons
+
+
+def load_file_skeletons(
+    ticket: dict, project_root: Path | None = None, *, regenerate: bool = False
+) -> dict[str, str]:
     """Return file skeletons from a sidecar when present, else legacy inline data.
 
     Invalid or missing sidecars degrade to inline ``file_skeletons`` for
     compatibility with older tickets and partially migrated branches.
+
+    With ``regenerate=True`` the touched files are re-parsed from disk and used
+    when they yield anything, so a step sees current signatures rather than the
+    analyze-time snapshot. Falls back to the stored data when regeneration
+    produces nothing (no touches, unparseable files, missing grammars).
     """
     root = project_root if project_root is not None else Path.cwd()
+    if regenerate:
+        fresh = regenerate_file_skeletons(ticket.get("touches") or [], root)
+        if fresh:
+            return fresh
     ref = ticket.get("file_skeletons_ref")
     if isinstance(ref, str) and ref.strip():
         ref_path = Path(ref)
@@ -792,7 +1616,25 @@ def load_tickets_by_ids(
 
 
 def canonical_id(ticket_id: str) -> str:
-    """Normalize a ticket ID's case and numeric suffix for comparisons."""
+    """Normalize a safe ticket ID's case and numeric suffix for comparisons.
+
+    Ticket IDs are used to derive branch and worktree paths.  Reject path
+    syntax before any lifecycle command can turn an attacker-controlled ticket
+    frontmatter value into a recursive-deletion target.
+    """
+    # Dots are a legitimate part of project ticket prefixes (for example
+    # ``ACME.PROJ-001``).  Keep them while excluding every pathname/ref
+    # traversal form: no separators, no leading/trailing dot, no ``..``, and
+    # no Git's special ``@{`` sequence.  The resulting IDs remain safe to use
+    # as one worktree path component and a local branch name.
+    if (
+        not isinstance(ticket_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?", ticket_id)
+        or ".." in ticket_id
+        or "@{" in ticket_id
+        or ticket_id.lower().endswith(".lock")
+    ):
+        raise ValueError(f"invalid ticket ID: {ticket_id!r}")
     normalized = ticket_id.upper()
     match = re.fullmatch(r"(.+-)(\d+)", normalized)
     if match:
@@ -807,15 +1649,38 @@ def unresolved_dependencies(
 
     Keep dependency gating in one place so scheduler selection, its diagnostic,
     and ``lanegate next`` cannot disagree about failed/closed prerequisites.
+
+    ``dependencies`` comes from executor/LLM-writable ``depends_on``
+    frontmatter and is not validated at parse time (``validate_ticket`` has no
+    check for it). A malformed entry can never resolve to a real, delivered
+    ticket, so it's treated the same as any other unmet dependency rather than
+    raising -- letting one bad ``depends_on`` string crash board/next/batch
+    selection for every ticket is worse than just leaving that one dependency
+    blocked.
+
+    ``status_map``'s keys are ``t["id"]`` straight from ticket frontmatter too
+    -- ``validate_ticket`` only checks ``id`` is truthy, not its shape -- so a
+    ticket with e.g. a trailing space in its id can reach here unquarantined.
+    Skip whatever key fails to canonicalize instead of raising: it can never
+    match a (necessarily valid) canonical dependency id anyway, so dropping it
+    from the map has the same net effect as if that ticket didn't exist yet.
     """
-    canonical_status_map = {
-        canonical_id(ticket_id): status for ticket_id, status in status_map.items()
-    }
-    return [
-        dependency
-        for dependency in dependencies or []
-        if canonical_status_map.get(canonical_id(dependency)) not in DEPENDENCY_SATISFIED_STATUSES
-    ]
+    canonical_status_map = {}
+    for ticket_id, status in status_map.items():
+        try:
+            canonical_status_map[canonical_id(ticket_id)] = status
+        except ValueError:
+            continue
+    unresolved = []
+    for dependency in dependencies or []:
+        try:
+            canonical_dependency = canonical_id(dependency)
+        except ValueError:
+            unresolved.append(dependency)
+            continue
+        if canonical_status_map.get(canonical_dependency) not in DEPENDENCY_SATISFIED_STATUSES:
+            unresolved.append(dependency)
+    return unresolved
 
 
 def branch_name(ticket_id: str) -> str:
@@ -870,12 +1735,17 @@ def get_ticket_diff(
     *,
     base: str | None = None,
     max_patch_chars: int = 20_000,
+    include_patches: bool = True,
 ) -> dict:
     """Return a structured, JSON-serializable diff for a ticket branch.
 
     The API contract is browser-oriented: callers get one entry per changed file,
     and large patches are truncated per file instead of returning one unbounded
     raw diff blob.
+
+    include_patches=False skips the per-file `git diff -- <path>` subprocess
+    entirely (files still get path/status from --name-status) for callers that
+    only need the stat/file list, e.g. a stat-only summary over many files.
     """
     base = base or resolve_trunk_branch(load_config(repo_root), repo_root)
     tid = canonical_id(ticket_id)
@@ -925,12 +1795,15 @@ def get_ticket_diff(
             old_path = parts[1]
             path = parts[2]
 
-        patch_r = _run_git(repo_root, ["diff", f"{base}..{branch}", "--", path])
-        patch = patch_r.stdout if patch_r.returncode == 0 else ""
+        patch = ""
+        patch_r = None
         patch_truncated = False
-        if max_patch_chars >= 0 and len(patch) > max_patch_chars:
-            patch = patch[:max_patch_chars] + "\n... [truncated]\n"
-            patch_truncated = True
+        if include_patches:
+            patch_r = _run_git(repo_root, ["diff", f"{base}..{branch}", "--", path])
+            patch = patch_r.stdout if patch_r.returncode == 0 else ""
+            if max_patch_chars >= 0 and len(patch) > max_patch_chars:
+                patch = patch[:max_patch_chars] + "\n... [truncated]\n"
+                patch_truncated = True
 
         if patch:
             aggregate_parts.append(patch)
@@ -943,7 +1816,7 @@ def get_ticket_diff(
         }
         if old_path is not None:
             entry["old_path"] = old_path
-        if patch_r.returncode != 0:
+        if patch_r is not None and patch_r.returncode != 0:
             entry["error"] = patch_r.stderr.strip()
         files.append(entry)
 
@@ -971,9 +1844,12 @@ def get_ticket_detail(ticket_id: str, cfg: dict, repo_root: Path) -> dict:
     all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
     ticket = None
     for t in all_tickets:
-        if canonical_id(t.get("id", "")) == tid:
-            ticket = t
-            break
+        try:
+            if canonical_id(t.get("id", "")) == tid:
+                ticket = t
+                break
+        except ValueError:
+            continue
 
     if ticket is None:
         return {"error": f"ticket {tid} not found", "status": 404}
@@ -985,6 +1861,82 @@ def get_ticket_detail(ticket_id: str, cfg: dict, repo_root: Path) -> dict:
     result["review_verdict"] = ticket.get("review_verdict")
     result["review_summary"] = ticket.get("review_summary")
     result["review_findings"] = ticket.get("review_findings") or []
+
+    if ticket.get("status") == "needs_review":
+        result["needs_review_cause"] = classify_needs_review_cause(ticket)
+        result["needs_review_recovery"] = needs_review_recovery_advice(ticket)
+
+    return result
+
+
+def get_ticket_summary(ticket_id: str, cfg: dict, repo_root: Path) -> dict:
+    """Aggregate why-is-this-stuck context into one payload for a single ticket.
+
+    Pulls together what's otherwise scattered across the ticket body, the review
+    section, and the worktree diff: the full (untruncated) escalation/failure
+    reason, review verdict/summary/findings, the needs_review cause + recovery
+    command, and a file-level diff stat -- so a stuck ticket can be understood
+    without opening the ticket file and the worktree separately.
+    """
+    tid = canonical_id(ticket_id)
+    tickets_dir = repo_root / cfg["tickets_dir"]
+    all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    ticket = next((t for t in all_tickets if t["id"] == tid), None)
+    if ticket is None:
+        return {"error": f"ticket {tid} not found", "status": 404}
+
+    result: dict = {
+        "id": tid,
+        "title": ticket.get("title", ""),
+        "status": ticket.get("status"),
+        "priority": ticket.get("priority"),
+        "milestone": ticket.get("milestone"),
+    }
+
+    status = ticket.get("status")
+    verdict = ticket.get("review_verdict")
+
+    if _reason_section_applies(status, verdict):
+        for header in _ATTENTION_SECTION_HEADERS:
+            section = _body_section(ticket, header).strip()
+            if section:
+                result["reason"] = section
+                break
+
+    if verdict:
+        result["review_verdict"] = verdict
+    if ticket.get("review_summary"):
+        result["review_summary"] = ticket["review_summary"]
+    findings = ticket.get("review_findings") or []
+    if findings:
+        result["review_findings"] = findings
+
+    if status == "needs_review":
+        result["needs_review_cause"] = classify_needs_review_cause(ticket)
+        result["needs_review_recovery"] = needs_review_recovery_advice(ticket)
+        result["next_step"] = result["needs_review_recovery"]
+    elif status == "code_complete":
+        if verdict == "changes_requested":
+            result["next_step"] = f"address feedback, then: lanegate review {tid} --verdict approved"
+        elif verdict == "approved":
+            result["next_step"] = f"lanegate merge {tid}"
+        elif findings:
+            # Findings exist (e.g. from an ad-hoc/audit review) but no verdict was
+            # ever recorded on the normal review path -- a silently stalled ticket
+            # otherwise looks identical to one still awaiting its first review.
+            result["next_step"] = (
+                f"unresolved review findings, no verdict recorded — decide: "
+                f"lanegate review {tid} --verdict approved|changes_requested"
+            )
+
+    diff = get_ticket_diff(tid, repo_root, include_patches=False)
+    if diff.get("error"):
+        result["diff_error"] = diff["error"]
+    else:
+        result["diff_stat"] = diff.get("stat", "").strip()
+        result["files_changed"] = [
+            {"path": f["path"], "status": f["status"]} for f in diff.get("files", [])
+        ]
 
     return result
 

@@ -9,7 +9,9 @@ temporary directory.  It therefore never creates ``dist/``, ``build/``, or
 The checks deliberately exercise the release artifact rather than this source
 checkout.  They cover packaging, clean installation, optional entrypoint
 imports, undeclared imports, a real ticket lifecycle, a first environment
-promotion, and interactive init with a guard script.
+promotion, and interactive init with a guard script.  They also exercise
+``lanegate flag`` end-to-end against a real per-environment ``flag_file``
+plus a real ``post_promote`` deploy hook that reads it.
 """
 
 from __future__ import annotations
@@ -123,6 +125,17 @@ def check_build(source_root: Path, work: Path, env: dict[str, str]) -> tuple[Pat
         raise SmokeFailure(
             f"expected one wheel and one sdist in {dist}; found wheels={wheels}, sdists={sdists}"
         )
+
+    packaging_smoke = tree / "scripts" / "packaging-smoke.sh"
+    if not packaging_smoke.is_file():
+        raise SmokeFailure(f"packaging safeguard is missing: {packaging_smoke}")
+    if not os.access(packaging_smoke, os.X_OK):
+        raise SmokeFailure(f"packaging safeguard is not executable: {packaging_smoke}")
+    try:
+        _run([packaging_smoke], cwd=tree, env=env, timeout=300)
+    except SmokeFailure as exc:
+        raise SmokeFailure(f"packaging safeguard failed: {exc}") from exc
+
     return wheels[0], tree
 
 
@@ -142,7 +155,22 @@ def check_clean_install(wheel: Path, work: Path, env: dict[str, str]) -> Install
         env=clean_env,
         timeout=180,
     )
-    _run([lanegate, "--version"], cwd=work, env=clean_env)
+    version_result = _run([lanegate, "--version"], cwd=work, env=clean_env)
+    metadata_result = _run(
+        [
+            python,
+            "-c",
+            "from importlib.metadata import version; print(version('lanegate'))",
+        ],
+        cwd=work,
+        env=clean_env,
+    )
+    expected_version = f"lanegate {metadata_result.stdout.strip()}"
+    if version_result.stdout.strip() != expected_version:
+        raise SmokeFailure(
+            "CLI version does not match installed distribution metadata: "
+            f"expected {expected_version!r}, got {version_result.stdout.strip()!r}"
+        )
     if not lanegate.is_file():
         raise SmokeFailure(f"wheel install did not create the console script: {lanegate}")
     return InstalledArtifact(python=python, lanegate=lanegate, env=clean_env)
@@ -215,6 +243,7 @@ def _configure_lifecycle_repo(repo: Path) -> None:
     # commits need the ticket file tracked in this throwaway repository.
     with (repo / ".gitignore").open("a") as ignored:
         ignored.write("\n!.lanegate/\n!.lanegate/tickets/\n!.lanegate/tickets/**\n")
+    flag_file = repo.parent / "flag-state.json"
     config = repo / ".lanegate.yml"
     config.write_text(
         config.read_text()
@@ -224,9 +253,27 @@ def _configure_lifecycle_repo(repo: Path) -> None:
         + "    branch: release-smoke\n"
         + "    from: main\n"
         + "    trigger: manual\n"
+        + f"    flag_file: {flag_file}\n"
+        + "    post_promote:\n"
+        + "      - python3\n"
+        + "      - scripts/flag_gate.py\n"
+        + f"      - {flag_file}\n"
     )
     (repo / "src").mkdir()
     (repo / "src" / "smoke.py").write_text('VALUE = "initial"\n')
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "flag_gate.py").write_text(
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "flag_path = Path(sys.argv[1])\n"
+        "try:\n"
+        "    flags = json.loads(flag_path.read_text())\n"
+        "except FileNotFoundError:\n"
+        "    flags = {}\n"
+        "Path('hook-output.json').write_text(json.dumps(flags))\n"
+    )
 
 
 def _ticket_id(output: str) -> str:
@@ -352,6 +399,73 @@ def check_first_promote(installed: InstalledArtifact, repo: Path) -> None:
         raise SmokeFailure("; ".join(errors))
 
 
+def check_flag_gate_deploy_hook(installed: InstalledArtifact, repo: Path) -> None:
+    """Exercise `lanegate flag` end-to-end against a real deploy hook.
+
+    Enables a flag, promotes so a real post_promote hook script reads the
+    real per-environment flag_file, then disables the flag and promotes
+    again to prove the round trip in both directions.
+    """
+    errors: list[str] = []
+
+    _run(
+        [installed.lanegate, "flag", "--env", "smoke", "enable", "maintenance_mode"],
+        cwd=repo,
+        env=installed.env,
+    )
+    listed = _run(
+        [installed.lanegate, "--json", "flag", "--env", "smoke", "list"],
+        cwd=repo,
+        env=installed.env,
+    )
+    flags = json.loads(listed.stdout)["flags"]
+    if flags.get("maintenance_mode") is not True:
+        errors.append(f"flag list did not report maintenance_mode enabled: {flags}")
+
+    (repo / "src" / "flag-smoke.py").write_text("FLAG_SMOKE = True\n")
+    _git(repo, installed.env, "add", "src/flag-smoke.py")
+    _git(repo, installed.env, "commit", "-m", "flag gate smoke: enable maintenance_mode")
+    _run([installed.lanegate, "promote", "smoke"], cwd=repo, env=installed.env)
+
+    hook_output = repo / "hook-output.json"
+    if not hook_output.is_file():
+        errors.append("post_promote hook did not write hook-output.json")
+    else:
+        observed = json.loads(hook_output.read_text())
+        if observed.get("maintenance_mode") is not True:
+            errors.append(
+                f"post_promote hook did not observe maintenance_mode enabled: {observed}"
+            )
+
+    _run(
+        [installed.lanegate, "flag", "--env", "smoke", "disable", "maintenance_mode"],
+        cwd=repo,
+        env=installed.env,
+    )
+    listed_after = _run(
+        [installed.lanegate, "--json", "flag", "--env", "smoke", "list"],
+        cwd=repo,
+        env=installed.env,
+    )
+    flags_after = json.loads(listed_after.stdout)["flags"]
+    if flags_after.get("maintenance_mode") is not False:
+        errors.append(f"flag list did not report maintenance_mode disabled: {flags_after}")
+
+    (repo / "src" / "flag-smoke.py").write_text("FLAG_SMOKE = False\n")
+    _git(repo, installed.env, "add", "src/flag-smoke.py")
+    _git(repo, installed.env, "commit", "-m", "flag gate smoke: disable maintenance_mode")
+    _run([installed.lanegate, "promote", "smoke"], cwd=repo, env=installed.env)
+
+    hook_output_after = json.loads(hook_output.read_text())
+    if hook_output_after.get("maintenance_mode") is not False:
+        errors.append(
+            f"post_promote hook did not observe maintenance_mode disabled: {hook_output_after}"
+        )
+
+    if errors:
+        raise SmokeFailure("; ".join(errors))
+
+
 def check_interactive_init_guard(installed: InstalledArtifact, work: Path) -> None:
     """Exercise ``init -i`` writing an argv-form guard, then reload that config (F27)."""
     repo = work / "interactive-init-repo"
@@ -368,7 +482,9 @@ def check_interactive_init_guard(installed: InstalledArtifact, work: Path) -> No
             "",  # executor
             "",  # reviewer
             "",  # max_parallel
-            "n",  # models
+            "",  # models.analyze
+            "",  # models.implement
+            "",  # models.review
             "n",  # feature flags
             "y",  # environments
             "1",  # environment count
@@ -424,48 +540,56 @@ def main() -> int:
         env = _isolated_env(work / "home")
         Path(env["HOME"]).mkdir()
 
-        build = _run_check("1/7 build", lambda: check_build(source_root, work, env), failures)
+        build = _run_check("1/8 build", lambda: check_build(source_root, work, env), failures)
         if build is None:
             print(
-                "[release-smoke] checks 2-7 skipped because build produced no wheel",
+                "[release-smoke] checks 2-8 skipped because build produced no wheel",
                 file=sys.stderr,
             )
         else:
             wheel, _tree = build
             installed = _run_check(
-                "2/7 clean install", lambda: check_clean_install(wheel, work, env), failures
+                "2/8 clean install", lambda: check_clean_install(wheel, work, env), failures
             )
             if installed is None:
                 print(
-                    "[release-smoke] checks 3-7 skipped because clean install failed",
+                    "[release-smoke] checks 3-8 skipped because clean install failed",
                     file=sys.stderr,
                 )
             else:
                 assert isinstance(installed, InstalledArtifact)
                 _run_check(
-                    "3/7 import surface", lambda: check_import_surface(installed, work), failures
+                    "3/8 import surface", lambda: check_import_surface(installed, work), failures
                 )
                 _run_check(
-                    "4/7 dependency honesty",
+                    "4/8 dependency honesty",
                     lambda: check_dependency_honesty(installed, work),
                     failures,
                 )
                 lifecycle_repo = _run_check(
-                    "5/7 first-run lifecycle",
+                    "5/8 first-run lifecycle",
                     lambda: check_first_run_lifecycle(installed, work),
                     failures,
                 )
                 if lifecycle_repo is None:
                     failures.append(("first promote", "skipped because first-run lifecycle failed"))
+                    failures.append(
+                        ("flag gate deploy hook", "skipped because first-run lifecycle failed")
+                    )
                 else:
                     assert isinstance(lifecycle_repo, Path)
                     _run_check(
-                        "6/7 first promote",
+                        "6/8 first promote",
                         lambda: check_first_promote(installed, lifecycle_repo),
                         failures,
                     )
+                    _run_check(
+                        "8/8 flag gate deploy hook",
+                        lambda: check_flag_gate_deploy_hook(installed, lifecycle_repo),
+                        failures,
+                    )
                 _run_check(
-                    "7/7 interactive init guard",
+                    "7/8 interactive init guard",
                     lambda: check_interactive_init_guard(installed, work),
                     failures,
                 )
@@ -474,7 +598,7 @@ def main() -> int:
         names = ", ".join(name for name, _ in failures)
         print(f"[release-smoke] FAILED checks: {names}", file=sys.stderr)
         return 1
-    print("[release-smoke] all seven checks passed")
+    print("[release-smoke] all eight checks passed")
     return 0
 
 

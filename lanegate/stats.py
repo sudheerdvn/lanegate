@@ -119,5 +119,5 @@ def cmd_stats(cfg: dict, repo_root: Path, *, json_output: bool = False) -> None:
     print()
     if no_timestamp:
         print(
-            f"  {no_timestamp} ticket(s) have no status_changed_at (pre-TICK-082) — shown as '—' on board"
+            f"  {no_timestamp} ticket(s) have no status_changed_at — shown as '—' on board"
         )

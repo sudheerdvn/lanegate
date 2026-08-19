@@ -2,19 +2,10 @@
 Board-clearing loop and its supporting helpers.
 
 Usage:
-    lanegate orchestrate                        # clear the board using executor from .lanegate.yml
-    lanegate orchestrate --max 3                # cap parallel tickets
-    lanegate orchestrate --dry-run              # print planned actions, do nothing
-    lanegate orchestrate --human-review final   # per_ticket | final | none
-
-TICK-255: this module mixes several concerns (audit capture, active-status
-bookkeeping, rate-limit detection, executor pool selection, the board-clearing
-loop itself, ...) that repeatedly collide on merge. TICK-271 converted this
-module into the lanegate/orchestrate/ package and extracted the safety gates
-(injection scan, blocked-file check, diff parser, static analysis) into
-guards.py; TICK-272 extracted tee logging and executor audit-bundle capture
-into audit.py. The remaining concerns are split out by TICK-273..279 — see
-docs/internal/module-split-proposal.md.
+    lanegate run                                # clear the board using executor from .lanegate.yml
+    lanegate run --max 3                        # cap parallel tickets
+    lanegate run --dry-run                      # print planned actions, do nothing
+    lanegate run --human-review final           # per_ticket | final | none
 """
 
 from __future__ import annotations
@@ -43,8 +34,11 @@ from lanegate.concurrency import (
     touches_overlap,
 )
 from lanegate.config import (
+    is_auto_fix_lane,
+    is_red_lane,
     resolve_acceptance_contract_mode,
     resolve_autonomy,
+    resolve_human_escalation,
     resolve_max_parallel_detail,
     resolve_model,
     resolve_trunk_branch,
@@ -53,32 +47,45 @@ from lanegate.config import (
 from lanegate.executor import (
     available_instances as _available_executor_instances,
     build_executor_cmd,
+    clear_failure_streak as _clear_pool_failure_streak,
     get_executor_config,
     is_cooling_down as _executor_is_cooling_down,
+    record_failure_signature as _record_pool_failure_signature,
     resolve_executor_env,
     write_cooldown as _write_executor_cooldown,
 )
 from lanegate.git import git_text
-from lanegate.pidutil import pid_alive
+from lanegate.pidutil import force_kill_pid, pid_alive
 from lanegate.ticket import (
     TERMINAL_STATUSES,
+    _RATE_LIMIT_MARKER,
+    _active_rate_limit_hibernation,
     _clean_attention_reason,
+    _has_non_rate_limit_hard_error,
     branch_name,
     is_paired_test_file,
     load_all_tickets,
     milestone_near_miss_warnings,
+    needs_review_recovery_advice,
 )
 
 _git_text = git_text
 
+# Kept at module scope so tests and operators can shorten the bounded
+# cooldown-poll interval without reaching into _drain_loop's closure.
+_COOLDOWN_POLL_SECONDS = 30
+
 # Safety gates (injection scan, blocked-file check, diff parser, static
-# analysis) live in orchestrate/guards.py (TICK-271); re-exported here so
+# analysis) live in orchestrate/guards.py; re-exported here so
 # `from lanegate.orchestrate import X` keeps working for every caller and test.
 from .guards import (
     _is_blocked_file,
     _run_acceptance_contract_audit,
     _run_static_analysis,
     _scan_injection_signals,
+    check_control_plane_compliance,
+    risk_lane_requires_human_review,
+    scan_risk_lane,
 )
 from .guards import _BLOCKED_FILE_RULES as _BLOCKED_FILE_RULES
 from .guards import _INJECTION_SIGNALS as _INJECTION_SIGNALS
@@ -86,7 +93,7 @@ from .guards import _SYSTEM_SECTION_HEADERS as _SYSTEM_SECTION_HEADERS
 from .guards import _parse_diff_changed_lines as _parse_diff_changed_lines
 
 # Tee logging and executor audit-bundle capture (transcript + task-output
-# capture, manifest, gate capture) live in orchestrate/audit.py (TICK-272);
+# capture, manifest, gate capture) live in orchestrate/audit.py;
 # re-exported here so `from lanegate.orchestrate import X` keeps working for
 # every caller and test.
 from .audit import _LogTee as _LogTee
@@ -121,9 +128,9 @@ from .audit import _write_json_atomic as _write_json_atomic
 
 # Durable run-event log and CLI status-reporting commands (event log
 # append/load/path helpers, last-run pointer, live lanegate-spawned process
-# enumeration, `lanegate ps`, `lanegate run-report`, `lanegate orchestrate-status`, and
-# the executor subprocess-streaming helper) live in orchestrate/run_report.py
-# (TICK-274); re-exported here so `from lanegate.orchestrate import X` keeps
+# enumeration, `lanegate ps`, `lanegate run-report`, `lanegate run --status`, and
+# the executor subprocess-streaming helper) live in orchestrate/run_report.py;
+# re-exported here so `from lanegate.orchestrate import X` keeps
 # working for every caller and test.
 from .run_report import _LAST_RUN_POINTER as _LAST_RUN_POINTER
 from .run_report import _RUN_EVENTS_SUFFIX as _RUN_EVENTS_SUFFIX
@@ -142,10 +149,11 @@ from .run_report import cmd_ps as cmd_ps
 from .run_report import cmd_run_report as cmd_run_report
 from .run_report import print_run_summary as print_run_summary
 from .run_report import read_executor_events as read_executor_events
+from .run_report import suppress_direct_action_tracking as suppress_direct_action_tracking
 from .run_report import summarize_executor_events as summarize_executor_events
 
 # Board batch selection and review/continuation queue rendering live in
-# orchestrate/batch.py (TICK-275); re-exported here so `from
+# orchestrate/batch.py; re-exported here so `from
 # lanegate.orchestrate import X` keeps working for every caller and test.
 from .batch import _continuation_step_lines as _continuation_step_lines
 from .batch import _format_max_parallel_detail as _format_max_parallel_detail
@@ -159,8 +167,8 @@ from .batch import next_batch as next_batch
 # Active-run status bookkeeping (read/write active-status file(s), executor
 # PID markers, elapsed-time formatting, normalization/aggregation across
 # concurrent executors, the get_orchestration_status() API wrapper, and
-# stale-executor-marker reconciliation) lives in orchestrate/status.py
-# (TICK-273); re-exported here so `from lanegate.orchestrate import X` keeps
+# stale-executor-marker reconciliation) lives in orchestrate/status.py;
+# re-exported here so `from lanegate.orchestrate import X` keeps
 # working for every caller and test.
 from .status import _executor_marker_base as _executor_marker_base
 from .status import _format_elapsed as _format_elapsed
@@ -171,10 +179,13 @@ from .status import _reconcile_stale_executor_markers as _reconcile_stale_execut
 from .status import _remove_executor_markers as _remove_executor_markers
 from .status import _write_active_status as _write_active_status
 from .status import _write_executor_pid_marker as _write_executor_pid_marker
+from .status import get_all_active_statuses as get_all_active_statuses
 from .status import get_orchestration_status as get_orchestration_status
 
+from .status import write_batch_status as write_batch_status
+
 # Executor pool selection/invocation (driver resolution, prompt dispatch,
-# worktree commit helpers) lives in orchestrate/pool.py (TICK-276);
+# worktree commit helpers) lives in orchestrate/pool.py;
 # re-exported here so `from lanegate.orchestrate import X` keeps working for
 # every caller and test.
 from .pool import _CONFIG_ERROR_EXIT_CODE as _CONFIG_ERROR_EXIT_CODE
@@ -198,10 +209,14 @@ from .status import write_executing_status as write_executing_status
 
 
 def _is_interrupted_exit(exit_code: int) -> bool:
-    return exit_code < 0
+    # A signal received directly by a child is reported as a negative return
+    # code, while a shell/CLI that catches SIGINT commonly reports 130.
+    return exit_code < 0 or exit_code == 130
 
 
 def _interrupted_exit_reason(exit_code: int) -> str:
+    if exit_code == 130:
+        return "executor interrupted by SIGINT (exit 130)"
     signum = abs(exit_code)
     try:
         signal_name = signal.Signals(signum).name
@@ -271,8 +286,7 @@ def _kill_pid(pid: int, *, grace_seconds: float = 2.0) -> bool:
     while time.time() < deadline and pid_alive(pid):
         time.sleep(0.05)
     if pid_alive(pid):
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGKILL)
+        force_kill_pid(pid)
     return True
 
 
@@ -281,13 +295,13 @@ def _reap_orphaned_executor_processes(
 ) -> list[str]:
     """Kill live executor subprocesses left behind by a dead orchestrate driver.
 
-    TICK-246/`_collect_live_lanegate_processes` already *detects* this exact
+    _collect_live_lanegate_processes already *detects* this exact
     situation — a ticket-executor PID still alive while the orchestrator
     lock that dispatched it is dead — and `lanegate ps` prints it as
     `[ORPHANED]` for a human to kill by hand. That detection is reused
     as-is here; this only adds the missing kill + durable-event + hibernate
-    steps (TICK-281), so an orphan left running unsupervised gets bounded by
-    the next `lanegate orchestrate` invocation instead of running until someone
+    steps, so an orphan left running unsupervised gets bounded by
+    the next `lanegate run` invocation instead of running until someone
     happens to notice via `lanegate ps`.
 
     A driver killed via SIGKILL/OOM can't run any in-process cleanup of its
@@ -357,7 +371,7 @@ def _pool_instance_healthy(repo_root: Path, cfg: dict, instance_name: str) -> bo
     marker = f"pool instance: {instance_name}"
     return not any(
         t.get("status") == "hibernated"
-        and _active_rate_limit_hibernation(t.get("_body") or "")
+        and _active_rate_limit_hibernation(t)
         and marker in (t.get("_body") or "")
         for t in tickets
     )
@@ -383,7 +397,7 @@ def resolve_pool_executor(
     exhausted instance instead of falling back to the ordinary driver.
     """
     driver_name = resolve_driver(step, ticket, cfg)
-    if (step == "implement" and ticket.get("executor")) or (
+    if (step in ("implement", "fix") and ticket.get("executor")) or (
         step == "review" and ticket.get("reviewer")
     ):
         return driver_name
@@ -392,8 +406,14 @@ def resolve_pool_executor(
         pool_name, _ = resolve_ticket_pool(cfg, ticket)
     pool_cfg = (cfg.get("pools") or {}).get(pool_name) if pool_name else None
     if not isinstance(pool_cfg, dict):
-        return None if healthy_only else driver_name
+        # A named review/implement driver can be cooling down even without a
+        # pool.  ``healthy_only`` is a hard promise to callers: never quietly
+        # turn an empty healthy set into an exhausted direct driver.
+        if healthy_only and not _pool_instance_healthy(repo_root, cfg, driver_name):
+            return None
+        return driver_name
 
+    assert pool_name is not None  # pool_cfg is a dict only when pool_name was truthy (line above)
     excluded = excluded or set()
     candidates = [
         name for name in pool_cfg.get("executors") or [] if name not in excluded
@@ -403,12 +423,17 @@ def resolve_pool_executor(
     healthy = [name for name in candidates if _pool_instance_healthy(repo_root, cfg, name)]
     if healthy_only and not healthy:
         return None
-    pick_from = healthy or candidates
+    # New dispatches must never spend an attempt on a known-cooling account.
+    # The old ``healthy or candidates`` fallback is what selected Claude A
+    # after its weekly quota had already been recorded.
+    if not healthy:
+        return None
+    pick_from = healthy
 
     running_counts = running_counts or {}
     dispatch_counts = dispatch_counts or {}
 
-    # TICK-286: prefer instances that still have room under their own
+    # Prefer instances that still have room under their own
     # executors[name].max_parallel cap (running_counts is the caller's live
     # concurrent-dispatch count, e.g. pool_running for implement; callers
     # that don't track one, like analyze/review, pass none and this is a
@@ -437,7 +462,7 @@ def resolve_pool_executor(
 
 
 # Review subagent and review-related daemon helpers live in
-# orchestrate/review.py (TICK-277); re-exported here so `from
+# orchestrate/review.py; re-exported here so `from
 # lanegate.orchestrate import X` keeps working for every caller and test.
 from .review import _git_head_sha as _git_head_sha
 from .review import _invoke_cmd_review as _invoke_cmd_review
@@ -449,7 +474,7 @@ from .review import spawn_watch_daemon as spawn_watch_daemon
 
 
 # Fix/drift-check subagents and combined-vs-split-mode helpers live in
-# orchestrate/autofix.py (TICK-278); re-exported here so `from
+# orchestrate/autofix.py; re-exported here so `from
 # lanegate.orchestrate import X` keeps working for every caller and test.
 from .autofix import _build_combined_prompt as _build_combined_prompt
 from .autofix import _extract_review_findings as _extract_review_findings
@@ -472,6 +497,61 @@ from .autofix import run_fix_agent as run_fix_agent
 # _analyze_drafts treats it as a systemic problem and stops the whole pass
 # rather than a per-ticket content issue.
 _ANALYZE_SYSTEMIC_FAILURE_THRESHOLD = 2
+
+# Consecutive same-signature executor failures on one pool instance, within
+# _POOL_FAILURE_STREAK_WINDOW_S of each other, treated as equivalent to a
+# recognized rate-limit hibernation even when the text matches no known
+# rate-limit pattern (e.g. agy's opaque "timeout waiting for response").
+_POOL_FAILURE_STREAK_THRESHOLD = 5
+_POOL_FAILURE_STREAK_WINDOW_S = 900
+
+
+_ANALYZE_FAILURE_VOLATILE_ID_RE = re.compile(
+    r'''(?ix)
+    (?P<key>
+        ["']?(?:session|message|request)[_-]?id["']?
+        | ["']?uuid["']?
+    )
+    \s*[:=]\s*
+    (?P<value>["'][^"']*["']|[^\s,}\]]+)
+    '''
+)
+_ANALYZE_FAILURE_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_ANALYZE_FAILURE_TIMESTAMP_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-][0-2]\d:?[0-5]\d)?\b"
+)
+_ANALYZE_FAILURE_USAGE_RE = re.compile(
+    r'''(?ix)
+    (?P<key>
+        ["']?(?:total_)?cost(?:_usd)?["']?
+        | ["']?(?:input|output|cache(?:_creation|_read)?|reasoning)[_-]?tokens?["']?
+        | ["']?(?:duration(?:_api)?_?ms|duration_seconds|num_turns)["']?
+    )
+    \s*[:=]\s*
+    -?\d+(?:\.\d+)?
+    '''
+)
+
+
+def _normalize_analyze_failure_reason(reason: str) -> str:
+    """Return a stable comparison key for executor failure diagnostics.
+
+    Executor stderr is retained verbatim for operators, but common per-run
+    metadata must not prevent the draft-analysis circuit breaker from
+    recognizing one repeated systemic failure.
+    """
+    normalized = _ANALYZE_FAILURE_VOLATILE_ID_RE.sub(
+        lambda match: f"{match.group('key')}=<volatile>", reason
+    )
+    normalized = _ANALYZE_FAILURE_UUID_RE.sub("<uuid>", normalized)
+    normalized = _ANALYZE_FAILURE_TIMESTAMP_RE.sub("<timestamp>", normalized)
+    normalized = _ANALYZE_FAILURE_USAGE_RE.sub(
+        lambda match: f"{match.group('key')}=<usage>", normalized
+    )
+    return normalized
 
 
 class _Tee:
@@ -496,11 +576,12 @@ def _analyze_drafts(
     milestone: str | None = None,
     tickets_dir=None,
     ticket_ids: set[str] | None = None,
-) -> None:
-    """Flip all eligible draft tickets to open via analyze.
+    pool_name: str | None = None,
+) -> bool:
+    """Analyze eligible draft tickets, one at a time, until one is dispatchable.
 
     Skips drafts outside the active milestone filter, and outside an explicit
-    ticket scope (TICK-262) when one is given — a run scoped to specific
+    ticket scope when one is given — a run scoped to specific
     ticket(s) must not go analyze unrelated drafts elsewhere in the milestone
     just because none of the requested ticket(s) were ready to dispatch.
     On analyze failure, logs a warning and continues to the next draft — UNLESS
@@ -509,6 +590,16 @@ def _analyze_drafts(
     that one ticket's content. Repeating the same doomed call across every
     remaining draft just burns model cost for a guaranteed-identical failure,
     so the whole draft-analysis pass stops early in that case instead.
+
+    Returns as soon as a successful analyze produces a dispatchable ticket,
+    instead of draining the entire draft backlog first — ready-to-implement
+    work must never sit idle behind unrelated drafts still waiting their turn.
+    Callers sit inside a loop that re-invokes this (checking for dispatchable
+    work first each time), so remaining drafts still get analyzed — just
+    interleaved with dispatch instead of front-loaded before it.
+
+    Returns True when the analysis subprocess was interrupted by the operator.
+    Callers must halt the run rather than dispatching another draft or worker.
     """
     from lanegate.analyze import cmd_analyze
     from lanegate.ticket import load_all_tickets as _load_all_tickets
@@ -520,29 +611,40 @@ def _analyze_drafts(
     drafts = [
         t
         for t in tickets
-        if t.get("status") == "draft"
+        if (t.get("status") == "draft" or (t.get("status") == "open" and not t.get("touches")))
         and (milestone is None or t.get("milestone") == milestone)
         and (ticket_ids is None or t["id"] in ticket_ids)
     ]
     last_failure_reason: str | None = None
     repeat_count = 0
     for t in drafts:
+        if (t.get("review_summary") or "").startswith("already_resolved:") or "analyze: ticket premise appears already resolved" in (t.get("_body") or ""):
+            print(f"[orchestrate] skipping draft {t['id']} (already flagged as already_resolved)")
+            continue
         print(f"[orchestrate] auto-analyzing draft {t['id']}")
         captured = io.StringIO()
         try:
             with contextlib.redirect_stderr(_Tee(sys.stderr, captured)):
-                cmd_analyze(t["id"], cfg, repo_root)
+                cmd_analyze(t["id"], cfg, repo_root, pool_name=pool_name)
         except (Exception, SystemExit) as exc:
             code = exc.code if isinstance(exc, SystemExit) else exc
             reason = captured.getvalue().strip() or str(exc)
+            if isinstance(code, int) and _is_interrupted_exit(code):
+                print(
+                    f"[orchestrate] draft analysis for {t['id']} was interrupted — "
+                    "stopping further dispatch",
+                    file=sys.stderr,
+                )
+                return True
+            comparison_reason = _normalize_analyze_failure_reason(reason)
             print(
                 f"WARNING: analyze failed for {t['id']}: {code} — skipping",
                 file=sys.stderr,
             )
-            if reason and reason == last_failure_reason:
+            if comparison_reason and comparison_reason == last_failure_reason:
                 repeat_count += 1
             else:
-                last_failure_reason = reason
+                last_failure_reason = comparison_reason
                 repeat_count = 1
             if repeat_count >= _ANALYZE_SYSTEMIC_FAILURE_THRESHOLD:
                 print(
@@ -552,10 +654,47 @@ def _analyze_drafts(
                     f"failure across the rest of the queue.",
                     file=sys.stderr,
                 )
-                return
+                return False
             continue
         last_failure_reason = None
         repeat_count = 0
+        if next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids):
+            return False
+    return False
+
+
+def _queue_code_complete_reviews(
+    cfg: dict,
+    repo_root: Path,
+    *,
+    milestone: str | None = None,
+    ticket_ids: set[str] | None = None,
+    exclude_ticket_ids: set[str] | None = None,
+    reason: str = "awaiting independent review",
+) -> list[str]:
+    """Move eligible completed work into the existing review-resume path.
+
+    A ticket with a changes-requested verdict is deliberately excluded: it must
+    stay visible to the fix workflow, not be silently sent through a fresh
+    review. This helper is used both at startup and before draft analysis.
+    """
+    from lanegate.lifecycle import mark_review_pending
+
+    tickets_dir = repo_root / cfg["tickets_dir"]
+    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    queued: list[str] = []
+    for ticket in tickets:
+        if ticket.get("status") != "code_complete" or ticket.get("review_verdict"):
+            continue
+        if exclude_ticket_ids is not None and ticket["id"] in exclude_ticket_ids:
+            continue
+        if milestone is not None and ticket.get("milestone") != milestone:
+            continue
+        if ticket_ids is not None and ticket["id"] not in ticket_ids:
+            continue
+        mark_review_pending(ticket, cfg, repo_root, reason=reason)
+        queued.append(ticket["id"])
+    return queued
 
 
 def _print_draft_analysis_plan(
@@ -575,18 +714,12 @@ def _print_draft_analysis_plan(
     drafts = [
         t
         for t in tickets
-        if t.get("status") == "draft"
+        if (t.get("status") == "draft" or (t.get("status") == "open" and not t.get("touches")))
         and (milestone is None or t.get("milestone") == milestone)
         and (ticket_ids is None or t["id"] in ticket_ids)
     ]
     for t in drafts:
         print(f"[dry-run] would analyze draft {t['id']}")
-
-
-def _pid_alive(pid: int) -> bool:
-    # Delegates to the shared cross-platform probe; on Windows a plain
-    # os.kill(pid, 0) would *terminate* the process being checked.
-    return pid_alive(pid)
 
 
 def _executor_alive(ticket: dict, cfg: dict, repo_root: Path) -> bool:
@@ -598,7 +731,7 @@ def _executor_alive(ticket: dict, cfg: dict, repo_root: Path) -> bool:
 
     if pid_path.exists():
         try:
-            return _pid_alive(int(pid_path.read_text(encoding="utf-8").strip()))
+            return pid_alive(int(pid_path.read_text(encoding="utf-8").strip()))
         except ValueError:
             return False
 
@@ -614,7 +747,19 @@ def _executor_alive(ticket: dict, cfg: dict, repo_root: Path) -> bool:
 
 
 def _hibernate_orphaned(cfg: dict, repo_root: Path) -> int:
-    """Hibernate in-progress tickets whose executor marker is missing or stale."""
+    """Reclaim work stranded by a prior session.
+
+    Covers two cases: in-progress tickets whose executor marker is missing
+    or stale, and code_complete tickets left with no review verdict. The
+    latter can only be seen here because this runs once at startup, before
+    this run has dispatched any worker of its own -- so any code_complete
+    ticket already on the board was left behind by a session that ended
+    (crashed, was killed, or errored) before it could hand the ticket to
+    review. Routing it through mark_review_pending reuses the same
+    hibernated/review_pending resume orchestrate already trusts for
+    rate-limited reviews, so it flows back through review on this run
+    instead of sitting until someone runs `lanegate review` by hand.
+    """
     from lanegate.lifecycle import cmd_hibernate
 
     tickets_dir = repo_root / cfg["tickets_dir"]
@@ -624,18 +769,39 @@ def _hibernate_orphaned(cfg: dict, repo_root: Path) -> int:
         for t in tickets
         if t.get("status") == "in_progress" and not _executor_alive(t, cfg, repo_root)
     ]
-    if not orphaned:
+    stranded_code_complete = [
+        t
+        for t in tickets
+        if t.get("status") == "code_complete" and not t.get("review_verdict")
+    ]
+
+    if not orphaned and not stranded_code_complete:
         return 0
 
-    print(
-        f"[orchestrate] {len(orphaned)} orphaned in_progress ticket(s) detected from prior session"
-    )
-    for t in orphaned:
-        branch = t.get("branch") or t["id"].lower()
-        print(f"[orchestrate] hibernating {t['id']} - partial work preserved in branch {branch}")
-        cmd_hibernate(t["id"], cfg, repo_root, reason="orphaned prior executor session")
+    if orphaned:
+        print(
+            f"[orchestrate] {len(orphaned)} orphaned in_progress ticket(s) detected from prior session"
+        )
+        for t in orphaned:
+            branch = t.get("branch") or t["id"].lower()
+            print(f"[orchestrate] hibernating {t['id']} - partial work preserved in branch {branch}")
+            cmd_hibernate(t["id"], cfg, repo_root, reason="orphaned prior executor session")
+
+    if stranded_code_complete:
+        print(
+            f"[orchestrate] {len(stranded_code_complete)} code_complete ticket(s) stranded from a "
+            "prior session (no review verdict) — queuing for review resume"
+        )
+        queued = _queue_code_complete_reviews(
+            cfg,
+            repo_root,
+            reason="orphaned prior session: code_complete with no review verdict",
+        )
+        for tid in queued:
+            print(f"[orchestrate] queuing {tid} for review resume")
+
     print("[orchestrate] resuming board clearing from hibernated tickets (priority-boosted)")
-    return len(orphaned)
+    return len(orphaned) + len(stranded_code_complete)
 
 
 def _gather_rate_limit_texts(
@@ -657,12 +823,30 @@ def _gather_rate_limit_texts(
     — they were pure agent-writable attack surface, since an executor agent
     has full write access to its own worktree and could plant rate-limit-
     shaped text there to force its own ticket (or, via rate_limit_halt, every
-    in-flight ticket) into hibernation on demand (TICK-203/F14 follow-up,
-    TICK-252). ``worktree_path`` stays in the signature only for call-site
+    in-flight ticket) into hibernation on demand. ``worktree_path`` stays in the signature only for call-site
     stability.
     """
     del worktree_path
     return [captured_stdout, captured_stderr]
+
+
+def _has_structured_rate_limit(texts: list[str]) -> bool:
+    """Return True if any text contains a JSON object with api_error_status == 429."""
+    for text in texts:
+        if not text:
+            continue
+        for line in text.splitlines():
+            line_str = line.strip()
+            if "api_error_status" not in line_str:
+                continue
+            try:
+                data = json.loads(line_str)
+                if isinstance(data, dict) and data.get("api_error_status") in (429, "429"):
+                    return True
+            except Exception:
+                if re.search(r'"api_error_status"\s*:\s*429\b', line_str):
+                    return True
+    return False
 
 
 def _is_rate_limit(
@@ -678,12 +862,17 @@ def _is_rate_limit(
     # tried to signal HTTP 429 would surface as 173, never 429. No executor
     # path in this codebase (subprocess-based or the ollama REST path, which
     # raises on non-2xx and is swallowed into a plain exit code) can produce
-    # a literal 429 here — detection relies solely on text matching below.
-    text = _rate_limit_detection_text(
-        _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
+    # a literal 429 here — detection relies on structured fields or text matching below.
+    texts = _gather_rate_limit_texts(
+        worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
     )
+    # An executor-provided HTTP 429 is unambiguous.  Check it before scanning
+    # the rest of a (possibly very large) transcript for setup-error phrases:
+    # a session-limit result can include earlier command/configuration output,
+    # but must still enter the cooldown/resume path.
+    if _has_structured_rate_limit(texts):
+        return True
+    text = _rate_limit_detection_text(texts)
     if _has_non_rate_limit_hard_error(text):
         return False
     patterns = (
@@ -728,25 +917,9 @@ def _rate_limit_detection_text(texts: list[str]) -> str:
 
 _MAX_RATE_LIMIT_EXCERPT = 2000  # cap raw text embedded in the hibernation reason
 
-# Must match resume_watch._RATE_LIMIT_MARKER — used there to tell "hibernated
-# because of a rate limit" apart from other halt reasons, and here (TICK-089)
-# to tell whether a specific pool instance is currently rate-limited.
-_RATE_LIMIT_MARKER = "rate limit or quota interruption"
-_NON_RATE_LIMIT_HARD_ERROR_PATTERNS = (
-    r"\binvalid_request_error\b",
-    r"\bstatus[\"']?\s*:\s*400\b",
-    r"\brequires a newer version of codex\b",
-    r"\bmodel metadata\b.{0,120}\bnot found\b",
-    r"\bunknown model\b",
-    r"\bmodel .* does not exist\b",
-)
-
-
-def _has_non_rate_limit_hard_error(text: str) -> bool:
-    lowered = text.lower()
-    return any(re.search(pattern, lowered) for pattern in _NON_RATE_LIMIT_HARD_ERROR_PATTERNS)
-
-
+# The shared ticket.py classifier distinguishes resumable rate-limit
+# hibernations from human-actionable hibernations; this loop also uses its
+# marker to identify pool instances that remain in cooldown.
 def _is_executor_setup_error(
     exit_code: int,
     worktree_path: Path | None = None,
@@ -838,10 +1011,6 @@ def _auth_error_reason(
     return f"{header}\n\nRaw executor output:\n{raw}"
 
 
-def _active_rate_limit_hibernation(body: str) -> bool:
-    return _RATE_LIMIT_MARKER in body and not _has_non_rate_limit_hard_error(body)
-
-
 def _rate_limit_reason(
     exit_code: int,
     worktree_path: Path | None = None,
@@ -870,41 +1039,16 @@ def _rate_limit_reason(
     return f"{header}\n\nRaw executor output:\n{raw}"
 
 
-def _flat_note_name(path: str) -> str:
-    return f"{path.replace('/', '_')}.md"
-
-
-def write_ticket_notes(repo_root: Path, tid: str, notes: str) -> Path:
-    """Persist per-ticket review findings and operational notes into .lanegate/notes/<tid>.md."""
-    notes_dir = repo_root / ".lanegate" / "notes"
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    path = notes_dir / f"{tid}.md"
-    path.write_text(notes.strip() + "\n", encoding="utf-8")
-    return path
-
-
 def _collect_prior_notes(ticket: dict, repo_root: Path) -> str:
-    notes_dir = repo_root / ".lanegate" / "notes"
+    """Return hibernation recovery context for *ticket*, if any."""
     recovery_path = repo_root / ".lanegate" / "recovery" / f"{ticket['id']}.md"
-    ticket_note_path = notes_dir / f"{ticket['id']}.md"
-    parts: list[str] = []
-    if ticket.get("status") in ("hibernated", "needs_review") and recovery_path.exists():
-        recovery_text = recovery_path.read_text(encoding="utf-8", errors="replace").strip()
-        if recovery_text:
-            parts.append("## Hibernation Recovery Context\n\n" + recovery_text)
-    if ticket_note_path.exists():
-        tn_text = ticket_note_path.read_text(encoding="utf-8", errors="replace").strip()
-        if tn_text:
-            parts.append("## Ticket Operational Notes\n\n" + tn_text)
-    for touched in ticket.get("touches") or []:
-        note_path = notes_dir / _flat_note_name(str(touched))
-        if note_path.exists():
-            text = note_path.read_text(encoding="utf-8", errors="replace").strip()
-            if text:
-                parts.append(text)
-    if not parts:
+    if ticket.get("status") not in ("hibernated", "needs_review") or not recovery_path.exists():
         return ""
-    return "## Prior Agent Notes\n\n" + "\n\n".join(parts)
+    recovery_text = recovery_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not recovery_text:
+        return ""
+    return "## Hibernation Recovery Context\n\n" + recovery_text
+
 
 
 def _conflicted_files(worktree_path: Path) -> list[str]:
@@ -991,14 +1135,14 @@ def _worktree_is_dirty(worktree_path: Path) -> bool:
 
 
 def _ticket_has_real_progress(worktree_path: Path) -> bool:
-    """Heuristic (TICK-263) for whether a rate-limited ticket is worth
+    """Heuristic for whether a rate-limited ticket is worth
     resuming on a healthy sibling pool instance rather than hibernating.
 
     True when the worktree shows real work-in-progress: commits ahead of
     main, or uncommitted tracked changes. False is more consistent with a
     stuck/looping session that burned quota without producing anything —
     that case should still hibernate rather than risk depleting a second
-    pool instance's quota on the same bad ticket (TICK-258).
+    pool instance's quota on the same bad ticket.
     """
     if not worktree_path.exists():
         return False
@@ -1068,6 +1212,32 @@ def _abort_rebase(worktree_path: Path) -> None:
         subprocess.run(["git", "rebase", "--abort"], cwd=worktree_path, capture_output=True, text=True, encoding="utf-8")
     except FileNotFoundError:
         pass
+
+
+def is_mid_rebase(worktree_path: Path) -> bool:
+    """Return True if git rebase is currently in progress in worktree_path."""
+    if not worktree_path or not worktree_path.exists():
+        return False
+    try:
+        for folder in ("rebase-merge", "rebase-apply"):
+            res = subprocess.run(
+                ["git", "rev-parse", "--git-path", folder],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            if res.returncode == 0:
+                p_str = res.stdout.strip()
+                if p_str:
+                    p = Path(p_str)
+                    full_p = p if p.is_absolute() else (worktree_path / p)
+                    if full_p.exists():
+                        return True
+    except FileNotFoundError:
+        pass
+    return False
+
 
 
 def _prepend_context(ticket: dict, *sections: str) -> dict:
@@ -1271,6 +1441,15 @@ def recover_scope_only_needs_review_tickets(
                 reason=f"static analysis findings ({len(findings)}): {'; '.join(findings[:5])}",
             )
             continue
+        ok_cp, cp_err = check_control_plane_compliance(restored, repo_root=repo_root, cfg=cfg, worktree_path=wt, check_review_independence=False)
+        if not ok_cp:
+            _mark_needs_review(
+                restored,
+                cfg,
+                repo_root,
+                reason=f"control plane compliance failed: {cp_err}",
+            )
+            continue
 
         acceptance_findings = _run_acceptance_contract_audit(restored, repo_root, cfg)
         if acceptance_findings and resolve_acceptance_contract_mode(cfg) == "blocker":
@@ -1314,6 +1493,52 @@ def cmd_orchestrate(
     recover: bool = True,
     verbose: bool = False,
     pool: str | None = None,
+    executors: list[str] | None = None,
+) -> None:
+    """Clear the ticket board using the configured executor.
+
+    Thin wrapper around `_cmd_orchestrate_body` that suppresses direct-action
+    tracking for the whole run: cmd_start/cmd_review/cmd_merge/etc. run
+    dozens of times per ticket inside a run as ordinary lifecycle steps, and
+    each already appears in this run's own orchestrate-*.events.jsonl, so
+    tracking them again as standalone `action-*` entries would just duplicate
+    the run in the run list. Direct-action tracking exists to give a
+    human running `lanegate start`/`review`/etc. by hand (outside any run) a
+    durable run id; suppress it here so it stays out of process.
+    """
+    with suppress_direct_action_tracking():
+        _cmd_orchestrate_body(
+            cfg,
+            repo_root,
+            max_parallel=max_parallel,
+            dry_run=dry_run,
+            human_review=human_review,
+            milestone=milestone,
+            all_milestones=all_milestones,
+            tickets=tickets,
+            auto_analyze=auto_analyze,
+            recover=recover,
+            verbose=verbose,
+            pool=pool,
+            executors=executors,
+        )
+
+
+def _cmd_orchestrate_body(
+    cfg: dict,
+    repo_root: Path,
+    *,
+    max_parallel: int | None = None,
+    dry_run: bool = False,
+    human_review: str | None = None,
+    milestone: str | None = None,
+    all_milestones: bool = False,
+    tickets: list[str] | None = None,
+    auto_analyze: bool = True,
+    recover: bool = True,
+    verbose: bool = False,
+    pool: str | None = None,
+    executors: list[str] | None = None,
 ) -> None:
     """
     Clear the ticket board using the configured executor.
@@ -1328,7 +1553,7 @@ def cmd_orchestrate(
             in .lanegate.yml, or "none" if that is also unset.
         milestone: restrict the run to tickets with this milestone tag
         all_milestones: clear tickets across all milestones (overrides milestone check)
-        tickets: optional explicit list of ticket IDs (TICK-262) restricting
+        tickets: optional explicit list of ticket IDs restricting
             dispatch to exactly these IDs, on top of (not instead of) the
             usual status/milestone/deps/lock eligibility filtering. Composes
             with milestone rather than replacing it.
@@ -1340,10 +1565,15 @@ def cmd_orchestrate(
         verbose: when True, stream full executor output to terminal; when False
             (default), print compact per-ticket progress lines only and route
             executor output to the log file only.
-        pool: name of a `pools:` entry (TICK-089) to draw executor instances
+        pool: name of a `pools:` entry to draw executor instances
             from; falls back to `cfg.default_pool` when not given, or to plain
             single-executor dispatch when neither is set.
+        executors: optional ad-hoc list of executor instance names to draw from
+            for this run without declaring a named pools: entry.
     """
+    triggered_by = os.environ.get("LANEGATE_RUN_TRIGGER", "manual")
+    trigger_reason = os.environ.get("LANEGATE_RUN_TRIGGER_REASON")
+
     # Store the original orchestrate arguments for resume-watch to use on retry
     from lanegate.resume_watch import store_orchestrate_args
     args_to_store: list[str] = []
@@ -1367,9 +1597,37 @@ def cmd_orchestrate(
         args_to_store.append("--verbose")
     if pool is not None:
         args_to_store.extend(["--pool", pool])
+    if executors is not None:
+        args_to_store.extend(["--executors", ",".join(executors)])
     store_orchestrate_args(repo_root, args_to_store)
 
-    effective_pool = pool or cfg.get("default_pool")
+    if pool is not None and executors is not None:
+        print(
+            "ERROR: --pool and --executors are mutually exclusive selectors",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    effective_pool: str | None
+    if executors is not None:
+        unknown = [e for e in executors if e not in (cfg.get("executors") or {})]
+        if unknown:
+            print(
+                f"ERROR: unknown executor(s) in --executors: {', '.join(unknown)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cfg = {
+            **cfg,
+            "pools": {
+                **(cfg.get("pools") or {}),
+                "__adhoc__": {"executors": executors, "strategy": "least-loaded"},
+            },
+        }
+        effective_pool = "__adhoc__"
+    else:
+        effective_pool = pool or cfg.get("default_pool")
+
     if effective_pool is not None and effective_pool not in (cfg.get("pools") or {}):
         print(
             f"ERROR: --pool {effective_pool!r} is not defined in pools: in .lanegate.yml",
@@ -1427,12 +1685,19 @@ def cmd_orchestrate(
         elif cfg.get("default_milestone"):
             effective_milestone = cfg["default_milestone"]
         else:
-            print(
-                "ERROR: no milestone specified and no default_milestone in .lanegate.yml.\n"
-                "Run with --milestone <m> or --all to clear tickets across all milestones.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            from lanegate.create import _discover_milestones
+
+            probe_dir = repo_root / cfg.get("tickets_dir", ".lanegate/tickets")
+            if _discover_milestones(probe_dir, cfg["ticket_prefix"], cfg, raise_on_error=True):
+                print(
+                    "ERROR: no milestone specified and no default_milestone in .lanegate.yml.\n"
+                    "Run with --milestone <m> or --all to clear tickets across all milestones.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # No ticket uses the milestone field at all -- nothing to scope by,
+            # so a bare `lanegate run` clears everything instead of hard-erroring
+            # on a fresh project's first, untagged ticket.
 
     # Detect and warn about milestone near-miss values (e.g., '1.5' vs 'v1.5')
     if effective_milestone:
@@ -1449,7 +1714,7 @@ def cmd_orchestrate(
                 file=sys.stderr,
             )
 
-    # Resolve explicit ticket scope (TICK-262): composes with milestone above
+    # Resolve explicit ticket scope: composes with milestone above
     # rather than replacing it — an id must still pass the usual eligibility
     # filtering (status/deps/lock) in next_batch() to actually be dispatched.
     effective_ticket_ids: set[str] | None = None
@@ -1460,7 +1725,7 @@ def cmd_orchestrate(
 
     if effective_ticket_ids:
         scope_tickets_dir = repo_root / cfg.get("tickets_dir", ".lanegate/tickets")
-        scope_all_tickets, _ = load_all_tickets(scope_tickets_dir, cfg["ticket_prefix"])
+        scope_all_tickets, _ = load_all_tickets(scope_tickets_dir, cfg["ticket_prefix"], cfg)
         known_ids = {t["id"] for t in scope_all_tickets}
         unknown_ids = sorted(effective_ticket_ids - known_ids)
         if unknown_ids:
@@ -1489,19 +1754,6 @@ def cmd_orchestrate(
         old.rename(archive_dir / old.name)
 
     report_session_ts = None if dry_run else session_ts
-    if report_session_ts is not None:
-        _write_last_run_pointer(repo_root, report_session_ts, log_path)
-        _append_run_event(
-            repo_root,
-            report_session_ts,
-            "run_start",
-            pid=os.getpid(),
-            milestone=effective_milestone,
-            ticket_ids=sorted(effective_ticket_ids) if effective_ticket_ids else None,
-            pool=effective_pool,
-            max_parallel=effective_max,
-            human_review=effective_human_review,
-        )
 
     with open(log_path, "w") as _log_f:
         _log_f.write(
@@ -1526,7 +1778,8 @@ def cmd_orchestrate(
             )
 
             if not dry_run:
-                # Detect and kill orphaned executor children (TICK-281) *before*
+                assert report_session_ts is not None  # report_session_ts is session_ts whenever not dry_run
+                # Detect and kill orphaned executor children *before*
                 # acquiring the lock below — once this process holds the lock,
                 # `_collect_live_lanegate_processes` sees a live orchestrator again
                 # and would no longer flag a prior driver's abandoned child as
@@ -1546,11 +1799,59 @@ def cmd_orchestrate(
                     print(f"ERROR: {e}", file=sys.stderr)
                     sys.exit(1)
 
+                _write_last_run_pointer(repo_root, report_session_ts, log_path)
+                _append_run_event(
+                    repo_root,
+                    report_session_ts,
+                    "run_start",
+                    pid=os.getpid(),
+                    milestone=effective_milestone,
+                    ticket_ids=sorted(effective_ticket_ids) if effective_ticket_ids else None,
+                    pool=effective_pool,
+                    max_parallel=effective_max,
+                    human_review=effective_human_review,
+                    triggered_by=triggered_by,
+                    trigger_reason=trigger_reason,
+                )
+
             if recover and not dry_run:
                 _hibernate_orphaned(cfg, repo_root)
+                from lanegate.lifecycle import cmd_recover_rate_limited_reviews
+
+                rec_tickets_dir = repo_root / cfg.get("tickets_dir", ".lanegate/tickets")
+                rec_all_tickets, _ = load_all_tickets(
+                    rec_tickets_dir, cfg.get("ticket_prefix", "TICK-"), cfg
+                )
+                rec_candidates = [
+                    t["id"]
+                    for t in rec_all_tickets
+                    if t.get("status") == "needs_review"
+                    and not t.get("auto_fix_attempts")
+                    and (
+                        effective_milestone is None
+                        or t.get("milestone") == effective_milestone
+                    )
+                    and (
+                        effective_ticket_ids is None
+                        or t["id"] in effective_ticket_ids
+                    )
+                ]
+                recovered_count = 0
+                for tid in rec_candidates:
+                    buf = io.StringIO()
+                    old_stdout = sys.stdout
+                    try:
+                        sys.stdout = buf
+                        r = cmd_recover_rate_limited_reviews(tid, cfg, repo_root)
+                        recovered_count += r
+                    finally:
+                        sys.stdout = old_stdout
+                if recovered_count > 0:
+                    print(f"Recovered {recovered_count} rate-limited review ticket(s).")
 
             run_status = "completed"
             try:
+                drain_recovery_kwargs = {"recover": False} if not recover else {}
                 _drain_loop(
                     cfg,
                     repo_root,
@@ -1565,6 +1866,7 @@ def cmd_orchestrate(
                     _orig_out=_orig_out,
                     _log_f=_log_f,
                     session_ts=report_session_ts,
+                    **drain_recovery_kwargs,
                 )
             except BaseException as exc:
                 run_status = f"crashed: {exc.__class__.__name__}: {exc}"
@@ -1592,6 +1894,7 @@ def _drain_loop(
     milestone: str | None = None,
     *,
     auto_analyze: bool = True,
+    recover: bool = True,
     verbose: bool = False,
     pool_name: str | None = None,
     ticket_ids: set[str] | None = None,
@@ -1602,12 +1905,12 @@ def _drain_loop(
     """Inner board-clearing loop — separated for testability.
 
     Args:
-        ticket_ids: optional explicit set of ticket IDs (TICK-262) restricting
+        ticket_ids: optional explicit set of ticket IDs restricting
             dispatch to exactly these IDs; composes with milestone.
         verbose: when True, stream full executor output to terminal; when False
             (default), print compact per-ticket status lines only and route
             executor output to the log file only.
-        pool_name: name of a `pools:` entry (TICK-089) to draw executor
+        pool_name: name of a `pools:` entry to draw executor
             instances from for tickets that don't already carry an explicit
             `ticket.executor` override. None (default) leaves dispatch
             entirely to the existing single-executor resolution.
@@ -1617,13 +1920,14 @@ def _drain_loop(
         _log_f: the open log file; used as the exclusive destination for
             executor output in compact mode.  Falls back to None (no redirect)
             when absent.
-        session_ts: this run's session timestamp (TICK-244), used to append
+        session_ts: this run's session timestamp, used to append
             durable events to `.lanegate/logs/orchestrate-<ts>.events.jsonl` for
             `lanegate run-report`. None (the default, e.g. dry-run or direct
             test calls) disables event recording.
     """
     from lanegate.lifecycle import (
         MergeFailedError,
+        _clear_human_review_approval,
         _commit_generated_ticket_write,
         cmd_complete,
         cmd_fail,
@@ -1635,6 +1939,8 @@ def _drain_loop(
     from lanegate.lifecycle import (
         cmd_review as _cmd_review,
     )
+    from lanegate.concurrency import SafeguardLockHeld, safeguard_lock
+    from lanegate.safeguards import run_safeguards
     from lanegate.ticket import load_all_tickets, write_ticket
     from lanegate.worktree import worktree_path
 
@@ -1659,13 +1965,13 @@ def _drain_loop(
             repo_root, session_ts, "ticket_outcome", ticket_id=tid, outcome=outcome, reason=reason
         )
 
-    # --- executor pool dispatch (TICK-089) ---
+    # --- executor pool dispatch ---
     # pool_running/pool_rr_index are only ever mutated from the main thread
     # (inside submit(), or the serial for-loop below) — worker threads never
     # touch them, so no lock is needed even under max_parallel > 1.
     pool_running: dict[str, int] = {}
 
-    # Load persisted rotation state (TICK-268): rr_index continues from where
+    # Load persisted rotation state: rr_index continues from where
     # the last run left off; dispatch_counts breaks least-loaded ties across runs.
     _persisted_pool_state: dict = (
         _load_pool_state(repo_root) if pool_name and not dry_run else {}
@@ -1683,20 +1989,19 @@ def _drain_loop(
 
     def _pool_has_available_instance(name: str) -> bool:
         """True if at least one instance in pool *name* is neither cooling
-        down (TICK-090) nor hibernated-for-rate-limit (TICK-089)."""
+        down nor hibernated-for-rate-limit."""
         pool_cfg = cfg["pools"][name]
         return any(
             _pool_instance_healthy(repo_root, cfg, candidate)
             for candidate in pool_cfg["executors"]
         )
 
-    _COOLDOWN_POLL_SECONDS = 30
     _COOLDOWN_MAX_POLLS = 4
 
     def _wait_for_pool_capacity(name: str) -> bool:
         """Block in bounded steps until some instance in pool *name* is no
         longer cooling down, instead of either tight-looping or halting the
-        whole run the instant every instance is exhausted at once (TICK-090).
+        whole run the instant every instance is exhausted at once.
         Gives up (returns False) after a bounded number of polls so a
         genuinely stuck run still surfaces to the human gate / resume-watch
         rather than hanging forever."""
@@ -1711,8 +2016,8 @@ def _drain_loop(
             time.sleep(_COOLDOWN_POLL_SECONDS)
         return _pool_has_available_instance(name)
 
-    def _select_pool_instance(name: str) -> str:
-        # TICK-286's per-instance max_parallel capacity preference now lives
+    def _select_pool_instance(name: str) -> str | None:
+        # Per-instance max_parallel capacity preference now lives
         # inside resolve_pool_executor() itself (the shared seam implement,
         # analyze, and review all route through) rather than duplicated here.
         instance = resolve_pool_executor(
@@ -1725,10 +2030,20 @@ def _drain_loop(
             rr_index=pool_rr_index,
             dispatch_counts=_pool_dispatch_counts,
         )
-        assert instance is not None  # A validated pool always has executors.
+        if instance is None and _wait_for_pool_capacity(name):
+            instance = resolve_pool_executor(
+                "implement",
+                {},
+                cfg,
+                repo_root,
+                pool_name=name,
+                running_counts=pool_running,
+                rr_index=pool_rr_index,
+                dispatch_counts=_pool_dispatch_counts,
+            )
         return instance
 
-    # Per-ticket count of sibling-retry attempts (TICK-263) made so far *this
+    # Per-ticket count of sibling-retry attempts made so far *this
     # run* — bounds how many times a single ticket can be bounced to another
     # pool instance after a rate limit, so a misbehaving ticket can't cycle
     # through the whole pool in one run even if each individual attempt
@@ -1741,7 +2056,7 @@ def _drain_loop(
     ) -> tuple[str | None, str]:
         """Decide whether a ticket that just hit a rate limit on
         *cooldown_instance* should be retried on a healthy sibling instance
-        within this run, instead of hibernating (TICK-263).
+        within this run, instead of hibernating.
 
         Returns (instance, reason) where instance is the sibling to retry on,
         or (None, reason) to fall back to today's hibernate-and-wait
@@ -1774,12 +2089,28 @@ def _drain_loop(
             f"and sibling instance {sibling!r} is healthy"
         )
 
+    # Set once any ticket's executor hits a rate/quota limit. A rate limit is a
+    # global (account/quota-level) condition, so every *new* executor
+    # invocation would hit the same wall and churn otherwise-fine tickets into
+    # failed/hibernated. Once set, we stop pulling new work via next_batch()
+    # (both the worker-pool refill and the outer loop) and let already-dispatched
+    # tickets finish, then exit so resume-watch can wait out the limit.
+    rate_limit_halt = False
+    # Set when an executor exits because it received a signal (for example
+    # SIGINT from Ctrl+C). Preserve active work and stop dispatching new
+    # tickets; the next orchestrate run can resume from hibernated state.
+    interrupt_halt = False
+    # Set when an executor reports a hard setup/configuration error (for
+    # example an unsupported model or stale Codex CLI). Retrying the rest of
+    # the board would only churn unrelated tickets into failed.
+    executor_setup_halt = False
+
     # Ticket ID -> pool-selected instance for the current dispatch. Deliberately
     # NOT persisted onto the ticket file: run_ticket reloads a fresh copy of
     # the ticket from disk after cmd_start (to pick up cmd_start's own
     # updates), which would discard an in-memory-only assignment anyway, and
     # writing an arbitrary named-instance string into ticket.executor trips a
-    # pre-existing validate_ticket gap (see TICK-247) that quarantines the
+    # pre-existing validate_ticket gap that quarantines the
     # ticket everywhere load_all_tickets is used. Passing the selection
     # through invoke_executor's executor_override instead avoids that
     # landmine entirely — it's a pure dispatch-time concern, never written to
@@ -1791,9 +2122,13 @@ def _drain_loop(
         when no pool is active or the ticket already carries an explicit
         `executor` override — pools only stand in for the same choice a user
         could make by hand, never overriding one."""
+        nonlocal rate_limit_halt
         if not pool_name or ticket.get("executor"):
             return None
         instance = _select_pool_instance(pool_name)
+        if instance is None:
+            rate_limit_halt = True
+            return None
         pool_assignment[ticket["id"]] = instance
         pool_running[instance] = pool_running.get(instance, 0) + 1
         if not dry_run:
@@ -1836,17 +2171,60 @@ def _drain_loop(
                 continue
             if ticket.get("pr_number"):
                 continue
+            # A completed rebase only proves Git accepted the result.  If an
+            # agent resolved any conflict hunk, preserve the normal automated
+            # review but require a human to make the final merge decision.
+            if ticket.get("requires_human_merge"):
+                files = ", ".join(ticket.get("rebase_conflict_files") or [])
+                detail = f" ({files})" if files else ""
+                print(
+                    f"[orchestrate] {ticket['id']}: automated rebase conflict recovery"
+                    f" requires human merge approval{detail}",
+                    file=sys.stderr,
+                )
+                continue
             # Supervised/manual autonomy permit the normal LLM review/fix
             # cycle, but an approved result still requires an explicit human
             # merge. This check also covers tickets approved during a prior
             # run (e.g. via `lanegate fix`), which reach this board-clear scan
             # without passing a worker.
-            if resolve_autonomy(cfg, ticket) != "full":
+            if not is_auto_fix_lane(resolve_autonomy(cfg, ticket)):
+                continue
+
+            # A ticket may reach this shared merge path after a prior run or a
+            # review-pending resume, neither of which necessarily traversed
+            # run_ticket's post-implementation risk-lane gate.  Re-scan the
+            # current branch diff here so an approved verdict never bypasses
+            # the human escalation required for red-lane changes.
+            merge_worktree = (
+                Path(ticket["worktree"])
+                if ticket.get("worktree")
+                else worktree_path(worktrees_dir, ticket["id"])
+            )
+            merge_trunk = resolve_trunk_branch(cfg, repo_root)
+            diff_capture = _git_text(
+                ["git", "diff", f"{merge_trunk}...HEAD"], merge_worktree
+            )
+            risk_lane = scan_risk_lane(
+                diff_capture.text if diff_capture.ok else "", ticket
+            )
+            if risk_lane_requires_human_review(
+                risk_lane, resolve_human_escalation(cfg)
+            ):
+                reason = (
+                    "red-lane escalation: diff scan classified this change as "
+                    "'red' (external credentials, security-sensitive, or irreversible "
+                    "operation detected) — human review required"
+                )
+                print(f"[orchestrate] {ticket['id']}: WARNING — {reason}", file=sys.stderr)
+                pause_for_needs_review(ticket["id"], reason)
                 continue
             if verbose:
                 print(f"[orchestrate] auto-merging {ticket['id']} (approved, no human gate)")
             try:
-                cmd_merge(ticket["id"], cfg, repo_root)
+                with suppress_direct_action_tracking():
+                    cmd_merge(ticket["id"], cfg, repo_root)
+                _log_outcome(ticket["id"], "merged")
                 merged_any = True
             except (Exception, SystemExit) as exc:
                 tid = ticket["id"]
@@ -1862,11 +2240,13 @@ def _drain_loop(
                         "skipping needs_review regression for terminal status",
                         file=sys.stderr,
                     )
+                    _log_outcome(tid, "merged")
                     merged_any = True
                     continue
                 reason = f"auto-merge failed: {exc}"
                 print(f"[orchestrate] {tid} merge failed — downgrading to needs_review", file=sys.stderr)
                 downgrade_approved_review_to_needs_review(ticket, reason)
+                _log_outcome(tid, "needs_review", reason=reason)
         return merged_any
 
     def append_or_replace_section(ticket: dict, header: str, text: str) -> None:
@@ -1881,6 +2261,7 @@ def _drain_loop(
         ticket["_body"] = body.rstrip() + f"\n\n{header}\n\n{text.strip()}\n"
 
     def downgrade_approved_review_to_needs_review(ticket: dict, reason: str) -> None:
+        _clear_human_review_approval(ticket)
         ticket["status"] = "needs_review"
         ticket["review_verdict"] = "changes_requested"
         ticket["review_summary"] = "blocked by orchestrate gate"
@@ -1903,6 +2284,7 @@ def _drain_loop(
         tickets whose status doesn't match any of the CLI-guarded
         transitions, e.g. a crash before cmd_start's own status write landed.
         """
+        _clear_human_review_approval(ticket)
         ticket["status"] = "needs_review"
         ticket["status_changed_at"] = _utc_now_iso()
         append_or_replace_section(ticket, "## Needs Review Reason", reason)
@@ -1926,7 +2308,24 @@ def _drain_loop(
             cmd_needs_review(tid, cfg, repo_root, reason=reason)
             _log_outcome(tid, "needs_review", reason=reason)
             return
-        if current in ("code_complete", "in_review", "needs_review"):
+        if current == "code_complete":
+            # A failed gate must release the code_complete lock.  That status
+            # can mean either a combined executor exited before recording a
+            # review verdict or an auto-fix/re-review exhausted its bounded
+            # retry budget.  Leaving it unchanged would requeue or retry it
+            # indefinitely and block every overlapping open ticket.
+            print(
+                f"[orchestrate] {tid}: forcing needs_review from code_complete "
+                f"after a failed gate: {reason}",
+                file=sys.stderr,
+            )
+            if not verbose:
+                _status(tid, "needs_review", orig_out, _log_f)
+            assert current_ticket is not None  # current == "code_complete" implies current_ticket was found above
+            _force_needs_review_write(current_ticket, reason)
+            _log_outcome(tid, "needs_review", reason=reason)
+            return
+        if current in ("in_review", "needs_review"):
             if (
                 current == "in_review"
                 and current_ticket is not None
@@ -1943,6 +2342,16 @@ def _drain_loop(
                     _status(tid, "needs_review", orig_out, _log_f)
                 _log_outcome(tid, "needs_review", reason=reason)
                 return
+            if current_ticket is not None:
+                append_or_replace_section(current_ticket, "## Needs Review Reason", reason)
+                write_ticket(current_ticket)
+                _commit_generated_ticket_write(
+                    repo_root,
+                    Path(current_ticket["_path"]),
+                    tid,
+                    "needs_review",
+                    cfg,
+                )
             print(
                 f"[orchestrate] {tid}: review gate already active "
                 f"(status={current}); warning preserved in log: {reason}",
@@ -1982,21 +2391,10 @@ def _drain_loop(
         _log_outcome(tid, "needs_review", reason=reason)
 
     all_paused_tickets: list[str] = []
-    # Set once any ticket's executor hits a rate/quota limit. A rate limit is a
-    # global (account/quota-level) condition, so every *new* executor
-    # invocation would hit the same wall and churn otherwise-fine tickets into
-    # failed/hibernated. Once set, we stop pulling new work via next_batch()
-    # (both the worker-pool refill and the outer loop) and let already-dispatched
-    # tickets finish, then exit so resume-watch can wait out the limit.
-    rate_limit_halt = False
-    # Set when an executor exits because it received a signal (for example
-    # SIGINT from Ctrl+C). Preserve active work and stop dispatching new
-    # tickets; the next orchestrate run can resume from hibernated state.
-    interrupt_halt = False
-    # Set when an executor reports a hard setup/configuration error (for
-    # example an unsupported model or stale Codex CLI). Retrying the rest of
-    # the board would only churn unrelated tickets into failed.
-    executor_setup_halt = False
+    # A code_complete result produced by this run is not an orphaned review.
+    # The worker that just handled it owns its completion/review outcome; do
+    # not requeue it as a fresh review on a later scheduler iteration.
+    handled_ticket_ids: set[str] = set()
 
     # Scope drift is normally handled in the same worker pass.  If an older
     # run paused solely for that reason, reclaim it before selecting new work
@@ -2024,7 +2422,36 @@ def _drain_loop(
             if reconciled is not None:
                 break
 
+        # Approved, ready-to-merge tickets always drain ahead of dispatching
+        # new open work -- otherwise WIP (and the touch-locks it holds) keeps
+        # growing while already-finished tickets sit waiting, which is
+        # exactly the situation that produces avoidable lock contention.
+        if not dry_run:
+            all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+            if auto_merge_approved_local_tickets(all_tickets):
+                continue
+
         batch = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
+
+        # Reviews are terminal-path work: do not spend fresh model capacity
+        # analyzing drafts while completed changes are waiting for their first
+        # independent verdict. Startup recovery normally queues these, but the
+        # live loop must make the same guarantee after any state transition.
+        if not batch and not dry_run and recover:
+            queued_reviews = _queue_code_complete_reviews(
+                cfg,
+                repo_root,
+                milestone=milestone,
+                ticket_ids=ticket_ids,
+                exclude_ticket_ids=handled_ticket_ids,
+            )
+            if queued_reviews:
+                print(
+                    "[orchestrate] queued code-complete ticket(s) for review before "
+                    f"draft analysis: {', '.join(queued_reviews)}",
+                    file=sys.stderr,
+                )
+                batch = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
 
         # Ready open/hibernated work always dispatches ahead of newly-created
         # drafts — only spend a loop iteration analyzing drafts when there is
@@ -2036,9 +2463,12 @@ def _drain_loop(
                     cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir, ticket_ids=ticket_ids
                 )
             else:
-                _analyze_drafts(
-                    cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir, ticket_ids=ticket_ids
-                )
+                if _analyze_drafts(
+                    cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir,
+                    ticket_ids=ticket_ids, pool_name=pool_name,
+                ):
+                    interrupt_halt = True
+                    break
                 batch = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
 
         if not batch:
@@ -2128,7 +2558,7 @@ def _drain_loop(
                         if holder_step:
                             print(f"  {holder_step}")
                         else:
-                            print(f"  {holder_id}: inspect ticket status, then rerun: lanegate orchestrate")
+                            print(f"  {holder_id}: inspect ticket status, then rerun: lanegate run")
                 if blocked_by_deps:
                     dep_holders = sorted({d for _, ds in blocked_by_deps for d in ds})
                     statuses_needed = [
@@ -2219,10 +2649,29 @@ def _drain_loop(
             if _log_f is not None:
                 _log_f.write(underfilled_line)
                 _log_f.flush()
+        write_batch_status(
+            repo_root,
+            batch_line.strip(),
+            underfilled_reason,
+            max_parallel=max_parallel,
+            total_open=total_open,
+        )
 
         def run_ticket(ticket: dict) -> bool:
+            # Worker-pool mode runs this in a ThreadPoolExecutor thread, which
+            # does not inherit contextvars set by the submitting thread (unlike
+            # asyncio). cmd_orchestrate's own suppress_direct_action_tracking()
+            # wrap is therefore invisible here under max_parallel > 1, so this
+            # nested call re-applies it in whichever thread actually executes.
+            with suppress_direct_action_tracking():
+                return _run_ticket_body(ticket)
+
+        def _run_ticket_body(ticket: dict) -> bool:
             nonlocal executor_setup_halt, interrupt_halt, rate_limit_halt
+            from lanegate.lifecycle import _commit_generated_ticket_write
+
             tid = ticket["id"]
+            handled_ticket_ids.add(tid)
 
             if dry_run:
                 _route = _resolve_driver_route(cfg, ticket)
@@ -2239,12 +2688,59 @@ def _drain_loop(
                     print(f"[dry-run] would run review for {tid}")
                 return False
 
+            # A rejected review has a committed worktree and actionable
+            # findings.  It must be resumable by a later `lanegate run`;
+            # otherwise it keeps its file lock forever and can deadlock every
+            # overlapping open ticket.  Do not use cmd_start here: that
+            # command correctly refuses code_complete tickets because it is
+            # an implementation claim, whereas this is a fix continuation.
+            if (
+                ticket.get("status") == "code_complete"
+                and ticket.get("review_verdict") == "changes_requested"
+            ):
+                wt_value = ticket.get("worktree")
+                wt = Path(wt_value) if wt_value else worktree_path(worktrees_dir, tid)
+                if not wt.exists():
+                    reason = (
+                        "review requested changes but the preserved worktree is missing "
+                        f"({wt})"
+                    )
+                    pause_for_needs_review(tid, reason)
+                    return True
+
+                if verbose:
+                    print(f"[orchestrate] resuming rejected review for {tid}")
+                else:
+                    _status(tid, "auto-fixing", orig_out, _log_f)
+                _log_dispatch(tid, "auto-fix", was_hibernated=False)
+
+                fixed = run_auto_fix_cycle(ticket, cfg, repo_root, wt, pool_name=pool_name)
+                if fixed is None:
+                    # Rate limit during fix pass — ticket hibernated, no attempt consumed.
+                    _log_outcome(tid, "hibernated", reason="rate limit during fix agent")
+                    return True
+                if not fixed:
+                    _log_outcome(tid, "changes_requested", reason="review requested changes")
+                    return True
+
+                latest, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                fixed_ticket = next((item for item in latest if item["id"] == tid), ticket)
+                if human_review != "none" or not is_auto_fix_lane(resolve_autonomy(cfg, fixed_ticket)):
+                    _log_outcome(tid, "awaiting_human_review")
+                    return True
+                auto_merge_approved_local_tickets([fixed_ticket])
+                final_all, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                final_ticket = next((item for item in final_all if item["id"] == tid), None)
+                _log_outcome(tid, str(final_ticket.get("status")) if final_ticket else "unknown")
+                return False
+
             # --- start ---
             if verbose:
                 print(f"[orchestrate] starting {tid}")
             else:
                 _status(tid, "starting", orig_out, _log_f)
             was_hibernated = ticket.get("status") == "hibernated"
+            was_review_pending = was_hibernated and bool(ticket.get("review_pending"))
             # cmd_start reattaches the existing worktree (instead of creating a
             # fresh one) for both hibernated and needs_review tickets — the
             # rebase-onto-main trust check below must fire for the same set,
@@ -2252,11 +2748,18 @@ def _drain_loop(
             # needs_review worktree can be just as stale relative to main.
             is_resuming_worktree = ticket.get("status") in ("hibernated", "needs_review")
             prior_notes = _collect_prior_notes(ticket, repo_root)
-            if verbose or _log_f is None or max_parallel > 1:
-                cmd_start(tid, cfg, repo_root, interactive=False)
-            else:
-                with contextlib.redirect_stdout(_log_f):
+            try:
+                if verbose or _log_f is None or max_parallel > 1:
                     cmd_start(tid, cfg, repo_root, interactive=False)
+                else:
+                    with contextlib.redirect_stdout(_log_f):
+                        cmd_start(tid, cfg, repo_root, interactive=False)
+            except (SystemExit, Exception) as exc:
+                code_str = f"exit code {exc.code}" if isinstance(exc, SystemExit) else str(exc)
+                err_msg = f"cmd_start failed: {code_str}"
+                print(f"ERROR: [{tid}] {err_msg}", file=sys.stderr)
+                pause_for_needs_review(tid, err_msg)
+                return True
 
             # Re-load ticket to get fresh data (cmd_start updates it), then
             # resolve the worktree. Hibernated tickets may reattach to a
@@ -2321,8 +2824,12 @@ def _drain_loop(
             )
 
             resume_context = ""
-            conflict_retry = False
-            rebase_conflict_files: list[str] = []
+            # A review-pending ticket was already verified before it was
+            # hibernated.  Rebase can nevertheless change the commit that
+            # review will inspect, so record whether this resume needs a new
+            # pre-complete verification before dispatching that reviewer.
+            pre_rebase_head = _git_head_sha(wt) if was_review_pending else None
+            review_pending_rebase_changed = False
             if is_resuming_worktree and _worktree_is_dirty(wt):
                 # A prior run (e.g. one interrupted by a rate limit or quota
                 # error) left uncommitted changes. `git rebase` cannot run
@@ -2351,22 +2858,45 @@ def _drain_loop(
                 if rebase_state == "conflict":
                     from lanegate.orchestrate.autofix import run_rebase_fix_agent
 
-                    if run_rebase_fix_agent(fresh_ticket, cfg, repo_root, wt, rebase_detail):
+                    if run_rebase_fix_agent(
+                        fresh_ticket,
+                        cfg,
+                        repo_root,
+                        wt,
+                        rebase_detail,
+                        pool_name=pool_name,
+                    ):
+                        # A conflicted rebase necessarily incorporated an
+                        # agent-selected resolution.  Do not trust the
+                        # verification from before hibernation.
+                        review_pending_rebase_changed = was_review_pending
                         print(
                             f"[orchestrate] {tid}: rebase conflict automatically resolved by fix agent",
                             file=sys.stderr,
                         )
                     else:
-                        conflict_retry = True
-                        rebase_conflict_files = _conflicted_files(wt)
-                        resume_context = (
-                            "## Conflict-aware resume\n\n"
-                            "Main has changed since this ticket was hibernated. "
-                            "Resolve the conflicted hunks below and complete only the missing work.\n\n"
-                            f"{rebase_detail}"
+                        _abort_rebase(wt)
+                        reason = (
+                            f"rebase conflict resolution failed for {tid} "
+                            "(reason_code: rebase_conflict_failed)"
                         )
-                        if verbose:
-                            print(f"[orchestrate] {tid}: conflict-aware resume retry")
+                        print(f"ERROR: {reason} — marking needs_review", file=sys.stderr)
+                        if not verbose:
+                            _status(tid, "needs_review", orig_out, _log_f)
+                        cmd_needs_review(tid, cfg, repo_root, reason=reason)
+                        _log_outcome(tid, "needs_review", reason=reason)
+                        return True
+                elif (
+                    rebase_state == "clean"
+                    and was_review_pending
+                    and pre_rebase_head is not None
+                    and _git_head_sha(wt) != pre_rebase_head
+                ):
+                    # A clean rebase can also replay commits onto a newer
+                    # base.  Only repeat verification when it actually
+                    # changed the reviewed commit; an already up-to-date
+                    # review-pending ticket keeps its existing evidence.
+                    review_pending_rebase_changed = True
                 elif rebase_state == "error":
                     reason = f"cannot run hibernated resume check: {rebase_detail}"
                     print(f"ERROR: {reason} for {tid} - marking needs_review", file=sys.stderr)
@@ -2376,6 +2906,130 @@ def _drain_loop(
                     _log_outcome(tid, "needs_review", reason=reason)
                     return True
             fresh_ticket = _prepend_context(fresh_ticket, prior_notes, resume_context)
+
+            # A rate-limited review has already passed implementation and every
+            # pre-complete guard.  Reattach/rebase it like any hibernated
+            # worktree, then resume at review -- never invoke an implementer
+            # merely because cmd_start temporarily restored the lock state.
+            if was_review_pending:
+                from lanegate.lifecycle import resume_review_pending
+
+                if review_pending_rebase_changed:
+                    timed_out_guards: list[str] = []
+                    try:
+                        with safeguard_lock(repo_root, tid):
+                            safeguards_passed, safeguard_reason = run_safeguards(
+                                "pre_complete",
+                                fresh_ticket,
+                                cfg,
+                                wt,
+                                timed_out_guards=timed_out_guards,
+                            )
+                    except SafeguardLockHeld as exc:
+                        safeguards_passed = False
+                        safeguard_reason = f"pre_complete safeguards unavailable: {exc}"
+
+                    if not safeguards_passed:
+                        reason = (
+                            "review-pending post-rebase pre_complete safeguards failed: "
+                            f"{safeguard_reason}"
+                        )
+                        print(f"ERROR: {reason} — marking needs_review", file=sys.stderr)
+                        if not verbose:
+                            _status(tid, "needs_review", orig_out, _log_f)
+                        cmd_needs_review(tid, cfg, repo_root, reason=reason)
+                        _log_outcome(tid, "needs_review", reason=reason)
+                        return True
+
+                    verified_sha = _git_head_sha(wt)
+                    if verified_sha:
+                        # Update pre_complete_verified_sha on disk without
+                        # persisting fresh_ticket's transient prepended context body.
+                        from lanegate.ticket import parse_ticket, write_ticket
+
+                        tpath = Path(fresh_ticket["_path"])
+                        disk_ticket = parse_ticket(tpath) or fresh_ticket
+                        disk_ticket["pre_complete_verified_sha"] = verified_sha
+                        write_ticket(disk_ticket)
+                        fresh_ticket["pre_complete_verified_sha"] = verified_sha
+                        _commit_generated_ticket_write(
+                            repo_root, tpath, tid, "update pre_complete_verified_sha after rebase", cfg
+                        )
+
+                # cmd_start above set status to in_progress like any other
+                # resume -- restore code_complete before the reviewer runs, or
+                # cmd_review's guard silently rejects the verdict write below
+                # (see resume_review_pending's docstring for the full chain).
+                resume_review_pending(fresh_ticket, cfg, repo_root)
+                review_executor = resolve_driver("review", fresh_ticket, cfg)
+                if review_executor in ("none", "auto-none"):
+                    _invoke_cmd_review(
+                        _cmd_review, tid, cfg, repo_root, verdict="approved",
+                        summary="auto-approved after review-pending resume",
+                        review_driver="auto-none", review_model="none",
+                    )
+                elif review_executor == "human":
+                    from lanegate.lifecycle import mark_review_pending
+
+                    latest, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                    pending = next((item for item in latest if item["id"] == tid), fresh_ticket)
+                    mark_review_pending(
+                        pending, cfg, repo_root,
+                        reason="Review pending: configured reviewer is human.",
+                    )
+                    _log_outcome(tid, "review_pending", reason="awaiting human review")
+                    return True
+                else:
+                    approved = run_review_agent(
+                        fresh_ticket, repo_root, worktree_path=wt, cfg=cfg, pool_name=pool_name
+                    )
+                    latest, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                    resumed = next((item for item in latest if item["id"] == tid), fresh_ticket)
+                    if resumed.get("status") == "hibernated" and resumed.get("review_pending"):
+                        _log_outcome(tid, "review_pending", reason=resumed.get("review_pending_reason"))
+                        return True
+                    if not approved:
+                        if resumed.get("status") == "in_review":
+                            # run_review_agent fell back to a pool-resolved
+                            # human reviewer (cmd_review(verdict=None)) —
+                            # correctly parked awaiting a human verdict, not
+                            # an escalation.
+                            _log_outcome(tid, "awaiting_human_review")
+                            return True
+                        if resumed.get("status") != "code_complete":
+                            # run_review_agent already moved the ticket to a
+                            # terminal state on its own (e.g. needs_review via
+                            # no independent reviewer being available) — see
+                            # the identical guard in the split-mode dispatch
+                            # branch above for the full rationale.
+                            _log_outcome(tid, "needs_review")
+                            return True
+                        # A substantive rejection still takes the normal fix
+                        # path; only the harness/rate-limit path above skips it.
+                        _fix_result = run_auto_fix_cycle(resumed, cfg, repo_root, wt, pool_name=pool_name)
+                        if _fix_result is None:
+                            # Rate limit during fix pass — ticket hibernated, no attempt consumed.
+                            _log_outcome(tid, "hibernated", reason="rate limit during fix agent")
+                            return True
+                        if not _fix_result:
+                            pause_for_needs_review(
+                                tid,
+                                "auto-fix/re-review did not reach approval; "
+                                "human intervention is required",
+                            )
+                            return True
+
+                latest, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                resumed = next((item for item in latest if item["id"] == tid), fresh_ticket)
+                if human_review != "none" or not is_auto_fix_lane(resolve_autonomy(cfg, resumed)):
+                    _log_outcome(tid, "awaiting_human_review")
+                    return True
+                auto_merge_approved_local_tickets([resumed])
+                final_all, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+                final_ticket = next((t for t in final_all if t["id"] == tid), None)
+                final_status = str(final_ticket.get("status")) if final_ticket and final_ticket.get("status") else "unknown"
+                _log_outcome(tid, final_status)
+                return False
 
             # --- invoke executor (combined or split mode) ---
             # Combined mode: implement and review resolve to the same executor.
@@ -2438,7 +3092,7 @@ def _drain_loop(
             exit_code, captured_stdout, captured_stderr = _dispatch(pool_instance)
             cooldown_written_for: str | None = None
 
-            # --- sibling-retry-on-rate-limit (TICK-263) ---
+            # --- sibling-retry-on-rate-limit ---
             # A single-instance rate limit doesn't have to hibernate the
             # ticket outright: if the worktree shows real progress and a
             # healthy sibling pool instance exists, retry once on that
@@ -2503,7 +3157,7 @@ def _drain_loop(
                         exit_code, wt, captured_stdout=captured_stdout, captured_stderr=captured_stderr
                     )
                     # Mark the actual instance that hit the wall cooling down
-                    # (TICK-090) — pool_instance when pool dispatch picked
+                    # — pool_instance when pool dispatch picked
                     # one, else whatever single executor this ticket resolved
                     # to. Structured file state under .lanegate/executors/ so
                     # `lanegate executor status`/`reset` and pool dispatch can
@@ -2513,7 +3167,7 @@ def _drain_loop(
                     )["implement"]
                     if cooldown_instance != cooldown_written_for:
                         # Not already written by the sibling-retry decision
-                        # above (TICK-263) — either no retry was attempted, or
+                        # above — either no retry was attempted, or
                         # the sibling itself also just hit its own limit.
                         _write_executor_cooldown(
                             repo_root, cooldown_instance, reason, retry_after=reason
@@ -2541,7 +3195,7 @@ def _drain_loop(
                     else:
                         print(
                             f"[orchestrate] {tid}: rate limit hit — work preserved, hibernating for resume.\n"
-                            f"  Check your API quota/billing, then re-run: lanegate orchestrate",
+                            f"  Check your API quota/billing, then re-run: lanegate run",
                             file=sys.stderr,
                         )
                     if not verbose:
@@ -2583,7 +3237,7 @@ def _drain_loop(
                     interrupt_halt = True
                     print(
                         f"[orchestrate] {tid}: {reason} — work preserved, hibernating.\n"
-                        f"  Re-run when ready: lanegate orchestrate",
+                        f"  Re-run when ready: lanegate run",
                         file=sys.stderr,
                     )
                     if not verbose:
@@ -2610,7 +3264,7 @@ def _drain_loop(
                         f"[orchestrate] {tid}: executor requires re-authentication — "
                         "work preserved, hibernating.\n"
                         "  Re-authenticate the CLI (e.g. run it once interactively to "
-                        "complete the login flow), then re-run: lanegate orchestrate",
+                        "complete the login flow), then re-run: lanegate run",
                         file=sys.stderr,
                     )
                     if not verbose:
@@ -2635,28 +3289,13 @@ def _drain_loop(
                     print(
                         f"[orchestrate] {tid}: executor setup/configuration error — "
                         "work preserved, hibernating and halting this run.\n"
-                        f"  Fix the executor/model issue, then re-run: lanegate orchestrate",
+                        f"  Fix the executor/model issue, then re-run: lanegate run",
                         file=sys.stderr,
                     )
                     if not verbose:
                         _status(tid, "hibernated", orig_out, _log_f)
                     cmd_hibernate(tid, cfg, repo_root, reason=reason)
                     _log_outcome(tid, "hibernated", reason=reason)
-                    return True
-                if conflict_retry:
-                    _abort_rebase(wt)
-                    reason = f"conflict-aware retry failed (executor exited {exit_code})"
-                    print(
-                        f"[orchestrate] {tid}: conflict-aware retry failed (exit {exit_code}) — needs human review.\n"
-                        f"  Rebase was aborted. Inspect the worktree at {wt}, then run:\n"
-                        f"    lanegate needs-review {tid}   (if manual fix needed)\n"
-                        f"    lanegate reopen {tid}          (to re-queue for automatic retry)",
-                        file=sys.stderr,
-                    )
-                    if not verbose:
-                        _status(tid, "needs_review", orig_out, _log_f)
-                    cmd_needs_review(tid, cfg, repo_root, reason=reason)
-                    _log_outcome(tid, "needs_review", reason=reason)
                     return True
                 log_path_str = getattr(_log_f, "name", "") if _log_f is not None else ""
                 log_hint = (
@@ -2682,11 +3321,67 @@ def _drain_loop(
                         snippet = snippet[-1500:]
                     reason_parts.append(f"**Error Output Snippet:**\n```\n{snippet}\n```")
 
+                if pool_instance:
+                    signature = _normalize_analyze_failure_reason(output_text or base_reason)
+                    is_streak = _record_pool_failure_signature(
+                        repo_root,
+                        pool_instance,
+                        signature,
+                        window_s=_POOL_FAILURE_STREAK_WINDOW_S,
+                        threshold=_POOL_FAILURE_STREAK_THRESHOLD,
+                    )
+                    if is_streak:
+                        reason = (
+                            f"{_RATE_LIMIT_MARKER} ({_POOL_FAILURE_STREAK_THRESHOLD} consecutive "
+                            f"failures on {pool_instance} with an identical error signature "
+                            f"within {_POOL_FAILURE_STREAK_WINDOW_S}s, executor exited "
+                            f"{exit_code}) — text matched no known rate-limit pattern, but "
+                            "treated as equivalent since it has the same shape (same instance, "
+                            "same error, repeating fast) so resume-watch can retry it with "
+                            "backoff instead of requiring manual reopen."
+                        )
+                        _write_executor_cooldown(repo_root, pool_instance, reason)
+                        _append_run_event(
+                            repo_root,
+                            session_ts,
+                            "executor_cooldown",
+                            instance=pool_instance,
+                            reason=reason,
+                            ticket_id=tid,
+                        )
+                        reason = f"{reason}\n\npool instance: {pool_instance}"
+                        print(
+                            f"[orchestrate] {tid}: {pool_instance} hit "
+                            f"{_POOL_FAILURE_STREAK_THRESHOLD} consecutive same-signature "
+                            "failures — treating as an unrecognized rate limit and hibernating.\n"
+                            "  Check the executor/provider status, then re-run: lanegate run",
+                            file=sys.stderr,
+                        )
+                        if not verbose:
+                            _status(tid, "hibernated", orig_out, _log_f)
+                        cmd_hibernate(tid, cfg, repo_root, reason=reason)
+                        _log_outcome(tid, "hibernated", reason=reason)
+                        if cfg.get("on_rate_limit") == "resume":
+                            spawn_resume_watch_daemon(repo_root)
+                        if pool_name and _pool_has_available_instance(pool_name):
+                            print(
+                                f"[orchestrate] {tid}: {pool_instance} cooling down — "
+                                "other pool instance(s) still available, continuing",
+                                file=sys.stderr,
+                            )
+                        elif cfg.get("on_rate_limit") == "resume":
+                            rate_limit_halt = True
+                        elif pool_name and _wait_for_pool_capacity(pool_name):
+                            pass
+                        else:
+                            rate_limit_halt = True
+                        return True
+
                 rich_reason = "\n\n".join(reason_parts)
                 print(
                     f"ERROR: {tid} executor exited {exit_code} — marked as failed, batch continues.{log_hint}\n"
                     f"  Re-run with --verbose to see executor output in the terminal.\n"
-                    f"  After fixing the issue: lanegate reopen {tid} && lanegate orchestrate",
+                    f"  After fixing the issue: lanegate reopen {tid} && lanegate run",
                     file=sys.stderr,
                 )
                 if not verbose:
@@ -2694,6 +3389,9 @@ def _drain_loop(
                 cmd_fail(tid, cfg, repo_root, reason=rich_reason)
                 _log_outcome(tid, "failed", reason=base_reason)
                 return True
+
+            if pool_instance:
+                _clear_pool_failure_streak(repo_root, pool_instance)
 
             audit_bundle_path: Path | None = None
             # Find the audit bundle by looking for the most recent session directory.
@@ -2712,21 +3410,6 @@ def _drain_loop(
                             audit_bundle_path = None
                     except (OSError, json.JSONDecodeError):
                         audit_bundle_path = None
-
-            if conflict_retry:
-                continued, detail = _continue_rebase(wt, rebase_conflict_files)
-                if not continued:
-                    _abort_rebase(wt)
-                    reason = f"conflict-aware rebase continue failed: {detail}"
-                    print(
-                        f"[orchestrate] {tid}: {reason} — needs human review.",
-                        file=sys.stderr,
-                    )
-                    if not verbose:
-                        _status(tid, "needs_review", orig_out, _log_f)
-                    cmd_needs_review(tid, cfg, repo_root, reason=reason)
-                    _log_outcome(tid, "needs_review", reason=reason)
-                    return True
 
             commit_worktree_changes(wt, tid)
 
@@ -2758,7 +3441,7 @@ def _drain_loop(
                     f"    - Agent crashed silently (check log for tracebacks)\n"
                     + (f"  Executor log: {log_path_hint}\n" if log_path_hint else "")
                     + f"  Re-run with --verbose to see executor output in the terminal.\n"
-                    f"  After investigating: lanegate reopen {tid} && lanegate orchestrate",
+                    f"  After investigating: lanegate reopen {tid} && lanegate run",
                     file=sys.stderr,
                 )
                 if not verbose:
@@ -2777,7 +3460,7 @@ def _drain_loop(
                     committed = _committed_files(wt)
                     allowed = set(touches_list)
                     unexpected = committed - allowed
-                    # TICK-245: a committed file that's the natural paired test file
+                    # A committed file that's the natural paired test file
                     # for an already-touched module is not scope drift.
                     unexpected = {f for f in unexpected if not is_paired_test_file(f, allowed)}
                     if unexpected:
@@ -2785,9 +3468,9 @@ def _drain_loop(
                             from lanegate.claim_file import claim_files
                             from lanegate.ticket import write_ticket
 
-                            claimed, detail = claim_files(sorted(unexpected), tid, cfg, repo_root)
+                            claimed, claim_detail = claim_files(sorted(unexpected), tid, cfg, repo_root)
                             if not claimed:
-                                reason = f"could not auto-claim additional touched files: {detail}"
+                                reason = f"could not auto-claim additional touched files: {claim_detail}"
                                 print(f"[orchestrate] {tid}: WARNING — {reason}", file=sys.stderr)
                                 pause_for_needs_review(tid, reason)
                                 return True
@@ -2820,6 +3503,70 @@ def _drain_loop(
                             )
                             pause_for_needs_review(tid, reason)
                             return True
+
+            # --- risk-lane classification ---
+            # A red-lane signal (external credentials, security-sensitive or
+            # irreversible operations) always escalates to a human, even when
+            # the ticket's configured autonomy is "full"/"green"/"yellow" —
+            # the risk lane is a safety override on top of autonomy, not a
+            # substitute for it. An explicit autonomy of "red" escalates
+            # unconditionally. Green/yellow lanes with no red signal fall
+            # through and stay on the automatic fix/re-review/merge path,
+            # same as "full" (see the is_auto_fix_lane checks below).
+            #
+            # Always route through pause_for_needs_review: an
+            # in_progress ticket used to go through cmd_hibernate(escalation=True)
+            # instead, but hibernated isn't recognized by human-gate
+            # checks, so a hibernated escalation could get auto-redispatched
+            # before a human ever saw it. needs_review is gated everywhere.
+            resolved_autonomy = resolve_autonomy(cfg, fresh_ticket)
+            escalation_triggers = resolve_human_escalation(cfg)
+            trunk_branch_for_scan = resolve_trunk_branch(cfg, repo_root)
+            diff_capture = _git_text(["git", "diff", f"{trunk_branch_for_scan}...HEAD"], wt)
+            if not diff_capture.ok:
+                red_signal_triggered = False
+                reason = (
+                    "red-lane escalation: risk scan unavailable because "
+                    f"`git diff {trunk_branch_for_scan}...HEAD` failed: "
+                    f"{diff_capture.error or 'no diagnostic available'} — human review required"
+                )
+            else:
+                risk_lane = scan_risk_lane(diff_capture.text, fresh_ticket)
+                red_signal_triggered = risk_lane_requires_human_review(
+                    risk_lane, escalation_triggers
+                )
+                reason = (
+                    "red-lane escalation: diff scan classified this change as "
+                    "'red' (external credentials, security-sensitive, or irreversible "
+                    "operation detected) — human review required"
+                    if red_signal_triggered
+                    else "red-lane escalation: ticket autonomy is 'red' — human review required"
+                )
+            if not diff_capture.ok or red_signal_triggered or is_red_lane(resolved_autonomy):
+                print(f"[orchestrate] {tid}: WARNING — {reason}", file=sys.stderr)
+                escalation_ticket = next(
+                    (t for t in load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)[0] if t["id"] == tid),
+                    fresh_ticket,
+                )
+                branch = escalation_ticket.get("branch") or branch_name(tid)
+                append_or_replace_section(
+                    escalation_ticket,
+                    "## Human Escalation",
+                    f"{reason}\n\n"
+                    f"Branch `{branch}` and worktree `{wt}` are preserved — not reset.\n\n"
+                    "To resume after review:\n"
+                    f"- Inspect the change: `git log {trunk_branch_for_scan}..{branch} --oneline` "
+                    f"and `git diff {trunk_branch_for_scan}...{branch}`\n"
+                    f"- Resume orchestration: `lanegate human-review {tid} --rationale \"...\"` (or `lanegate reopen {tid}`)",
+                )
+                from lanegate.ticket import write_ticket
+
+                write_ticket(escalation_ticket)
+                _commit_generated_ticket_write(
+                    repo_root, Path(escalation_ticket["_path"]), tid, "human escalation", cfg
+                )
+                pause_for_needs_review(tid, reason)
+                return True
 
             # --- blocked-file check ---
             # Fires for ALL committed files regardless of touches list.
@@ -2866,6 +3613,13 @@ def _drain_loop(
                     print(f"[orchestrate] {tid}: WARNING — {reason}", file=sys.stderr)
                     pause_for_needs_review(tid, reason)
                     return True
+
+            ok_cp, cp_err = check_control_plane_compliance(ticket, repo_root=repo_root, cfg=cfg, worktree_path=wt, check_review_independence=False)
+            if not ok_cp:
+                reason = f"control plane compliance failed: {cp_err}"
+                print(f"[orchestrate] {tid}: WARNING — {reason}", file=sys.stderr)
+                pause_for_needs_review(tid, reason)
+                return True
 
             # --- static analysis gate ---
             # Runs after the blocked-file check, before LLM review dispatch.
@@ -2945,7 +3699,7 @@ def _drain_loop(
                     )
                     print(
                         f"ERROR: {tid} — {reason}.\n"
-                        f"  Hibernating for retry. Re-run: lanegate orchestrate",
+                        f"  Hibernating for retry. Re-run: lanegate run",
                         file=sys.stderr,
                     )
                     # cmd_hibernate only accepts in_progress and sys.exit(1)s
@@ -2967,13 +3721,17 @@ def _drain_loop(
                     and post_ticket
                     and post_ticket.get("review_verdict") == "changes_requested"
                 ):
-                    fixed = run_auto_fix_cycle(post_ticket, cfg, repo_root, wt)
+                    fixed = run_auto_fix_cycle(post_ticket, cfg, repo_root, wt, pool_name=pool_name)
+                    if fixed is None:
+                        # Rate limit during fix pass — ticket hibernated, no attempt consumed.
+                        _log_outcome(tid, "hibernated", reason="rate limit during fix agent")
+                        return True
                     if fixed:
                         if verbose:
                             print(f"[orchestrate] {tid}: auto-fix cycle reached approved")
                         all_t_fixed, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
                         fixed_ticket = next((t for t in all_t_fixed if t["id"] == tid), post_ticket)
-                        if resolve_autonomy(cfg, fixed_ticket) != "full":
+                        if not is_auto_fix_lane(resolve_autonomy(cfg, fixed_ticket)):
                             print(
                                 f"[orchestrate] {tid}: awaiting human merge approval "
                                 "(auto-fix cycle approved)",
@@ -2986,9 +3744,11 @@ def _drain_loop(
                             f"[orchestrate] {tid}: combined-mode review requested changes — pausing",
                             file=sys.stderr,
                         )
-                        if not verbose:
-                            _status(tid, "changes_requested", orig_out, _log_f)
-                        _log_outcome(tid, "changes_requested", reason="review requested changes")
+                        pause_for_needs_review(
+                            tid,
+                            "auto-fix/re-review did not reach approval; "
+                            "human intervention is required",
+                        )
                         return True
                 elif (
                     post_status == "in_review"
@@ -3005,7 +3765,7 @@ def _drain_loop(
                         print(f"[orchestrate] {tid}: combined mode — approved")
                     if (
                         human_review == "per_ticket"
-                        or resolve_autonomy(cfg, post_ticket) != "full"
+                        or not is_auto_fix_lane(resolve_autonomy(cfg, post_ticket))
                     ):
                         print(
                             f"[orchestrate] {tid}: awaiting human merge approval "
@@ -3026,7 +3786,7 @@ def _drain_loop(
                     )
                     print(
                         f"ERROR: {tid} — {reason}.\n"
-                        f"  Pausing for manual review. Re-run: lanegate orchestrate",
+                        f"  Pausing for manual review. Re-run: lanegate run",
                         file=sys.stderr,
                     )
                     pause_for_needs_review(tid, reason)
@@ -3108,14 +3868,46 @@ def _drain_loop(
                     return True
                 else:
                     # Non-human reviewer (codex, claude, agy, etc.): ALWAYS RUN REVIEWER!
-                    approved = run_review_agent(review_ticket, repo_root, worktree_path=wt, cfg=cfg)
+                    approved = run_review_agent(
+                        review_ticket, repo_root, worktree_path=wt, cfg=cfg, pool_name=pool_name
+                    )
                     if not approved:
                         # The review agent persists its findings on disk —
                         # reload so the fix agent sees the newest ones rather
                         # than a copy of the ticket that predates the review.
                         all_t3, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
                         reloaded = next((t for t in all_t3 if t["id"] == tid), review_ticket)
-                        fixed = run_auto_fix_cycle(reloaded, cfg, repo_root, wt)
+                        if reloaded.get("status") == "hibernated" and reloaded.get("review_pending"):
+                            # Reviewer temporarily unavailable (cooldown/rate
+                            # limit) — self-resolves on the next `lanegate
+                            # run`, not a human-intervention escalation.
+                            _log_outcome(tid, "review_pending", reason=reloaded.get("review_pending_reason"))
+                            return True
+                        if reloaded.get("status") == "in_review":
+                            # run_review_agent fell back to a pool-resolved
+                            # human reviewer — correctly parked awaiting a
+                            # human verdict, not an escalation.
+                            _log_outcome(tid, "awaiting_human_review")
+                            return True
+                        if reloaded.get("status") != "code_complete":
+                            # run_review_agent already moved the ticket to a
+                            # terminal state on its own (e.g. needs_review via
+                            # _escalate_no_reviewer when no independent
+                            # reviewer is available, each with its own
+                            # specific reason) instead of leaving it at
+                            # code_complete the way a genuine changes_requested
+                            # verdict does. run_auto_fix_cycle assumes that
+                            # code_complete precondition; calling it anyway
+                            # finds no review findings to act on and fails
+                            # generically, overwriting the ticket's real, more
+                            # specific reason with a misleading one.
+                            _log_outcome(tid, "needs_review")
+                            return True
+                        fixed = run_auto_fix_cycle(reloaded, cfg, repo_root, wt, pool_name=pool_name)
+                        if fixed is None:
+                            # Rate limit during fix pass — ticket hibernated, no attempt consumed.
+                            _log_outcome(tid, "hibernated", reason="rate limit during fix agent")
+                            return True
                         if fixed:
                             if verbose:
                                 print(f"[orchestrate] {tid}: auto-fix cycle reached approved")
@@ -3124,10 +3916,14 @@ def _drain_loop(
                                 f"[orchestrate] {tid}: review requested changes — pausing",
                                 file=sys.stderr,
                             )
-                            _log_outcome(tid, "changes_requested", reason="review requested changes")
+                            pause_for_needs_review(
+                                tid,
+                                "auto-fix/re-review did not reach approval; "
+                                "human intervention is required",
+                            )
                             return True
 
-                if human_review == "per_ticket" or resolve_autonomy(cfg, review_ticket) != "full":
+                if human_review == "per_ticket" or not is_auto_fix_lane(resolve_autonomy(cfg, review_ticket)):
                     print(
                         f"[orchestrate] {tid}: awaiting human merge approval "
                         "(supervised autonomy)",
@@ -3149,11 +3945,12 @@ def _drain_loop(
 
             final_all, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
             final_ticket = next((t for t in final_all if t["id"] == tid), None)
-            _log_outcome(tid, final_ticket.get("status") if final_ticket else "unknown")
+            _log_outcome(tid, str(final_ticket.get("status")) if final_ticket else "unknown")
 
             return False
 
         def run_worker_pool(initial_items: list[dict]) -> list[str]:
+            nonlocal interrupt_halt
             paused_tickets: list[str] = []
             submitted_ids: set[str] = set()
             in_flight: dict[concurrent.futures.Future, tuple[str, set[str], str | None]] = {}
@@ -3166,9 +3963,15 @@ def _drain_loop(
 
             def submit(pool: concurrent.futures.ThreadPoolExecutor, ticket: dict) -> None:
                 tid = ticket["id"]
-                submitted_ids.add(tid)
                 touches = set(ticket.get("touches") or [])
                 instance = assign_pool_instance(ticket)
+                # An explicit ticket.executor deliberately bypasses pool
+                # selection, so its assignment is None while it remains
+                # dispatchable.  Reserve/reject a ticket only when selection
+                # actually exhausted the active pool.
+                if instance is None and pool_name and rate_limit_halt:
+                    return
+                submitted_ids.add(tid)
                 future = pool.submit(run_ticket, ticket)
                 in_flight[future] = (tid, touches, instance)
 
@@ -3210,7 +4013,7 @@ def _drain_loop(
                             # of killing the batch.
                             reason = f"worker thread crashed: {exc.__class__.__name__}: {exc}"
                             print(f"ERROR: {tid_done} — {reason}", file=sys.stderr)
-                            # TICK-249: the reason string alone (exception class + message)
+                            # The reason string alone (exception class + message)
                             # was often not enough to find the actual failing line without
                             # cross-referencing timestamped logs by hand — print the full
                             # traceback right here instead.
@@ -3231,13 +4034,31 @@ def _drain_loop(
                             # error was hit — do not pull new tickets.
                             break
                         candidate = next_refill_candidate()
+                        if candidate is None and recover:
+                            queued_reviews = _queue_code_complete_reviews(
+                                cfg,
+                                repo_root,
+                                milestone=milestone,
+                                ticket_ids=ticket_ids,
+                                exclude_ticket_ids=handled_ticket_ids,
+                            )
+                            if queued_reviews:
+                                print(
+                                    "[orchestrate] queued code-complete ticket(s) for review before "
+                                    f"draft analysis: {', '.join(queued_reviews)}",
+                                    file=sys.stderr,
+                                )
+                                candidate = next_refill_candidate()
                         if candidate is None and auto_analyze:
                             # Only spend time analyzing drafts once there is
                             # no already-dispatchable work to refill with —
                             # ready tickets must never wait behind drafts.
-                            _analyze_drafts(
-                                cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir
-                            )
+                            if _analyze_drafts(
+                                cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir,
+                                ticket_ids=ticket_ids, pool_name=pool_name,
+                            ):
+                                interrupt_halt = True
+                                break
                             candidate = next_refill_candidate()
                         if candidate is None:
                             break
@@ -3249,6 +4070,12 @@ def _drain_loop(
             for ticket in work_items:
                 tid = ticket["id"]
                 instance = assign_pool_instance(ticket) if not dry_run else None
+                # An explicit ticket.executor deliberately bypasses pool
+                # selection, so assign_pool_instance() returns None even
+                # though this ticket is ready to dispatch.  Only stop when
+                # selection actually exhausted the pool and set its halt flag.
+                if instance is None and pool_name and not dry_run and rate_limit_halt:
+                    break
                 try:
                     paused = run_ticket(ticket)
                 except (Exception, SystemExit) as exc:
@@ -3257,7 +4084,7 @@ def _drain_loop(
                     # caught explicitly or it unwinds out of cmd_orchestrate.
                     reason = f"ticket run crashed: {exc.__class__.__name__}: {exc}"
                     print(f"ERROR: {tid} — {reason}", file=sys.stderr)
-                    # TICK-249: see matching comment in run_worker_pool above.
+                    # See matching comment in run_worker_pool above.
                     traceback.print_exc(file=sys.stderr)
                     pause_for_needs_review(tid, reason)
                     paused = True
@@ -3284,7 +4111,7 @@ def _drain_loop(
 
         if human_review == "final":
             # Print instructions and exit, spawning watcher
-            print("\n[orchestrate] batch complete — review PRs, then run:\n    lanegate orchestrate")
+            print("\n[orchestrate] batch complete — review PRs, then run:\n    lanegate run")
             all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
             _print_review_queue(all_tickets, milestone=milestone, stream=orig_out)
             _print_continuation_steps(all_tickets, milestone=milestone, stream=orig_out)
@@ -3302,14 +4129,16 @@ def _drain_loop(
         _print_continuation_steps(all_tickets, milestone=milestone, stream=orig_out)
         summary_lines = []
         for tid in all_paused_tickets:
-            t = ticket_by_id.get(tid)
-            status = t.get("status", "unknown") if t else "unknown"
+            paused_ticket = ticket_by_id.get(tid)
+            status = paused_ticket.get("status", "unknown") if paused_ticket else "unknown"
             if status == "hibernated":
-                remedy = "re-run: lanegate orchestrate"
-            elif status in ("needs_review", "failed"):
-                remedy = f"inspect and fix, then: lanegate reopen {tid} && lanegate orchestrate"
+                remedy = "re-run: lanegate run"
+            elif status == "needs_review":
+                remedy = needs_review_recovery_advice(paused_ticket) if paused_ticket else f"inspect and fix, then: lanegate reopen {tid} && lanegate run"
+            elif status == "failed":
+                remedy = f"inspect and fix, then: lanegate reopen {tid} && lanegate run"
             elif status == "changes_requested":
-                remedy = "address reviewer feedback, then: lanegate orchestrate"
+                remedy = "address reviewer feedback, then: lanegate run"
             else:
                 remedy = f"check ticket (status: {status})"
             summary_lines.append(f"  {tid} [{status}] -> {remedy}")

@@ -107,7 +107,7 @@ def test_read_pid_returns_none_when_no_file(tmp_path):
 def test_read_pid_returns_none_for_dead_process(tmp_path):
     pid_path = tmp_path / "resume-watch.pid"
     pid_path.write_text("999999\n")
-    with patch("lanegate.resume_watch.pid_alive", return_value=False):
+    with patch("lanegate.watch_common.pid_alive", return_value=False):
         assert _read_pid(pid_path) is None
 
 
@@ -185,13 +185,38 @@ def test_already_running_exits_nonzero(tmp_path):
     assert pid_path.exists()
 
 
+def test_background_spawns_detached_and_returns_without_running_loop(tmp_path, capsys):
+    cfg = _default_cfg(tmp_path)
+    with (
+        patch("lanegate.lifecycle.spawn_detached", return_value=4242) as mock_spawn,
+        patch("lanegate.resume_watch._run_loop") as mock_loop,
+    ):
+        cmd_resume_watch(cfg, tmp_path, background=True)
+
+    mock_spawn.assert_called_once()
+    args, _kwargs = mock_spawn.call_args
+    assert args[0] == ["lanegate", "resume-watch"]
+    mock_loop.assert_not_called()
+    assert "4242" in capsys.readouterr().out
+
+
+def test_background_exits_nonzero_when_already_running(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    pid_path = _resume_watch_pid_file(tmp_path)
+    pid_path.write_text(f"{os.getpid()}\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_resume_watch(cfg, tmp_path, background=True)
+    assert exc_info.value.code == 1
+
+
 def test_stale_pid_file_cleaned_up_on_start(tmp_path):
     cfg = _default_cfg(tmp_path)
     pid_path = _resume_watch_pid_file(tmp_path)
     pid_path.write_text("999999\n")  # stale
 
     with (
-        patch("lanegate.resume_watch.pid_alive", return_value=False),
+        patch("lanegate.watch_common.pid_alive", return_value=False),
         patch("lanegate.resume_watch._run_loop") as mock_loop,
     ):
         cmd_resume_watch(cfg, tmp_path)
@@ -270,7 +295,7 @@ def test_run_loop_exits_immediately_when_nothing_rate_limited(tmp_path):
 
 
 def test_run_loop_retries_and_exits_when_resolved(tmp_path):
-    """Retries `lanegate orchestrate`; once no rate-limited tickets remain, exits."""
+    """Retries `lanegate run`; once no rate-limited tickets remain, exits."""
     cfg = _default_cfg(tmp_path)
     tickets_dir = Path(cfg["tickets_dir"])
     _write_hibernated_ticket(
@@ -295,7 +320,7 @@ def test_run_loop_retries_and_exits_when_resolved(tmp_path):
         _run_loop(cfg, tmp_path)
 
     assert len(run_calls) == 1
-    assert run_calls[0] == ["lanegate", "orchestrate"]
+    assert run_calls[0] == ["lanegate", "run"]
     assert sleep_calls == [300]
 
 
@@ -305,7 +330,7 @@ def test_resume_detects_and_resumes_after_limit(tmp_path):
 
     TICK-001 is hibernated with the rate-limit marker; TICK-002 was already
     in_progress when the limit hit. The rate limit clears on the third retry.
-    The daemon only invokes `lanegate orchestrate`; it never writes ticket status
+    The daemon only invokes `lanegate run`; it never writes ticket status
     itself, so the in-flight TICK-002 must retain its status across resume.
     """
     cfg = _default_cfg(
@@ -383,6 +408,92 @@ def test_run_loop_backs_off_exponentially_and_caps_at_max(tmp_path):
     assert attempts[0] == 4
 
 
+def test_run_loop_lock_held_polls_without_consuming_backoff(tmp_path):
+    cfg = _default_cfg(
+        tmp_path,
+        rate_limit_resume={
+            "initial_backoff_s": 10,
+            "max_backoff_s": 10,
+            "ceiling_s": None,
+            "lock_poll_interval_s": 5,
+        },
+    )
+    tickets_dir = Path(cfg["tickets_dir"])
+    _write_hibernated_ticket(
+        tickets_dir, "TICK-001", "rate limit or quota interruption (executor exited 429)"
+    )
+
+    lock_statuses = [
+        {"held": True, "pid": 4242, "alive": True},
+        {"held": True, "pid": 4242, "alive": True},
+        {"held": True, "pid": 4242, "alive": True},
+        {"held": False, "pid": None, "alive": False},
+    ]
+
+    def mock_run(args, **kwargs):
+        _write_open_ticket(tickets_dir, "TICK-001")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    sleep_calls = []
+
+    with (
+        patch(
+            "lanegate.resume_watch.orchestrator_lock_status",
+            side_effect=lock_statuses,
+        ),
+        patch("lanegate.resume_watch.subprocess.run", side_effect=mock_run) as mock_subprocess,
+        patch("lanegate.resume_watch.time.sleep", side_effect=lambda s: sleep_calls.append(s)),
+        patch("lanegate.resume_watch._write_log"),
+    ):
+        _run_loop(cfg, tmp_path)
+
+    assert mock_subprocess.call_count == 1
+    assert sleep_calls[:3] == [5, 5, 5]
+    assert sleep_calls[3] == 10  # the real retry uses the untouched initial backoff
+
+
+def test_run_loop_lock_held_does_not_advance_give_up_ceiling(tmp_path):
+    cfg = _default_cfg(
+        tmp_path,
+        rate_limit_resume={
+            "initial_backoff_s": 10,
+            "max_backoff_s": 10,
+            "ceiling_s": 10,
+            "lock_poll_interval_s": 5,
+        },
+    )
+    tickets_dir = Path(cfg["tickets_dir"])
+    _write_hibernated_ticket(
+        tickets_dir, "TICK-001", "rate limit or quota interruption (executor exited 429)"
+    )
+
+    held = {"held": True, "pid": 4242, "alive": True}
+    free = {"held": False, "pid": None, "alive": False}
+    # 5 held-polls * lock_poll_interval_s=5 == 25s, which would blow the
+    # ceiling_s=10 budget if it were counted as elapsed time.
+    lock_statuses = [held, held, held, held, held, free]
+
+    def mock_run(args, **kwargs):
+        _write_open_ticket(tickets_dir, "TICK-001")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch(
+            "lanegate.resume_watch.orchestrator_lock_status",
+            side_effect=lock_statuses,
+        ),
+        patch("lanegate.resume_watch.subprocess.run", side_effect=mock_run) as mock_subprocess,
+        patch("lanegate.resume_watch.time.sleep"),
+        patch("lanegate.resume_watch._write_log"),
+    ):
+        _run_loop(cfg, tmp_path)
+
+    assert mock_subprocess.call_count == 1
+    events = [e["event"] for e in read_history(tmp_path)]
+    assert "gave_up" not in events
+    assert "resumed" in events
+
+
 class _FrozenDatetime(datetime):
     """A datetime subclass whose .now() is pinned, for deterministic reset-time tests."""
 
@@ -431,11 +542,111 @@ def test_parse_reset_time_real_capture_with_named_timezone():
     assert parsed == datetime(2026, 7, 29, 18, 40, 0, tzinfo=UTC)
 
 
-def test_parse_reset_time_unknown_timezone_name_falls_back_to_now_zone():
+def test_parse_reset_time_unknown_timezone_name_is_rejected_by_shared_parser():
     now = datetime(2026, 7, 28, 4, 0, 0, tzinfo=UTC)
     text = "resets 9:00pm (Not/ARealZone)"
-    parsed = _parse_reset_time(text, now=now)
-    assert parsed == datetime(2026, 7, 28, 21, 0, 0, tzinfo=UTC)
+    assert _parse_reset_time(text, now=now) is None
+
+
+def test_parse_reset_time_delegates_to_shared_parser_with_rollover_setting():
+    now = datetime(2026, 8, 8, 20, 0, 0, tzinfo=UTC)
+    expected = datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+    with patch("lanegate.resume_watch._parse_executor_reset_time", return_value=expected) as parser:
+        assert _parse_reset_time("resets Aug 7, 6am (America/Los_Angeles)", now=now, allow_rollover=False) == expected
+    parser.assert_called_once_with(
+        "resets Aug 7, 6am (America/Los_Angeles)", now=now, allow_rollover=False
+    )
+
+
+def test_parse_reset_time_dated_weekly_resets():
+    now = datetime(2026, 8, 4, 20, 0, 0, tzinfo=UTC)
+
+    # Mon D with zone
+    text1 = "You've hit your weekly limit - resets Aug 7, 6am (America/Los_Angeles)"
+    assert _parse_reset_time(text1, now=now) == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+    # D Mon with zone
+    text2 = "resets 7 Aug, 6am (America/Los_Angeles)"
+    assert _parse_reset_time(text2, now=now) == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+    # Mon D without zone
+    text3 = "You've hit your Opus weekly limit - resets Aug 7, 6am"
+    assert _parse_reset_time(text3, now=now) == datetime(2026, 8, 7, 6, 0, 0, tzinfo=UTC)
+
+    # D Mon without zone
+    text4 = "resets 7 Aug, 6am"
+    assert _parse_reset_time(text4, now=now) == datetime(2026, 8, 7, 6, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_explicit_date_year_rollover():
+    now = datetime(2026, 8, 8, 20, 0, 0, tzinfo=UTC)
+    text = "resets Aug 7, 6am (America/Los_Angeles)"
+    assert _parse_reset_time(text, now=now) == datetime(2027, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_dated_hint_allow_rollover_false_stays_in_past():
+    """A past explicit date with allow_rollover=False must stay in the past,
+    not roll to next year.  This is the direct regression test for the finding:
+    _run_loop passes allow_rollover=False on every pass after the first so that
+    a stale hint means "window cleared, retry now" rather than a ~1-year sleep.
+    Both common date-orderings ("Aug 7" and "7 Aug") are covered."""
+    now = datetime(2026, 8, 8, 20, 0, 0, tzinfo=UTC)  # one day past the reset
+
+    # "Mon D" ordering — Aug 7 6am LA = 2026-08-07T13:00Z, already past
+    result = _parse_reset_time(
+        "You've hit your weekly limit - resets Aug 7, 6am (America/Los_Angeles)",
+        now=now,
+        allow_rollover=False,
+    )
+    assert result is not None
+    assert result.year == 2026, f"Expected 2026, got {result.year} — dated branch rolled to next year with allow_rollover=False"
+    assert result == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+    # "D Mon" ordering
+    result2 = _parse_reset_time(
+        "resets 7 Aug, 6am (America/Los_Angeles)",
+        now=now,
+        allow_rollover=False,
+    )
+    assert result2 is not None
+    assert result2.year == 2026
+    assert result2 == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+    # Future dated hint — both True and False should return the same future result
+    now_before = datetime(2026, 8, 4, 20, 0, 0, tzinfo=UTC)
+    result3 = _parse_reset_time(
+        "resets Aug 7, 6am (America/Los_Angeles)",
+        now=now_before,
+        allow_rollover=False,
+    )
+    assert result3 is not None
+    assert result3 == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_dated_hint_allow_rollover_false_same_year_later_month():
+    """A hint whose month has already passed this year (not a year-boundary
+    wrap) must resolve to this year, not roll forward — allow_rollover=False
+    means "is this stale", and the window cleared months ago either way."""
+    now = datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC)  # a month past the hint
+
+    result = _parse_reset_time(
+        "resets Aug 7, 6am (UTC)", now=now, allow_rollover=False,
+    )
+    assert result is not None
+    assert result == datetime(2026, 8, 7, 6, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_dated_hint_allow_rollover_false_year_boundary_wrap():
+    """A hint whose month is later than now's, re-read just past a year
+    boundary, means last year's occurrence (already passed), not ~11 months
+    in the future — e.g. a "Dec 30" hint re-checked in early January."""
+    now = datetime(2027, 1, 5, 0, 0, 0, tzinfo=UTC)
+
+    result = _parse_reset_time(
+        "resets Dec 30, 6am (UTC)", now=now, allow_rollover=False,
+    )
+    assert result is not None
+    assert result == datetime(2026, 12, 30, 6, 0, 0, tzinfo=UTC)
 
 
 def test_parse_reset_time_returns_none_for_unrecognized_format():
@@ -458,6 +669,48 @@ def test_reset_wait_seconds_uses_latest_deadline_across_tickets():
 def test_reset_wait_seconds_none_when_no_hint_present():
     hibernated = [{"id": "TICK-001", "_body": "rate limit or quota interruption (executor exited 1)"}]
     assert _reset_wait_seconds(hibernated) is None
+
+
+# ---------------------------------------------------------------------------
+# _parse_reset_time explicit-date parsing (TICK-403)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_reset_time_weekly_limit_with_explicit_date_allow_rollover_true():
+    now = datetime(2026, 8, 5, 22, 0, 0, tzinfo=UTC)
+    text = "You've hit your weekly limit · resets Aug 7, 6am (America/Los_Angeles)"
+    parsed = _parse_reset_time(text, now=now, allow_rollover=True)
+    assert parsed == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_weekly_limit_with_explicit_date_allow_rollover_false():
+    now = datetime(2026, 8, 5, 22, 0, 0, tzinfo=UTC)
+    text = "You've hit your weekly limit · resets Aug 7, 6am (America/Los_Angeles)"
+    parsed = _parse_reset_time(text, now=now, allow_rollover=False)
+    assert parsed == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_date_before_month_variant():
+    now = datetime(2026, 8, 5, 22, 0, 0, tzinfo=UTC)
+    text = "You've hit your weekly limit · resets 7 Aug, 6am (America/Los_Angeles)"
+    parsed = _parse_reset_time(text, now=now, allow_rollover=False)
+    assert parsed == datetime(2026, 8, 7, 13, 0, 0, tzinfo=UTC)
+
+
+def test_parse_reset_time_date_year_boundary_rolls_forward():
+    now = datetime(2026, 12, 30, 10, 0, 0, tzinfo=UTC)
+    text = "resets Jan 2, 9am (UTC)"
+    parsed = _parse_reset_time(text, now=now, allow_rollover=False)
+    assert parsed == datetime(2027, 1, 2, 9, 0, 0, tzinfo=UTC)
+
+
+def test_reset_wait_seconds_multi_day_for_dated_hint():
+    now = datetime(2026, 8, 5, 22, 0, 0, tzinfo=UTC)
+    hibernated = [
+        {"id": "TICK-001", "_body": "You've hit your weekly limit · resets Aug 7, 6am (America/Los_Angeles)"}
+    ]
+    wait = _reset_wait_seconds(hibernated, now=now, allow_rollover=False)
+    assert wait > 3600
 
 
 # ---------------------------------------------------------------------------
@@ -804,11 +1057,11 @@ def test_run_loop_preserves_orchestrate_flags(tmp_path):
 
     # Verify that the stored arguments were included in the retry command
     assert len(run_calls) == 1
-    assert run_calls[0] == ["lanegate", "orchestrate", "--milestone", "v2", "--human-review", "per_ticket"]
+    assert run_calls[0] == ["lanegate", "run", "--milestone", "v2", "--human-review", "per_ticket"]
 
 
 def test_run_loop_uses_empty_args_when_none_stored(tmp_path):
-    """When no arguments are stored (e.g., plain `lanegate orchestrate`), fall
+    """When no arguments are stored (e.g., plain `lanegate run`), fall
     back to using bare orchestrate without additional flags."""
     cfg = _default_cfg(tmp_path)
     tickets_dir = Path(cfg["tickets_dir"])
@@ -834,7 +1087,7 @@ def test_run_loop_uses_empty_args_when_none_stored(tmp_path):
 
     # Verify that without stored arguments, we still retry (just with bare command)
     assert len(run_calls) == 1
-    assert run_calls[0] == ["lanegate", "orchestrate"]
+    assert run_calls[0] == ["lanegate", "run"]
 
 
 # ---------------------------------------------------------------------------
@@ -1025,3 +1278,35 @@ def test_read_orchestrate_args_keeps_stricter_human_review(tmp_path):
     args, dropped = _read_orchestrate_args(tmp_path)
     assert args == ["--human-review", "per_ticket"]
     assert dropped == []
+
+
+def test_retry_subprocess_sets_resume_watch_trigger_env(tmp_path):
+    """Subprocess invocation from resume_watch sets LANEGATE_RUN_TRIGGER and LANEGATE_RUN_TRIGGER_REASON env vars."""
+    cfg = _default_cfg(
+        tmp_path,
+        rate_limit_resume={"initial_backoff_s": 1, "max_backoff_s": 10, "ceiling_s": None},
+    )
+    tickets_dir = Path(cfg["tickets_dir"])
+    _write_hibernated_ticket(
+        tickets_dir, "TICK-001", "rate limit or quota interruption (executor exited 429)"
+    )
+
+    captured_kwargs = []
+
+    def mock_run(args, **kwargs):
+        captured_kwargs.append(kwargs)
+        _write_open_ticket(tickets_dir, "TICK-001")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("lanegate.resume_watch.subprocess.run", side_effect=mock_run),
+        patch("lanegate.resume_watch.time.sleep"),
+        patch("lanegate.resume_watch._write_log"),
+    ):
+        _run_loop(cfg, tmp_path)
+
+    assert len(captured_kwargs) == 1
+    env = captured_kwargs[0].get("env", {})
+    assert env.get("LANEGATE_RUN_TRIGGER") == "resume-watch"
+    assert "rate limit on TICK-001" in env.get("LANEGATE_RUN_TRIGGER_REASON", "")
+

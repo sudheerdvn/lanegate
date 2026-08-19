@@ -13,6 +13,7 @@ import fnmatch
 import json
 import re
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -29,9 +30,11 @@ _INJECTION_SIGNALS: list[tuple[str, str]] = [
     (r"you\s+are\s+now\s+", "role reassignment"),
     (r"act\s+as\s+(an?\s+)?AI\s+without", "role reassignment"),
     (r"pretend\s+(you\s+are|to\s+be)\s+", "role reassignment"),
-    # Tag escape attempts
-    (r"</untrusted-data>", "tag escape"),
-    (r"<untrusted-data>", "nested tag injection"),
+    # ``build_prompt`` renders its own delimiter and escapes either delimiter
+    # in every untrusted value.  Do not reject those literal strings here:
+    # review findings and code examples must be able to describe the fence
+    # without making a ticket permanently unrunnable.  Textual attempts to
+    # override the instruction layer are still scanned below.
     (r"</?system>", "system tag injection"),
     (r"</?assistant>", "assistant tag injection"),
     # Explicit jailbreak vocabulary
@@ -62,11 +65,27 @@ def _scan_injection_signals(ticket: dict) -> list[str]:
 
     Scans the entire body without exemptions to prevent bypass attacks that
     prefix the body with system-section headers to truncate the scan window.
+    Literal ``<untrusted-data>`` delimiters are intentionally handled by
+    ``prompts.build_prompt`` at the rendering boundary, where they are escaped
+    in every untrusted field.  Scanning them here would reject legitimate
+    historical review evidence without adding protection.
     """
+    def _field_text(value: object) -> str:
+        """Render legacy list-valued criteria without skipping any content.
+
+        Older hand-authored tickets may express close criteria as YAML lists.
+        Treat each list element as ticket text so the injection gate still
+        inspects it instead of crashing before dispatch or silently omitting
+        a criterion from the scan.
+        """
+        if isinstance(value, list):
+            return "\n".join(str(item) for item in value)
+        return str(value or "")
+
     fields = {
-        "title": ticket.get("title", ""),
-        "body": ticket.get("_body", ""),
-        "close_criteria": ticket.get("close_criteria", ""),
+        "title": _field_text(ticket.get("title", "")),
+        "body": _field_text(ticket.get("_body", "")),
+        "close_criteria": _field_text(ticket.get("close_criteria", "")),
     }
     findings: list[str] = []
     for field_name, content in fields.items():
@@ -94,6 +113,103 @@ def _scan_injection_signals(ticket: dict) -> list[str]:
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Risk-lane classification (TICK-467)
+# ---------------------------------------------------------------------------
+
+_RED_LANE_SIGNALS: list[tuple[str, str, str]] = [
+    # External credentials / secrets
+    (r"(?i)aws_secret_access_key\s*[:=]", "AWS secret key", "credentials"),
+    (r"-----BEGIN\s+(RSA|OPENSSH|EC|DSA|PGP)?\s*PRIVATE KEY-----", "private key material", "credentials"),
+    (r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*[:=]\s*['\"][A-Za-z0-9/_\-+=]{8,}['\"]", "hardcoded credential", "credentials"),
+    (r"\bghp_[A-Za-z0-9]{20,}\b", "GitHub personal access token", "credentials"),
+    (r"\bsk-[A-Za-z0-9]{20,}\b", "API secret key", "credentials"),
+    # Irreversible / security-sensitive operations
+    (r"\brm\s+-rf\s+/", "irreversible filesystem deletion", "security_actions"),
+    (r"(?i)\bdrop\s+(table|database|schema)\b", "irreversible database schema change", "security_actions"),
+    (r"\bgit\s+push\s+.*--force\b", "force-push (irreversible history rewrite)", "security_actions"),
+    # scan_risk_lane() strips the unified-diff '+' marker before matching.
+    (r"(?im)^\s*sudo\s+", "privilege escalation", "security_actions"),
+    (r"\bchmod\s+(-R\s+)?777\b", "insecure permission change", "security_actions"),
+]
+
+_YELLOW_LANE_SIGNALS: list[tuple[str, str]] = [
+    (r"(?im)^##\s*Review Findings", "review-findings amendment"),
+    (r"(?im)^##\s*Requirement", "requirement amendment"),
+    (r"(?i)\bclose_criteria\b", "close-criteria amendment"),
+]
+
+
+class RiskLane(str):
+    """A risk-lane result with the red-signal categories that caused it.
+
+    It remains a ``str`` subclass so existing callers comparing the result to
+    ``"green"``, ``"yellow"``, or ``"red"`` retain their API unchanged.
+    """
+
+    signals: frozenset[str]
+
+    def __new__(cls, lane: str, signals: frozenset[str] = frozenset()) -> "RiskLane":
+        result = super().__new__(cls, lane)
+        result.signals = signals
+        return result
+
+
+def scan_risk_lane(diff_text: str, ticket: dict | None = None) -> RiskLane:
+    """Classify a change's risk lane from its diff (and optional ticket context).
+
+    Returns:
+      - "red": external credentials, security-sensitive, or irreversible
+        operations found in added lines — always escalates to a human,
+        regardless of the ticket's configured autonomy.
+      - "yellow": requirement amendments or review-finding-driven changes —
+        stays on the automatic fix/re-review path (like "full" autonomy).
+      - "green": ordinary scoped changes — the default.
+
+    Only added (``+``) lines are scanned so removing a risky pattern does
+    not itself trigger escalation.
+    """
+    added_lines = "\n".join(
+        line[1:]
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    red_signals = frozenset(
+        category
+        for pattern, _label, category in _RED_LANE_SIGNALS
+        if re.search(pattern, added_lines)
+    )
+    if red_signals:
+        return RiskLane("red", red_signals)
+
+    haystack = added_lines
+    if ticket:
+        haystack += "\n" + str(ticket.get("_body", "")) + "\n" + str(ticket.get("close_criteria", ""))
+    for pattern, _label in _YELLOW_LANE_SIGNALS:
+        if re.search(pattern, haystack):
+            return RiskLane("yellow")
+
+    return RiskLane("green")
+
+
+def risk_lane_requires_human_review(risk_lane: str, escalation_triggers: dict) -> bool:
+    """Return whether a classified lane matches an enabled escalation trigger.
+
+    A red classification alone is intentionally insufficient: credentials and
+    security actions are configured independently.  A plain ``"red"`` from a
+    legacy caller is treated conservatively as both categories because it has
+    no signal metadata to filter on.
+    """
+    if risk_lane != "red":
+        return False
+    detected_triggers = getattr(
+        risk_lane,
+        "signals",
+        frozenset({"credentials", "security_actions"}),
+    )
+    return any(escalation_triggers.get(trigger, False) for trigger in detected_triggers)
+
+
 def _run_acceptance_contract_audit(ticket: dict, repo_root: Path, cfg: dict) -> list[str]:
     """Run and persist the deterministic acceptance-contract audit for a ticket."""
     from lanegate.analyze import audit_acceptance_contract
@@ -114,6 +230,59 @@ def _run_acceptance_contract_audit(ticket: dict, repo_root: Path, cfg: dict) -> 
     return audit.findings
 
 
+def check_control_plane_compliance(
+    ticket: dict,
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
+    worktree_path: Path | None = None,
+    *,
+    check_review_independence: bool = True,
+) -> tuple[bool, str | None]:
+    """Verify ticket-branch isolation and review compliance for control-plane files."""
+    from lanegate.safeguards import collect_control_plane_touches
+
+    cp_touches, curr_branch = collect_control_plane_touches(ticket, worktree_path, cfg)
+
+    if not cp_touches:
+        return True, None
+
+    trunk_branch = (cfg or {}).get("trunk_branch", "main")
+    cp_list = ", ".join(sorted(set(cp_touches)))
+
+    # 1. Branch isolation check
+    if ticket.get("status") not in ("merged", "post_merge"):
+        if (
+            ticket.get("is_main")
+            or not ticket.get("id")
+            or curr_branch in (trunk_branch, "main", "master")
+        ):
+            return False, f"Control-plane files ({cp_list}) require ticket-branch isolation and cannot be modified directly on {trunk_branch}."
+
+    # 2. Independent review compliance check
+    if check_review_independence:
+        independence = ticket.get("review_independence") or (ticket.get("review") or {}).get("review_independence")
+        review_driver = ticket.get("review_driver") or (ticket.get("review") or {}).get("driver")
+        implementer = ticket.get("implement_driver") or ticket.get("executor") or ticket.get("implementer")
+        review_model = ticket.get("review_model") or (ticket.get("review") or {}).get("model")
+        implement_model = ticket.get("implement_session_model") or ticket.get("implement_model")
+
+        if independence == "self":
+            return False, f"Control-plane files ({cp_list}) require independent model review, but same-model review was recorded."
+        if independence == "undetermined":
+            return False, f"Control-plane files ({cp_list}) require independent model review, but undetermined review independence was recorded."
+        if not independence or independence not in ("independent", "different-model"):
+            return False, f"Control-plane files ({cp_list}) require independent model review, but independent review was not recorded."
+
+        if review_driver and implementer and review_driver == implementer:
+            if review_model and implement_model and review_model == implement_model:
+                return False, f"Control-plane files ({cp_list}) require independent model review, but same driver and model were used for review."
+            elif (not review_model or not implement_model or review_model == implement_model) and independence not in ("independent", "different-model"):
+                return False, f"Control-plane files ({cp_list}) require independent model review, but same driver and model were used for review."
+
+    return True, None
+
+
+
 # ---------------------------------------------------------------------------
 # Hard-blocked file categories
 # ---------------------------------------------------------------------------
@@ -122,6 +291,8 @@ def _run_acceptance_contract_audit(ticket: dict, repo_root: Path, cfg: dict) -> 
 # Glob patterns use fnmatch against the full relative path (forward-slash separators).
 # Prefix patterns are checked with str.startswith().
 _BLOCKED_FILE_RULES: list[tuple[str, str]] = [
+    # LaneGate control plane
+    (".lanegate.yml", "LaneGate control configuration: .lanegate.yml"),
     # CI/CD
     (".github/", "CI/CD: .github/ directory"),
     (".circleci/", "CI/CD: .circleci/ directory"),

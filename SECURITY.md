@@ -8,7 +8,7 @@ Do not include actual credentials, private keys, or production system details in
 
 ## LaneGate's Security Model
 
-LaneGate is a local coordinator for coding agents. When you run `lanegate orchestrate`, it spawns AI agent subprocesses (Claude, aider, Codex, or others) that read and write files inside git worktrees. Those agents execute with the same OS permissions as the user who ran LaneGate.
+LaneGate is a local coordinator for coding agents. When you run `lanegate run`, it spawns AI agent subprocesses (Claude, aider, Codex, or others) that read and write files inside git worktrees. Those agents execute with the same OS permissions as the user who ran LaneGate. `lanegate orchestrate` is retained as a compatibility alias.
 
 **What LaneGate does:**
 - Runs each ticket in its own git worktree, one worktree per ticket
@@ -33,4 +33,4 @@ LaneGate is currently in pre-release (v0.x). Security fixes are applied to the l
 
 ## Safer Operating Pattern
 
-For repositories you care about, configure deterministic safeguards in `.lanegate.yml`, keep `max_parallel` low, and run `lanegate orchestrate --human-review final` so you inspect diffs before merge. Use `reviewer: human` with `--human-review per_ticket` when each ticket needs its own recorded human verdict. The `protected_paths` and `security_sensitive_paths` config keys can add project-specific hard blocks, but they are not a sandbox.
+For repositories you care about, configure deterministic safeguards in `.lanegate.yml`, keep `max_parallel` low, and run `lanegate run --human-review final` so you inspect diffs before merge. Use `reviewer: human` with `--human-review per_ticket` when each ticket needs its own recorded human verdict. The `protected_paths` and `security_sensitive_paths` config keys can add project-specific hard blocks, but they are not a sandbox.

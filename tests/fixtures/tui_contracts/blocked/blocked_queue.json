@@ -7,6 +7,8 @@
       "diff_cmd": "git diff main...tick-145-multi-tenant",
       "priority": 1,
       "milestone": "v1.5",
+      "attention_category": "escalated",
+      "attention_summary": "Static analysis requires manual review",
       "findings": [
         "Migration lacks downtime strategy; need zero-downtime approach",
         "Missing rollback testing",
@@ -21,6 +23,8 @@
       "diff_cmd": "git diff main...tick-143-rate-limit",
       "priority": 2,
       "milestone": "v1.6",
+      "attention_category": "rejected",
+      "attention_summary": "Reviewer requested edge-case coverage",
       "findings": [
         "Rate limiter doesn't account for distributed backends",
         "Missing tests for edge cases (clock skew, concurrent requests)"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -25,6 +26,7 @@ _BASE_CFG = {
     "lock_statuses": ["in_progress", "code_complete", "in_review"],
     "environments": [],
 }
+_API_TOKENS: dict[int, str] = {}
 
 
 class FakeProc:
@@ -78,8 +80,13 @@ def api_server(repo_root: Path):
     server = LaneGateApiServer(_BASE_CFG, repo_root, port=port)
     server.start()
     _wait_for_port(port)
-    yield "127.0.0.1", port
-    server.stop()
+    assert server.token_path is not None
+    _API_TOKENS[port] = server.token_path.read_text().strip()
+    try:
+        yield "127.0.0.1", port
+    finally:
+        _API_TOKENS.pop(port, None)
+        server.stop()
 
 
 def _get(host: str, port: int, path: str) -> tuple[int, dict | str]:
@@ -97,7 +104,10 @@ def _get(host: str, port: int, path: str) -> tuple[int, dict | str]:
 def _post(host: str, port: int, path: str, payload: dict | None = None) -> tuple[int, dict | str]:
     conn = HTTPConnection(host, port, timeout=5)
     body = json.dumps(payload or {}).encode()
-    conn.request("POST", path, body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    if token := _API_TOKENS.get(port):
+        headers["X-LaneGate-Token"] = token
+    conn.request("POST", path, body=body, headers=headers)
     resp = conn.getresponse()
     raw = resp.read().decode()
     conn.close()
@@ -110,7 +120,10 @@ def _post(host: str, port: int, path: str, payload: dict | None = None) -> tuple
 def _put(host: str, port: int, path: str, payload: dict | None = None) -> tuple[int, dict | str]:
     conn = HTTPConnection(host, port, timeout=5)
     body = json.dumps(payload or {}).encode()
-    conn.request("PUT", path, body=body, headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    if token := _API_TOKENS.get(port):
+        headers["X-LaneGate-Token"] = token
+    conn.request("PUT", path, body=body, headers=headers)
     resp = conn.getresponse()
     raw = resp.read().decode()
     conn.close()
@@ -217,46 +230,146 @@ def test_get_status_inactive_when_no_run(api_server, repo_root):
     assert data["active"] is False
 
 
-# ── POST /api/orchestrate/start ───────────────────────────────────────────────
+# ── POST /api/runs/start ──────────────────────────────────────────────────────
 
-def test_orchestrate_start_returns_started(api_server, repo_root):
+def test_run_start_returns_started(api_server, repo_root):
     host, port = api_server
     fake_proc = FakeProc(pid=12345)
     with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
-        status, data = _post(host, port, "/api/orchestrate/start", {})
+        status, data = _post(host, port, "/api/runs/start", {})
     assert status == 200
     assert data["run_id"].startswith("run-")
     assert data["status"] == "running"
     assert data["orchestrator_pid"] == 12345
     mock_popen.assert_called_once()
-    assert mock_popen.call_args[0][0][:3] == [sys.executable, "-m", "lanegate.cli"]
+    assert mock_popen.call_args[0][0][:4] == [sys.executable, "-m", "lanegate.cli", "run"]
 
 
-def test_orchestrate_start_passes_milestone(api_server, repo_root):
+def test_mutating_routes_require_a_local_token_before_parsing_body(api_server, repo_root):
+    """A CORS-safelisted text/plain request must not reach JSON parsing."""
+    host, port = api_server
+    token_path = repo_root / ".lanegate" / f"api-token-{port}"
+    assert token_path.read_text().strip() == _API_TOKENS[port]
+    if sys.platform != "win32":
+        # os.chmod on Windows only toggles the read-only DOS attribute; it
+        # cannot express owner-only POSIX permission bits, so stat() never
+        # reports 0o600 there regardless of what the source requested.
+        assert token_path.stat().st_mode & 0o777 == 0o600
+
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/api/orchestrate/start",
+            body=b"not JSON",
+            headers={"Content-Type": "text/plain"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read().decode())
+    finally:
+        conn.close()
+
+    assert response.status == 401
+    assert body == {"error": "missing or invalid API token"}
+
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/api/runs/stop",
+            body=b"not JSON",
+            headers={"Content-Type": "text/plain", "X-LaneGate-Token": "incorrect"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read().decode())
+    finally:
+        conn.close()
+
+    assert response.status == 401
+    assert body == {"error": "missing or invalid API token"}
+
+    conn = HTTPConnection(host, port, timeout=5)
+    try:
+        conn.request(
+            "PUT",
+            "/api/pools/default/executors",
+            body=b"not JSON",
+            headers={"Content-Type": "text/plain"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read().decode())
+    finally:
+        conn.close()
+
+    assert response.status == 401
+    assert body == {"error": "missing or invalid API token"}
+
+
+def test_orchestrate_start_remains_a_compatibility_alias(api_server, repo_root):
+    host, port = api_server
+    with patch("subprocess.Popen", return_value=FakeProc(pid=12345)) as mock_popen:
+        status, data = _post(host, port, "/api/orchestrate/start", {})
+
+    assert status == 200
+    assert data["status"] == "running"
+    assert mock_popen.call_args[0][0][3] == "run"
+
+
+def test_api_started_run_id_resolves_log_event_and_summary_endpoints(api_server, repo_root):
+    host, port = api_server
+    fake_proc = FakeProc(pid=12345)
+    with patch("subprocess.Popen", return_value=fake_proc):
+        status, started = _post(host, port, "/api/runs/start", {})
+    assert status == 200
+
+    session_ts = "2026-08-10T18-32-45"
+    logs_dir = repo_root / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text("API audit line\n")
+    from lanegate.orchestrate.run_report import _append_run_event
+
+    _append_run_event(repo_root, session_ts, "run_start", pid=os.getpid(), ts="2026-08-10T18:32:45Z")
+
+    with patch("lanegate.orchestrate.run_report.orchestrator_lock_status", return_value={"held": True}):
+        status, logs = _get(host, port, f"/api/runs/{started['run_id']}/logs")
+        assert status == 200
+        assert logs["run_id"] == session_ts
+        assert [event["message"] for event in logs["events"]] == ["API audit line"]
+
+        status, events = _get(host, port, f"/api/runs/{started['run_id']}/events")
+        assert status == 200
+        assert events["run_id"] == session_ts
+
+        status, summary = _get(host, port, f"/api/runs/{started['run_id']}")
+    assert status == 200
+    assert summary["run_id"] == session_ts
+
+
+def test_run_start_passes_milestone(api_server, repo_root):
     host, port = api_server
     fake_proc = FakeProc(pid=99)
     with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
-        _post(host, port, "/api/orchestrate/start", {"milestone": "v2"})
+        _post(host, port, "/api/runs/start", {"milestone": "v2"})
     call_args = mock_popen.call_args[0][0]
     assert "--milestone" in call_args
     assert "v2" in call_args
 
 
-def test_orchestrate_start_passes_max_parallel(api_server, repo_root):
+def test_run_start_passes_max_parallel(api_server, repo_root):
     host, port = api_server
     fake_proc = FakeProc(pid=99)
     with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
-        _post(host, port, "/api/orchestrate/start", {"max_parallel": 3})
+        _post(host, port, "/api/runs/start", {"max_parallel": 3})
     call_args = mock_popen.call_args[0][0]
     assert "--max" in call_args
     assert "3" in call_args
 
 
-def test_orchestrate_start_passes_human_review(api_server, repo_root):
+def test_run_start_passes_human_review(api_server, repo_root):
     host, port = api_server
     fake_proc = FakeProc(pid=99)
     with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
-        _post(host, port, "/api/orchestrate/start", {"human_review": "per_ticket"})
+        _post(host, port, "/api/runs/start", {"human_review": "per_ticket"})
     call_args = mock_popen.call_args[0][0]
     assert "--human-review" in call_args
     assert "per_ticket" in call_args
@@ -280,23 +393,107 @@ def test_current_run_reports_cli_started_run_not_tracked_by_api(api_server, repo
         "heartbeat_count": 4,
         "orchestrator_lock": {"held": True, "pid": 12321, "alive": True},
     }
-    with patch("lanegate.orchestrate.get_orchestration_status", return_value=active_status):
+    session_ts = "2026-08-10T18-32-45"
+    logs_dir = repo_root / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text("CLI audit line\n")
+    with (
+        patch("lanegate.orchestrate.get_orchestration_status", return_value=active_status),
+        patch(
+            "lanegate.orchestrate.run_report._resolve_active_run_session_ts",
+            return_value=session_ts,
+        ),
+    ):
         status, data = _get(host, port, "/api/runs/current")
 
     assert status == 200
-    assert data["run_id"] == "TICK-001-1700000000-1-implement"
+    assert data["run_id"] == session_ts
     assert data["status"] == "running"
     assert data["process_alive"] is True
     assert data["tickets"] == ["TICK-001"]
     assert data["workers"][0]["ticket_id"] == "TICK-001"
     assert data["orchestrator_pid"] == 12321
 
+    status, logs = _get(host, port, f"/api/runs/{session_ts}/logs")
+    assert status == 200
+    assert [event["message"] for event in logs["events"]] == ["CLI audit line"]
+
+
+def test_run_logs_rejects_per_ticket_executor_session_id(api_server):
+    host, port = api_server
+
+    status, data = _get(host, port, "/api/runs/TICK-001-1700000000-1-implement/logs")
+
+    assert status == 404
+    assert "run log not found" in data["error"]
+
+
+def test_current_run_keeps_cli_run_live_between_dispatches_and_includes_analysis(api_server, repo_root):
+    host, port = api_server
+    active_status = {
+        "active": True,
+        "state": "between-dispatches",
+        "reconciliation_state": "orchestrator_live",
+        "executor_pid": 55555,
+        "executor_session": "TICK-001-1700000000-1-implement",
+        "ticket_id": "TICK-001",
+        "started_at_iso": "2026-08-05T18:32:45Z",
+        "heartbeat_count": 4,
+        "orchestrator_lock": {"held": True, "pid": 12321, "alive": True},
+    }
+    analysis = {
+        "phase": "model_requested",
+        "executor": "claude",
+        "model": "claude-haiku-4-5-20251001",
+        "elapsed_seconds": 12,
+        "log_path": ".lanegate/logs/analyze.log",
+    }
+    with (
+        patch("lanegate.orchestrate.get_orchestration_status", return_value=active_status),
+        patch("lanegate.analyze.get_active_analysis_status", return_value=analysis),
+    ):
+        status, data = _get(host, port, "/api/runs/current")
+
+    assert status == 200
+    assert data["run_id"] == "orchestrator-12321"
+    assert data["status"] == "between-dispatches"
+    assert data["process_alive"] is True
+    assert data["started_at_iso"] == "2026-08-05T18:32:45Z"
+    assert data["orchestrator_pid"] == 12321
+    assert data["tickets"] == ["TICK-001"]
+    assert data["analysis"] == analysis
+
+
+def test_current_run_exposes_persisted_batch_status(api_server, repo_root):
+    """The Run payload exposes the exact batch diagnostics held in status."""
+    host, port = api_server
+    batch_line = "[orchestrate] batch: 1 running of cap 3, 2 peers (3 open tickets total)"
+    reason = "selected TICK-366 has parallel_safe=false"
+    active_status = {
+        "active": True,
+        "state": "running",
+        "reconciliation_state": "live",
+        "executor_pid": 55555,
+        "executor_session": "TICK-001-1700000000-1-implement",
+        "ticket_id": "TICK-001",
+        "heartbeat_count": 4,
+        "orchestrator_lock": {"held": True, "pid": 12321, "alive": True},
+        "batch_line": batch_line,
+        "underfilled_reason": reason,
+    }
+    with patch("lanegate.orchestrate.get_orchestration_status", return_value=active_status):
+        status, data = _get(host, port, "/api/runs/current")
+
+    assert status == 200
+    assert data["batch_line"] == batch_line
+    assert data["underfilled_reason"] == reason
+
 
 def test_current_run_reports_api_started_run(api_server, repo_root):
     host, port = api_server
     fake_proc = FakeProc(pid=777)
     with patch("subprocess.Popen", return_value=fake_proc):
-        _, started = _post(host, port, "/api/orchestrate/start", {"dry_run": True})
+        _, started = _post(host, port, "/api/runs/start", {"dry_run": True})
 
     status, data = _get(host, port, "/api/runs/current")
     assert status == 200
@@ -341,6 +538,21 @@ def test_runs_list_and_detail_endpoints(api_server, repo_root):
         assert len(data_det["batch_tickets"]) == 1
 
 
+def test_api_runs_endpoint_includes_direct_actions(api_server, repo_root):
+    from lanegate.orchestrate.run_report import begin_direct_action, record_direct_action_event
+
+    tracking = begin_direct_action(repo_root, "complete", ticket_id="TICK-001", executor="cli")
+    record_direct_action_event(
+        repo_root, tracking["action_id"], "action_end", action_type="complete",
+        ticket_id="TICK-001", status="success",
+    )
+    host, port = api_server
+    status, data = _get(host, port, "/api/runs")
+    assert status == 200
+    action = next(run for run in data["runs"] if run["run_id"] == tracking["action_id"])
+    assert action["batch_tickets"][0]["executor"] == "direct:complete"
+
+
 def test_run_summary_reports_dispatched_ticket_without_outcome_as_interrupted(
     api_server, repo_root
 ):
@@ -375,18 +587,18 @@ def test_run_summary_reports_dispatched_ticket_without_outcome_as_interrupted(
     assert "lanegate ps" in t["failure_reason"]
 
 
-# ── POST /api/orchestrate/stop ────────────────────────────────────────────────
+# ── POST /api/runs/stop ───────────────────────────────────────────────────────
 
-def test_orchestrate_stop_no_active_run(api_server, repo_root):
+def test_run_stop_no_active_run(api_server, repo_root):
     host, port = api_server
-    status, data = _post(host, port, "/api/orchestrate/stop", {})
+    status, data = _post(host, port, "/api/runs/stop", {})
     assert status == 200
     assert data["stop_requested"] is False
     assert data["status"] == "idle"
     assert "reason" in data
 
 
-def test_orchestrate_stop_signals_orchestrator_not_executor(api_server, repo_root):
+def test_run_stop_signals_orchestrator_not_executor(api_server, repo_root):
     host, port = api_server
     active_status = {
         "active": True,
@@ -401,9 +613,9 @@ def test_orchestrate_stop_signals_orchestrator_not_executor(api_server, repo_roo
         patch("lanegate.orchestrate.get_orchestration_status", return_value=active_status),
         patch("os.kill") as mock_kill,
     ):
-        _, started = _post(host, port, "/api/orchestrate/start", {})
+        _, started = _post(host, port, "/api/runs/start", {})
         with patch("lanegate.api.pid_alive", return_value=True):
-            status, data = _post(host, port, "/api/orchestrate/stop", {})
+            status, data = _post(host, port, "/api/runs/stop", {})
     assert status == 200
     assert data["run_id"] == started["run_id"]
     assert data["stop_requested"] is True
@@ -520,6 +732,37 @@ def test_orchestrate_run_logs_pagination(api_server, repo_root):
     assert [ev["id"] for ev in data["events"]] == ["3", "4", "5"]
 
 
+def test_current_run_log_page_includes_presentation_metadata(api_server, repo_root):
+    host, port = api_server
+    log_path = repo_root / ".lanegate" / "watch.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "[orchestrate] executor finished (exit 0)\n"
+        "[orchestrate] WARNING — rate limited\n"
+        "executor failed (exit 1)\n"
+        "[orchestrate] review verdict CHANGES_REQUESTED\n"
+        "+added line\n"
+    )
+
+    status, data = _get(host, port, "/api/runs/current/logs?offset=0&limit=5")
+
+    assert status == 200
+    assert [event["message"] for event in data["events"]] == [
+        "[orchestrate] executor finished (exit 0)",
+        "[orchestrate] WARNING — rate limited",
+        "executor failed (exit 1)",
+        "[orchestrate] review verdict CHANGES_REQUESTED",
+        "+added line",
+    ]
+    assert [(event["style"], event["level"], event["kind"]) for event in data["events"]] == [
+        ("cyan", "info", "orchestrator"),
+        ("yellow", "warning", "orchestrator"),
+        ("bold red", "error", "executor"),
+        ("yellow", "warning", "orchestrator"),
+        ("green", "success", "executor"),
+    ]
+
+
 def test_current_run_log_page_redacts_secret_text(api_server, repo_root):
     host, port = api_server
     log_path = repo_root / ".lanegate" / "watch.log"
@@ -621,6 +864,16 @@ def test_get_ticket_detail_json_structure(api_server, repo_root):
     assert "close_criteria" in payload
 
 
+def test_get_ticket_detail_skips_malformed_ticket_id_when_scanning(api_server, repo_root):
+    td = repo_root / "tickets"
+    (td / "TICK-900.md").write_text(
+        "---\nid: 'TICK-900 '\ntitle: Malformed\nstatus: open\n---\nBody.\n"
+    )
+    status, payload = _get(api_server[0], api_server[1], "/api/tickets/TICK-001")
+    assert status == 200
+    assert payload["id"] == "TICK-001"
+
+
 def test_get_ticket_detail_includes_review_driver_fields(api_server, repo_root):
     host, port = api_server
     td = repo_root / "tickets"
@@ -666,6 +919,20 @@ def test_get_blocked_empty_queue(api_server):
     _, payload = _get(host, port, "/api/blocked")
     # When no blocked tickets exist, should be empty array
     assert payload["blocked"] == []
+
+
+def test_get_blocked_excludes_in_review_changes_requested(api_server, repo_root):
+    host, port = api_server
+    td = repo_root / "tickets"
+    frontmatter = (
+        "id: TICK-010\ntitle: Test TICK-010\nstatus: in_review\n"
+        "priority: 5\nparallel_safe: true\nreview_verdict: changes_requested\n"
+        "touches:\n  - src/baz.py\n"
+    )
+    (td / "TICK-010.md").write_text(f"---\n{frontmatter}---\nBody.\n")
+
+    _, payload = _get(host, port, "/api/blocked")
+    assert "TICK-010" not in [t["id"] for t in payload["blocked"]]
 
 
 # ── GET /api/config - Sanitized settings endpoint ───────────────────────────
@@ -758,8 +1025,13 @@ def pools_api_server(pools_repo_root: Path):
     server = LaneGateApiServer(cfg, pools_repo_root, port=port)
     server.start()
     _wait_for_port(port)
-    yield "127.0.0.1", port
-    server.stop()
+    assert server.token_path is not None
+    _API_TOKENS[port] = server.token_path.read_text().strip()
+    try:
+        yield "127.0.0.1", port
+    finally:
+        _API_TOKENS.pop(port, None)
+        server.stop()
 
 
 def test_get_pools_returns_200(pools_api_server):
@@ -960,3 +1232,120 @@ def test_historical_run_logs_redact_raw_transcript(api_server, repo_root):
     assert messages[0] == "ordinary line"
     assert "sk-" not in messages[1]
     assert "[REDACTED]" in messages[1]
+
+
+def test_historical_run_logs_semantic_line_metadata_http(api_server, repo_root):
+    host, port = api_server
+    session_ts = "20260730T150000Z"
+    logs_dir = repo_root / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_content = (
+        "- HTTP 429 rate limit retry\n"
+        "  - HTTP 429 rate limit retry\n"
+        "-   HTTP 429 rate limit retry\n"
+        "- [ ] checklist item\n"
+        "The PR was merged, then reverted\n"
+        "No tests passed.\n"
+        "-     key: value\n"
+        "-    return value\n"
+        "+    return value\n"
+        "verdict: approved\n"
+    )
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text(log_content)
+
+    status, data = _get(host, port, f"/api/runs/{session_ts}/logs?offset=0&limit=15")
+
+    assert status == 200
+    events = data["events"]
+    assert len(events) == 10
+
+    # Bullet and checklist items are not marked error/red
+    assert events[0]["level"] != "error"
+    assert events[0]["style"] != "red"
+    assert events[1]["level"] != "error"
+    assert events[1]["style"] != "red"
+    assert events[2]["level"] != "error"
+    assert events[2]["style"] != "red"
+    assert events[3]["level"] != "error"
+    assert events[3]["style"] != "red"
+
+    # Prose containing merged/passed is not marked success/green
+    assert events[4]["level"] != "success"
+    assert events[4]["style"] != "green"
+    assert events[5]["level"] != "success"
+    assert events[5]["style"] != "green"
+
+    # Whitespace diff lines retain red/green styles. 2-space indentation is
+    # deliberately not used here — it's the documented markdown-bullet case
+    # (see test_cli.py's test_logs_line_style_prevents_false_positives),
+    # which must NOT be red, so this line uses 5 spaces to stay unambiguous.
+    assert events[6]["level"] == "error"
+    assert events[6]["style"] == "red"
+    assert events[7]["level"] == "error"
+    assert events[7]["style"] == "red"
+    assert events[8]["level"] == "success"
+    assert events[8]["style"] == "green"
+
+    # Verdict is marked success/green
+    assert events[9]["level"] == "success"
+    assert events[9]["style"] == "green"
+
+
+def test_run_payload_multiple_workers(api_server, repo_root, monkeypatch):
+    """_run_payload() returns status dictionaries for all active per-session
+    executor status files in the workers list during multi-ticket parallel execution."""
+    from lanegate.api import _run_payload
+
+    status_dir = repo_root / ".lanegate" / "active-orchestrate"
+    status_dir.mkdir(parents=True, exist_ok=True)
+
+    session1 = {
+        "ticket_id": "TICK-101",
+        "executor_pid": 11111,
+        "state": "running",
+        "reconciliation_state": "live",
+        "resolved_driver": "claude",
+        "resolved_executor": "claude",
+        "resolved_model": "claude-3-5-sonnet",
+        "started_at": 1700000000.0,
+        "updated_at": "2026-08-07T16:00:00Z",
+    }
+    session2 = {
+        "ticket_id": "TICK-102",
+        "executor_pid": 22222,
+        "state": "running",
+        "reconciliation_state": "live",
+        "resolved_driver": "codex",
+        "resolved_executor": "codex",
+        "resolved_model": "gpt-4o",
+        "started_at": 1700000000.0,
+        "updated_at": "2026-08-07T16:00:01Z",
+    }
+
+    (status_dir / "session1.json").write_text(json.dumps(session1), encoding="utf-8")
+    (status_dir / "session2.json").write_text(json.dumps(session2), encoding="utf-8")
+
+    monkeypatch.setattr("lanegate.pidutil.pid_alive", lambda pid: True)
+
+    payload = _run_payload(repo_root, {}, None)
+
+    assert len(payload["workers"]) == 2
+    worker_tids = {w["ticket_id"] for w in payload["workers"]}
+    assert worker_tids == {"TICK-101", "TICK-102"}
+    assert set(payload["tickets"]) == {"TICK-101", "TICK-102"}
+
+    w1 = next(w for w in payload["workers"] if w["ticket_id"] == "TICK-101")
+    assert w1["executor_pid"] == 11111
+    assert w1["state"] == "running"
+    assert w1["resolved_driver"] == "claude"
+
+    w2 = next(w for w in payload["workers"] if w["ticket_id"] == "TICK-102")
+    assert w2["executor_pid"] == 22222
+    assert w2["state"] == "running"
+    assert w2["resolved_driver"] == "codex"
+
+    host, port = api_server
+    status, data = _get(host, port, "/api/runs/current")
+    assert status == 200
+    assert len(data["workers"]) == 2
+    assert set(data["tickets"]) == {"TICK-101", "TICK-102"}

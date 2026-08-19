@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from lanegate.concurrency import claim_lock, touches_overlap
+from lanegate.lifecycle import _control_repo_root
 from lanegate.ticket import (
     canonical_id,
     load_all_tickets,
@@ -34,6 +35,7 @@ def claim_files(
     requested = sorted({path for path in file_paths if path})
     if not requested:
         return True, None
+    repo_root = _control_repo_root(repo_root)
     prefix = cfg["ticket_prefix"]
     tickets_dir = repo_root / cfg["tickets_dir"]
     lock_statuses: list[str] = cfg.get(
@@ -53,9 +55,12 @@ def claim_files(
         # Find the target ticket again with fresh data.
         fresh_target = None
         for t in fresh_tickets:
-            if canonical_id(t.get("id", "")) == target_id:
-                fresh_target = t
-                break
+            try:
+                if canonical_id(t.get("id", "")) == target_id:
+                    fresh_target = t
+                    break
+            except ValueError:
+                continue
 
         if fresh_target is None:
             return False, f"ticket {target_id} not found in {tickets_dir}"
@@ -63,7 +68,11 @@ def claim_files(
         # Check every requested path before modifying the ticket, so a conflict
         # cannot leave a multi-file claim only partly applied.
         for t in fresh_tickets:
-            if canonical_id(t.get("id", "")) == target_id:
+            try:
+                is_self = canonical_id(t.get("id", "")) == target_id
+            except ValueError:
+                is_self = False
+            if is_self:
                 continue  # skip our own ticket
             if t.get("status") in lock_statuses:
                 locked_touches = t.get("touches") or []
@@ -96,6 +105,7 @@ def claim_files(
                 [
                     "git",
                     "commit",
+                    "-s",
                     "--only",
                     str(ticket_path),
                     "-m",

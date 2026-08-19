@@ -17,17 +17,39 @@ Coverage:
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from lanegate.executor import build_implement_prompt
 from lanegate.prompts import (
+    _bounded_doc_excerpt,
+    _scope_doc_to_relevant_paths,
     build_prompt,
-    get_bounded_architecture_excerpt,
+    get_bounded_shared_notes,
     load_project_guidance,
     load_prompt_template,
     render_prompt,
     truncate_to_budget,
 )
 from lanegate.reviewer import build_review_prompt
+
+
+@pytest.fixture(autouse=True)
+def fixture_project_root(tmp_path, monkeypatch):
+    """Keep default prompt roots out of the developer's real checkout."""
+    monkeypatch.chdir(tmp_path)
+
+
+def test_default_prompt_root_is_fixture_root(tmp_path):
+    """A default-root prompt resolves a fixture template, never the checkout."""
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "implement.md").write_text("FIXTURE IMPLEMENT TEMPLATE")
+    prompt = build_implement_prompt(
+        {"id": "TICK-ROOT", "title": "Fixture", "touches": [], "close_criteria": "", "_body": ""}
+    )
+    assert "FIXTURE IMPLEMENT TEMPLATE" in prompt
 
 
 class TestTruncateToBudget:
@@ -39,10 +61,10 @@ class TestTruncateToBudget:
         assert truncated is True
         assert len(text.encode("utf-8")) <= 11
 
-    def test_get_bounded_architecture_excerpt_still_truncates_via_helper(self, tmp_path):
+    def test_bounded_doc_excerpt_still_truncates_via_helper(self, tmp_path):
         (tmp_path / "docs").mkdir()
         (tmp_path / "docs" / "ARCHITECTURE.md").write_text("x" * 100)
-        excerpt, component = get_bounded_architecture_excerpt(tmp_path, ["src/x.py"], budget_bytes=20)
+        excerpt, component = _bounded_doc_excerpt(tmp_path, "docs/ARCHITECTURE.md", ["src/x.py"], budget_bytes=20)
         assert len(excerpt.encode("utf-8")) <= 20
         assert component.reason.endswith("-truncated")
 
@@ -172,6 +194,27 @@ class TestBuildImplementPrompt:
         instruction_layer = prompt[:untrusted_start]
         assert "TICK-099" not in instruction_layer
 
+    def test_implementation_keeps_worktree_template_and_guidance(self, tmp_path):
+        """TICK-211 only pins trusted review/fix/drift inputs to control.
+
+        Implementation intentionally runs against the branch it is changing,
+        so a self-hosting continuation must see its updated implement template
+        and project guidance rather than the control checkout's stale copies.
+        """
+        control_root = tmp_path / "repo"
+        worktree = control_root / ".lanegate" / "worktrees" / "tick-099"
+        prompts_dir = worktree / "prompts"
+        prompts_dir.mkdir(parents=True)
+        (prompts_dir / "implement.md").write_text("WORKTREE IMPLEMENT TEMPLATE")
+        (worktree / "AGENTS.md").write_text("WORKTREE IMPLEMENT GUIDANCE")
+
+        prompt = build_implement_prompt(
+            self._make_ticket(), project_root=worktree, cfg={"project_guidance": {}}
+        )
+
+        assert "WORKTREE IMPLEMENT TEMPLATE" in prompt
+        assert "WORKTREE IMPLEMENT GUIDANCE" in prompt
+
     def test_title_inside_untrusted_block(self):
         ticket = self._make_ticket(title="Add feature X")
         prompt = build_implement_prompt(ticket)
@@ -238,6 +281,15 @@ class TestBuildImplementPrompt:
         ticket = self._make_ticket()
         assert isinstance(build_implement_prompt(ticket), str)
 
+    def test_durable_notes_guidance_is_included(self):
+        prompt = build_implement_prompt(self._make_ticket())
+
+        assert "## Durable notes" in prompt
+        assert ".lanegate/notes/global.md" in prompt
+        assert "Append a dated/provenance-labelled block" in prompt
+        assert "five factual blocks and roughly" in prompt
+        assert "Do not add summaries discoverable directly from the code" in prompt
+
     def test_file_skeletons_in_trusted_layer(self):
         """Legacy inline file skeletons still appear before untrusted-data."""
         ticket = self._make_ticket(
@@ -259,7 +311,7 @@ class TestBuildImplementPrompt:
             file_skeletons_summary={"files": 1, "bytes": sidecar.stat().st_size},
         )
 
-        prompt = build_implement_prompt(ticket, project_root=tmp_path)
+        prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
         untrusted_start = prompt.index("<untrusted-data>")
         instruction_layer = prompt[:untrusted_start]
@@ -319,7 +371,7 @@ class TestBuildImplementPrompt:
         (tmp_path / "AGENTS.md").write_text("Use pytest and keep functions small.")
         ticket = self._make_ticket()
 
-        prompt = build_implement_prompt(ticket, project_root=tmp_path)
+        prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
         untrusted_start = prompt.index("<untrusted-data>")
         instruction_layer = prompt[:untrusted_start]
@@ -480,6 +532,15 @@ class TestBuildReviewPrompt:
         ticket = self._make_ticket()
         assert isinstance(build_review_prompt(ticket), str)
 
+    def test_durable_notes_guidance_is_included(self, tmp_path):
+        prompt = build_review_prompt(self._make_ticket(), project_root=tmp_path)
+
+        assert "## Durable notes" in prompt
+        assert ".lanegate/notes/global.md" in prompt
+        assert "Append a dated/provenance-labelled block" in prompt
+        assert "five factual blocks and roughly" in prompt
+        assert "Do not record summaries that are" in prompt
+
     def test_no_findings_when_review_findings_absent(self):
         """When review_findings is absent, no checklist is injected."""
         ticket = self._make_ticket()
@@ -516,6 +577,53 @@ class TestBuildReviewPrompt:
         prompt = build_review_prompt(ticket)
         assert "confirm each is resolved" in prompt
         assert "changes_requested" in prompt
+
+    def test_finding_discipline_requires_repro_for_correctness_and_verification_gap(self, tmp_path):
+        """Correctness/verification-gap findings must be backed by an executed repro."""
+        ticket = self._make_ticket()
+        prompt = build_review_prompt(ticket, project_root=tmp_path)
+        untrusted_start = prompt.index("<untrusted-data>")
+        instruction_layer = prompt[:untrusted_start]
+        assert "construct and execute a minimal repro" in instruction_layer
+        assert "unverified by execution" in instruction_layer
+
+    def test_project_local_review_override_has_repro_instruction(self):
+        """This repo's own prompts/review.md override must carry the same
+        repro-first instruction as the packaged default (TICK-529: the
+        override resolves first via load_prompt_template(), so a paragraph
+        added only to the packaged default never reaches this project's own
+        reviews). Reads the file directly rather than through
+        build_review_prompt: project_root resolution deliberately redirects
+        a worktree path back to the control checkout root (TICK-211), so
+        exercising that path from inside a worktree would test the wrong
+        file for reasons unrelated to this regression."""
+        override_path = Path(__file__).parents[1] / "prompts" / "review.md"
+        text = override_path.read_text(encoding="utf-8")
+        assert "construct and execute a minimal repro" in text
+        assert "unverified by execution" in text
+
+    def test_finding_discipline_warns_against_bare_git_stash(self, tmp_path):
+        """TICK-626: reviewers must not use a bare `git stash`/`git stash
+        pop` to revert code for a repro — stash is a repo-wide ref stack
+        shared across every worktree of the clone, so popping can silently
+        apply an unrelated concurrent session's changes (TICK-624 incident).
+        """
+        ticket = self._make_ticket()
+        prompt = build_review_prompt(ticket, project_root=tmp_path)
+        untrusted_start = prompt.index("<untrusted-data>")
+        instruction_layer = prompt[:untrusted_start]
+        assert "do not use a bare `git stash`" in instruction_layer.lower()
+
+    def test_project_local_review_override_warns_against_bare_git_stash(self):
+        """This repo's own prompts/review.md override must carry the same
+        anti-stash guidance as the packaged default (TICK-626), for the
+        same reason TICK-529 required the repro-first instruction in both
+        files: the override resolves first via load_prompt_template(), so
+        a paragraph added only to the packaged default never reaches this
+        project's own reviews."""
+        override_path = Path(__file__).parents[1] / "prompts" / "review.md"
+        text = override_path.read_text(encoding="utf-8")
+        assert "do not use a bare `git stash`" in text.lower()
 
     def test_project_guidance_in_trusted_layer(self, tmp_path):
         (tmp_path / "CONTRIBUTING.md").write_text("Reviewers require regression tests.")
@@ -685,6 +793,17 @@ class TestBuildFixPrompt:
 
         ticket = self._make_ticket()
         assert isinstance(build_fix_prompt(ticket, diff="d", findings="f"), str)
+
+    def test_durable_notes_guidance_is_included(self):
+        from lanegate.reviewer import build_fix_prompt
+
+        prompt = build_fix_prompt(self._make_ticket(), diff="d", findings="f")
+
+        assert "## Durable notes" in prompt
+        assert ".lanegate/notes/global.md" in prompt
+        assert "Append a dated/provenance-labelled block" in prompt
+        assert "five factual blocks and roughly" in prompt
+        assert "Do not write summaries discoverable" in prompt
 
     def test_project_override_template_used(self, tmp_path):
         from lanegate.reviewer import build_fix_prompt
@@ -892,6 +1011,21 @@ class TestLoadPromptTemplate:
         assert isinstance(template, str)
         assert len(template) > 0
 
+    def test_builtin_templates_mandate_symbols(self, tmp_path):
+        """analyze/implement templates require `lanegate symbols` before raw file reads.
+
+        analyze.md must stay language-neutral (see
+        test_analyze_template_language_neutral), so only implement.md's rule
+        is checked against the ".py" example explicitly.
+        """
+        for step in ("analyze", "implement"):
+            template = load_prompt_template(step, tmp_path)
+            assert "lanegate symbols" in template
+            assert "must" in template.lower()
+
+        implement_template = load_prompt_template("implement", tmp_path)
+        assert ".py" in implement_template
+
     def test_builtin_review_loads(self, tmp_path):
         """Built-in review template loads without error and mentions verdict."""
         template = load_prompt_template("review", tmp_path)
@@ -1037,6 +1171,68 @@ class TestLoadProjectGuidance:
         assert "Use pytest." in result
         assert "Require tests for all changes." in result
 
+    def test_load_project_guidance_skips_architecture_doc(self, tmp_path):
+        """Verify docs/ARCHITECTURE.md is excluded from project guidance when present in project_guidance.files."""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        arch_file = docs_dir / "ARCHITECTURE.md"
+        arch_file.write_text("## Architecture Reference\nSystem architecture guidelines.")
+        agents_file = tmp_path / "AGENTS.md"
+        agents_file.write_text("General coding guidelines for agents.")
+
+        cfg = {
+            "reference_docs": ["docs/ARCHITECTURE.md"],
+            "project_guidance": {
+                "include_defaults": False,
+                "files": ["docs/ARCHITECTURE.md", "AGENTS.md"],
+            },
+        }
+
+        guidance = load_project_guidance(tmp_path, cfg)
+        assert "AGENTS.md" in guidance
+        assert "General coding guidelines for agents." in guidance
+        assert "ARCHITECTURE.md" not in guidance
+        assert "System architecture guidelines." not in guidance
+
+        # Verify prompt builders (implement, review, fix, analyze) include docs/ARCHITECTURE.md at most once
+        ticket = {
+            "id": "TICK-100",
+            "title": "Test Ticket",
+            "touches": ["src/main.py"],
+            "close_criteria": "Passes tests",
+            "_body": "Ticket body description mentioning main.py",
+        }
+        (tmp_path / "src").mkdir(exist_ok=True)
+        (tmp_path / "src" / "main.py").write_text("def main(): pass")
+
+        # 1. implement prompt
+        from lanegate.executor import build_implement_prompt
+        impl_prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg=cfg)
+        assert impl_prompt.count("### docs/ARCHITECTURE.md") == 1
+
+        # 2. review prompt
+        from lanegate.reviewer import build_review_prompt
+        rev_prompt = build_review_prompt(ticket, project_root=tmp_path, cfg=cfg)
+        assert rev_prompt.count("### docs/ARCHITECTURE.md") == 1
+
+        # 3. fix prompt
+        from lanegate.reviewer import build_fix_prompt
+        fix_prompt = build_fix_prompt(ticket, diff="diff", findings="findings", project_root=tmp_path, cfg=cfg)
+        assert fix_prompt.count("### docs/ARCHITECTURE.md") == 1
+
+        # 4. analyze prompt
+        from lanegate.analyze import _build_prompt
+        analyze_prompt = _build_prompt(ticket, tmp_path, cfg=cfg)
+        assert analyze_prompt.count("### docs/ARCHITECTURE.md") == 1
+
+        # 5. drift check prompt
+        from lanegate.reviewer import build_drift_check_prompt
+        drift_prompt = build_drift_check_prompt(
+            ticket, original_diff="diff1", fix_diff="diff2", findings="findings", project_root=tmp_path, cfg=cfg
+        )
+        assert drift_prompt.count("### docs/ARCHITECTURE.md") == 1
+
+
 
 # ---------------------------------------------------------------------------
 # TICK-306: bounded payload budgeting -- architecture doc no longer
@@ -1064,15 +1260,64 @@ def _write_large_arch_doc(tmp_path, *, name: str = "ARCHITECTURE.md") -> None:
     (docs / name).write_text(_LARGE_ARCH_DOC)
 
 
+class TestReferenceDocsAreOptIn:
+    """TICK-414: LaneGate must not guess a project's doc filenames."""
+
+    def test_unconfigured_project_gets_no_reference_doc(self, tmp_path):
+        from lanegate.prompts import get_bounded_reference_excerpts
+
+        _write_large_arch_doc(tmp_path)  # docs/ARCHITECTURE.md exists on disk
+
+        excerpt, components = get_bounded_reference_excerpts(
+            tmp_path, ["lanegate/orchestrate.py"], step="implement"
+        )
+
+        assert excerpt == ""
+        assert components == []
+
+    def test_configured_doc_is_injected_under_its_own_name(self, tmp_path):
+        from lanegate.prompts import get_bounded_reference_excerpts
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "DESIGN.md").write_text(_LARGE_ARCH_DOC)
+
+        excerpt, components = get_bounded_reference_excerpts(
+            tmp_path, ["lanegate/orchestrate.py"], step="implement",
+            cfg={"reference_docs": ["docs/DESIGN.md"]},
+        )
+
+        assert "Orchestration Loop" in excerpt
+        assert [c.label for c in components] == ["reference-excerpt:docs/DESIGN.md"]
+
+    def test_step_budget_is_shared_across_multiple_docs(self, tmp_path):
+        from lanegate.prompts import get_bounded_reference_excerpts
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "DESIGN.md").write_text(_LARGE_ARCH_DOC)
+        (docs / "ARCHITECTURE.md").write_text(_LARGE_ARCH_DOC)
+
+        excerpt, components = get_bounded_reference_excerpts(
+            tmp_path, ["lanegate/orchestrate.py"], step="implement",
+            cfg={"reference_docs": ["docs/DESIGN.md", "docs/ARCHITECTURE.md"]},
+            budget_bytes=400,
+        )
+
+        # A second reference doc must not silently double the payload.
+        assert len(excerpt.encode("utf-8")) <= 400
+        assert len(components) == 2
+
+
 class TestBoundedArchitectureExcerpt:
     def test_architecture_not_unconditional_on_unrelated_ticket(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         _write_large_arch_doc(tmp_path)
         assert len(_LARGE_ARCH_DOC.encode("utf-8")) > 2000  # sanity: doc is "large"
 
-        excerpt, component = get_bounded_architecture_excerpt(
-            tmp_path, ["src/unrelated_widget.py"], step="implement"
+        excerpt, component = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["src/unrelated_widget.py"], step="implement"
         )
 
         assert excerpt == ""
@@ -1082,23 +1327,23 @@ class TestBoundedArchitectureExcerpt:
         assert "Unrelated section about promote.py" not in excerpt
 
     def test_architecture_not_unconditional_when_no_touches_declared(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         _write_large_arch_doc(tmp_path)
 
-        excerpt, component = get_bounded_architecture_excerpt(tmp_path, [], step="implement")
+        excerpt, component = _bounded_doc_excerpt(tmp_path, "docs/ARCHITECTURE.md", [], step="implement")
 
         assert excerpt == ""
         assert component.injected is False
         assert "Orchestration Loop" not in excerpt
 
     def test_bounded_architecture_excerpt_on_relevant_ticket(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         _write_large_arch_doc(tmp_path)
 
-        excerpt, component = get_bounded_architecture_excerpt(
-            tmp_path, ["lanegate/orchestrate.py"], step="implement"
+        excerpt, component = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["lanegate/orchestrate.py"], step="implement"
         )
 
         assert "Orchestration Loop" in excerpt
@@ -1113,38 +1358,38 @@ class TestBoundedArchitectureExcerpt:
         assert component.source == "docs/ARCHITECTURE.md"
 
     def test_accounting_is_deterministic_across_calls(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         _write_large_arch_doc(tmp_path)
 
-        excerpt1, component1 = get_bounded_architecture_excerpt(
-            tmp_path, ["lanegate/orchestrate.py"], step="implement"
+        excerpt1, component1 = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["lanegate/orchestrate.py"], step="implement"
         )
-        excerpt2, component2 = get_bounded_architecture_excerpt(
-            tmp_path, ["lanegate/orchestrate.py"], step="implement"
+        excerpt2, component2 = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["lanegate/orchestrate.py"], step="implement"
         )
 
         assert excerpt1 == excerpt2
         assert component1.as_dict() == component2.as_dict()
 
     def test_compact_doc_included_whole_as_standards_summary(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         docs = tmp_path / "docs"
         docs.mkdir()
         (docs / "ARCHITECTURE.md").write_text("# Standards\n\nKeep functions small.")
 
-        excerpt, component = get_bounded_architecture_excerpt(tmp_path, [], step="implement")
+        excerpt, component = _bounded_doc_excerpt(tmp_path, "docs/ARCHITECTURE.md", [], step="implement")
 
         assert "Keep functions small." in excerpt
         assert component.reason == "compact-standards-summary"
         assert component.injected is True
 
     def test_missing_doc_returns_empty_and_labelled(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
-        excerpt, component = get_bounded_architecture_excerpt(
-            tmp_path, ["lanegate/orchestrate.py"], step="implement"
+        excerpt, component = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["lanegate/orchestrate.py"], step="implement"
         )
 
         assert excerpt == ""
@@ -1152,12 +1397,12 @@ class TestBoundedArchitectureExcerpt:
         assert component.reason == "missing"
 
     def test_budget_truncates_and_labels_excerpt(self, tmp_path):
-        from lanegate.prompts import get_bounded_architecture_excerpt
+        from lanegate.prompts import _bounded_doc_excerpt
 
         _write_large_arch_doc(tmp_path)
 
-        excerpt, component = get_bounded_architecture_excerpt(
-            tmp_path, ["lanegate/orchestrate.py"], step="implement", budget_bytes=50
+        excerpt, component = _bounded_doc_excerpt(
+            tmp_path, "docs/ARCHITECTURE.md", ["lanegate/orchestrate.py"], step="implement", budget_bytes=50
         )
 
         assert len(excerpt.encode("utf-8")) <= 50
@@ -1196,7 +1441,7 @@ class TestBoundedArchitectureExcerpt:
             "_body": "Change the loop.",
         }
 
-        prompt = build_implement_prompt(ticket, project_root=tmp_path)
+        prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
         untrusted_start = prompt.index("<untrusted-data>")
         instruction_layer = prompt[:untrusted_start]
@@ -1367,6 +1612,19 @@ class TestRenderPrompt:
         assert "Test ticket" in result
         assert "{{ " not in result  # all placeholders replaced
 
+    def test_analyze_template_language_neutral(self, tmp_path):
+        """analyze.md must not steer analysis toward Python-only projects.
+
+        lanegate's own skeleton support spans Go, JS/JSX, TS/TSX, Rust, Java,
+        Ruby, C/C++, and Python, so the illustrative paths, test-selection
+        syntax, and package-structure examples in the prompt text must not be
+        hardcoded to Python/pytest.
+        """
+        template = load_prompt_template("analyze", tmp_path)
+        assert ".py" not in template
+        assert "pytest" not in template
+        assert "::" not in template
+
 
 def test_discover_project_guidance_omits_claude_md_for_non_claude_executor(tmp_path):
     from lanegate.prompts import discover_project_guidance
@@ -1381,3 +1639,275 @@ def test_discover_project_guidance_omits_claude_md_for_non_claude_executor(tmp_p
     guidance_claude = discover_project_guidance(tmp_path, executor="claude")
     assert "AGENTS_STANDARDS_CONTENT" in guidance_claude
     assert "CLAUDE_VENDOR_CONTENT" in guidance_claude
+
+
+class TestDiscoveryGuidanceIsOptIn:
+    """TICK-411: the prompt must not push agents toward repo-wide grep."""
+
+    def test_unconfigured_project_names_no_tool(self):
+        from lanegate.prompts import render_discovery_guidance
+
+        text = render_discovery_guidance({})
+        assert "graphify" not in text
+        # LaneGate's own AST lookup is always offered; no third party required.
+        assert "lanegate symbols" in text
+        # Raw search still offered, but explicitly as the last and dearest option.
+        assert "grep" in text
+        assert "most expensive option" in text
+
+    def test_declared_tool_is_ranked_above_raw_search(self):
+        from lanegate.prompts import render_discovery_guidance
+
+        text = render_discovery_guidance(
+            {"code_intel": {"command": "mytool query", "description": "a symbol index"}}
+        )
+        assert text.index("mytool query") < text.index("grep")
+        assert "a symbol index" in text
+        # A declared third-party tool ranks below the built-in, never above it.
+        assert text.index("lanegate symbols") < text.index("mytool query")
+
+    def test_bare_string_command_is_accepted(self):
+        from lanegate.prompts import resolve_code_intel
+
+        assert resolve_code_intel({"code_intel": "ctags -R"})["command"] == "ctags -R"
+
+    def test_blank_or_malformed_config_is_ignored(self):
+        from lanegate.prompts import resolve_code_intel
+
+        for bad in ({}, {"code_intel": ""}, {"code_intel": {"command": "  "}},
+                    {"code_intel": []}, {"code_intel": None}):
+            assert resolve_code_intel(bad) is None
+
+    def test_guidance_points_at_skeletons_only_when_present(self):
+        from lanegate.prompts import render_discovery_guidance
+
+        with_skels = render_discovery_guidance({}, has_skeletons=True)
+        without = render_discovery_guidance({}, has_skeletons=False)
+        assert "FILE SKELETONS" in with_skels
+        # Promising structure a prompt does not contain is worse than silence.
+        assert "FILE SKELETONS" not in without
+
+    def test_sidecar_skeletons_point_at_symbols_not_grep(self):
+        from lanegate.prompts import render_discovery_guidance
+
+        text = render_discovery_guidance(
+            {}, has_skeletons=False, skeletons_ref=".lanegate/context/TICK-1/file_skeletons.json"
+        )
+        # Nothing is actually inlined in this mode -- must not claim otherwise.
+        assert "FILE SKELETONS" not in text
+        assert ".lanegate/context/TICK-1/file_skeletons.json" in text
+        assert "lanegate symbols" in text
+        # The sidecar path must not tell the agent to fall back to grep/reads
+        # ahead of `lanegate symbols` -- that was the TICK-413 bug.
+        assert text.index("lanegate symbols") < text.index("grep")
+
+
+def test_scope_doc_word_boundaries():
+    doc_text = (
+        "## Section 1: Rapid therapist client click\n"
+        "This section describes rapid therapy and client click handling.\n\n"
+        "## Section 2: Public API\n"
+        "This section describes the api endpoints.\n\n"
+        "## Section 3: Configuration\n"
+        "This section documents the .lanegate.yml configuration file."
+    )
+    # Short stem 'api' must not match 'rapid' or 'therapist' in prose
+    excerpt, matched = _scope_doc_to_relevant_paths(doc_text, ["lanegate/api.py"])
+    assert matched == ["Section 2: Public API"]
+    assert "Rapid therapist" not in excerpt
+    assert "api endpoints" in excerpt
+
+    # Short stem 'cli' must not match 'client' or 'click' in prose
+    excerpt_cli, matched_cli = _scope_doc_to_relevant_paths(doc_text, ["lanegate/cli.py"])
+    assert matched_cli == []
+    assert excerpt_cli == ""
+
+    # Dot-leading file path .lanegate.yml must match section mentioning it
+    excerpt_dot, matched_dot = _scope_doc_to_relevant_paths(doc_text, [".lanegate.yml"])
+    assert matched_dot == ["Section 3: Configuration"]
+    assert ".lanegate.yml" in excerpt_dot
+
+
+def test_canonical_note_filename_dotfiles():
+    from lanegate.prompts import canonical_note_filename
+
+    assert canonical_note_filename("lanegate/worktree.py") == "v2/lanegate_sworktree.py.md"
+    assert canonical_note_filename("./lanegate/worktree.py") == "v2/lanegate_sworktree.py.md"
+    assert canonical_note_filename(".gitignore") == "v2/.gitignore.md"
+    assert canonical_note_filename("./.gitignore") == "v2/.gitignore.md"
+    assert canonical_note_filename(".env") == "v2/.env.md"
+    assert canonical_note_filename("./.env") == "v2/.env.md"
+    assert canonical_note_filename("src/.gitignore") == "v2/src_s.gitignore.md"
+    assert canonical_note_filename("./src/.gitignore") == "v2/src_s.gitignore.md"
+
+
+def test_canonical_note_filename_is_injective_with_adjacent_separators():
+    from lanegate.prompts import canonical_note_filename
+
+    assert canonical_note_filename("a/b.py") != canonical_note_filename("a_b.py")
+    assert canonical_note_filename("a_/b.py") != canonical_note_filename("a/_b.py")
+
+
+def test_durable_note_writers_define_ordered_legacy_migration():
+    """All note-writing instructions must match the reader's v2 contract."""
+    root = Path(__file__).parents[1]
+    writer_instructions = (
+        "lanegate/templates/prompts/implement.md",
+        "lanegate/templates/prompts/fix.md",
+        "lanegate/templates/prompts/review.md",
+        "lanegate/skills/implement.md",
+    )
+
+    for relative_path in writer_instructions:
+        text = (root / relative_path).read_text(encoding="utf-8")
+        normalized = " ".join(text.lower().split())
+        assert "in this order" in normalized
+        assert "src/foo_bar.py" in text
+        assert "v2/src_sfoo_ubar.py.md" in text
+        assert "verify the legacy flat name is unambiguous" in normalized
+        assert "no other tracked repository path" in normalized
+        assert "preserve it unchanged" in normalized
+        assert "do not create a competing correction" in normalized
+        assert "only then fold" in normalized
+        assert "remove" in normalized
+
+
+def test_get_bounded_shared_notes_reads_legacy_flat_filename(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "src_foo_bar.py.md").write_text("legacy note")
+
+    assert "legacy note" in get_bounded_shared_notes(tmp_path, ["src/foo_bar.py"])
+
+
+def test_get_bounded_shared_notes_reads_duplicate_legacy_name_once(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "src_foo.py.md").write_text("legacy note")
+
+    notes = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+
+    assert notes.count("legacy note") == 1
+
+
+def test_shared_notes_do_not_misassign_ambiguous_legacy_flat_note(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "a_b.py.md").write_text("legacy fact with unknown ownership")
+
+    notes = get_bounded_shared_notes(tmp_path, ["a/b.py", "a_b.py"])
+
+    assert "legacy fact with unknown ownership" not in notes
+    assert "### Legacy note migration conflict: a_b.py.md" in notes
+    assert "`a/b.py`" in notes
+    assert "`a_b.py`" in notes
+
+
+def test_shared_notes_fail_closed_when_git_owner_discovery_fails(tmp_path, monkeypatch):
+    import subprocess
+
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    (notes_root / "a_b.py.md").write_text("legacy fact with unknown ownership")
+
+    def git_unavailable(*_args, **_kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(subprocess, "run", git_unavailable)
+
+    notes = get_bounded_shared_notes(tmp_path, ["a/b.py"])
+
+    assert "legacy fact with unknown ownership" not in notes
+    assert "### Legacy note migration conflict: a_b.py.md" in notes
+    assert "Git discovery failed" in notes
+
+
+def test_shared_notes_accept_text_git_ls_files_output(tmp_path, monkeypatch):
+    import subprocess
+
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "src_foo.py.md").write_text("legacy fact")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="src/foo.py\0"),
+    )
+
+    notes = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+
+    assert "legacy fact" in notes
+
+
+def test_shared_notes_keep_canonical_and_legacy_namespaces_separate(tmp_path):
+    from lanegate.prompts import canonical_note_filename, get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    canonical = notes_root / canonical_note_filename("a/b.py")
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("canonical a/b note")
+    # This is the legacy flat name for a distinct path, a_sb.py. It must not
+    # be mistaken for the canonical note for a/b.py.
+    (notes_root / "a_sb.py.md").write_text("legacy a_sb note")
+
+    notes = get_bounded_shared_notes(tmp_path, ["a/b.py", "a_sb.py"])
+    assert "### a/b.py\ncanonical a/b note" in notes
+    assert "### a_sb.py\nlegacy a_sb note" in notes
+
+
+def test_shared_notes_preserve_canonical_and_legacy_facts_during_migration(tmp_path):
+    from lanegate.prompts import canonical_note_filename, get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    canonical = notes_root / canonical_note_filename("src/foo_bar.py")
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("new durable fact")
+    (notes_root / "src_foo_bar.py.md").write_text("legacy durable fact")
+
+    notes = get_bounded_shared_notes(tmp_path, ["src/foo_bar.py"])
+    assert "new durable fact" in notes
+    assert "legacy durable fact" in notes
+
+
+def test_get_bounded_shared_notes_dotfiles(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / ".gitignore.md").write_text("ignore rules note")
+
+    res = get_bounded_shared_notes(tmp_path, [".gitignore"])
+    assert "ignore rules note" in res
+    assert ".gitignore" in res
+
+
+def test_shared_notes_are_bounded_and_injected_once_in_analyze_and_implement_prompts(tmp_path):
+    from lanegate.analyze import _build_prompt
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "global.md").write_text("g" * 5000)
+    (notes_root / "src_module.py.md").write_text("file-specific note")
+    cfg = {"payload_budgets": {"analyze": 10000, "implement": 10000}}
+    ticket = {
+        "id": "TICK-999", "title": "Shared notes", "touches": ["src/module.py"],
+        "close_criteria": "ok", "_body": "",
+    }
+
+    shared_notes = get_bounded_shared_notes(tmp_path, ticket["touches"], cfg=cfg)
+    assert len(shared_notes.encode("utf-8")) <= 4000
+    analyze_prompt = _build_prompt(ticket, tmp_path, cfg=cfg)
+    implement_prompt = build_implement_prompt(ticket, tmp_path, cfg=cfg)
+    assert analyze_prompt.count("## Shared Project Notes") == 1
+    assert implement_prompt.count("## Shared Project Notes") == 1

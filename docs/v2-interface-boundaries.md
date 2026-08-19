@@ -50,7 +50,7 @@ Do not rewrite the core merely because a future surface is not a terminal. Defin
 
 ## Language and Runtime Comparison
 
-TICK-118 asked for a runtime spike comparing TypeScript+Bun, Go, Rust, and Python for likely V2 layers. It was explicitly framed as "a decision aid, not a rewrite ticket." Here is that comparison applied per layer, rather than to LaneGate as a whole:
+A runtime spike was requested comparing TypeScript+Bun, Go, Rust, and Python for likely V2 layers. It was explicitly framed as "a decision aid, not a rewrite ticket." Here is that comparison applied per layer, rather than to LaneGate as a whole:
 
 | Layer | Python | TypeScript+Bun | Go | Rust |
 |---|---|---|---|---|
@@ -75,15 +75,15 @@ POST /api/tickets/{id}/start
 POST /api/tickets/{id}/complete
 POST /api/tickets/{id}/review
 POST /api/tickets/{id}/merge
-POST /api/orchestrate/start
-POST /api/orchestrate/stop
+POST /api/runs/start
+POST /api/runs/stop
 GET  /api/runs/current
 GET  /api/runs/current/logs/stream
 ```
 
 The API can shell out to the CLI for rare fallback operations during early development, but core flows should share Python functions with the CLI. The API must return structured status, errors, paths, ticket metadata, and log cursors instead of asking callers to scrape human-oriented command output.
 
-### TICK-107 Local API Design
+### Local API Design
 
 Recommended first backend: a small Python HTTP server that lives inside the existing package and binds to `127.0.0.1` by default. FastAPI is a reasonable choice once the endpoint set grows because it gives typed request/response models, OpenAPI output, streaming support, and easier frontend integration. The first slice can still keep the domain logic dependency-free by putting reusable service functions under the Python core and having both CLI and API call those functions.
 
@@ -95,8 +95,24 @@ Safe defaults:
 - return file paths relative to the repo root unless an absolute path is needed
   to open a local worktree
 - do not expose a remote network API, account system, or cloud state in V1.5
-- include a per-server local token or browser session secret before exposing
-  mutating actions beyond loopback
+- require a per-server local token for every mutating action, including on
+  loopback
+
+#### Local API mutation authentication (F26)
+
+At startup, `lanegate api` creates a cryptographically random token and writes
+it with owner-only permissions to the gitignored
+`.lanegate/api-token-<port>` file. Native local clients that need a mutation
+read that file and send its value in the `X-LaneGate-Token` request header.
+`POST /api/runs/start`, `POST /api/runs/stop`, their
+`/api/orchestrate/*` compatibility aliases, and
+`PUT /api/pools/{name}/executors` reject a missing or mismatched token with
+`401` before reading or parsing the request body.
+
+The token is intentionally neither returned by a read endpoint nor accepted in
+a query string. It is also not a CORS-safelisted header, so an unrelated web
+page cannot add it to a no-CORS simple request. This token is local process
+authentication, not a remote API or account system.
 
 Initial endpoint contract:
 
@@ -105,22 +121,22 @@ Initial endpoint contract:
 | `GET /api/board` | Board grouped by status plus pipeline summary | `{statuses, pipeline, hidden_count, filters}` |
 | `GET /api/tickets` | Flat ticket list for search/filter | `{tickets: [{id, title, status, priority, milestone, touches, depends_on, branch, worktree}]}` |
 | `GET /api/tickets/{id}` | Ticket detail | `{ticket, body, close_criteria, review, files, links}` |
-| `GET /api/blocked` | Changes-requested or blocked queue | `{tickets: [{id, reason, review_verdict, findings}]}` |
+| `GET /api/blocked` | Needs-human-decision queue | `{blocked: [{id, attention_category, attention_summary, findings, branch, diff_cmd}]}` |
 | `GET /api/diff/{id}` | Diff for a ticket branch/worktree | `{id, base, branch, files: [{path, status, patch?}]}` |
 | `POST /api/tickets/{id}/start` | Claim and create/attach worktree | request `{}`, response `{id, status, branch, worktree}` |
 | `POST /api/tickets/{id}/complete` | Move to `code_complete` after scope/safeguard checks | request `{allow_drift?: boolean}`, response `{id, status, warnings}` |
 | `POST /api/tickets/{id}/review` | Record review or invoke review step later | request `{verdict, summary?, findings?}`, response `{id, status, review_verdict}` |
 | `POST /api/tickets/{id}/merge` | Merge ticket branch when allowed | request `{delete_worktree?: boolean}`, response `{id, status, merge_commit?}` |
-| `POST /api/orchestrate/start` | Start one orchestration run | request `{milestone?, max_parallel?, human_review?}`, response `{run_id, status}` |
-| `POST /api/orchestrate/stop` | Request graceful stop/cancel | request `{run_id}`, response `{run_id, status, stop_requested: true}` |
+| `POST /api/runs/start` | Start one LaneGate run | request `{milestone?, max_parallel?, human_review?}`, response `{run_id, status}` |
+| `POST /api/runs/stop` | Request graceful stop/cancel | request `{run_id}`, response `{run_id, status, stop_requested: true}` |
 | `GET /api/runs/current` | Current run state | `{run_id, status, started_at, tickets, workers, last_event_id}` |
 | `GET /api/runs/current/logs/stream` | Live logs/events | SSE events `{id, type, timestamp, ticket_id?, message, data?}` |
 
 The API should prefer structured domain errors over plain text. A failed `start` response should say whether the cause is `locked_touch`, `missing_ticket`, `wrong_status`, `empty_touches`, `remote_behind`, or `worktree_error`. The UI can then show helpful actions instead of guessing from CLI prose.
 
-### TICK-146 Build Result
+### Build Result
 
-TICK-146 implemented a first slice of this design as `lanegate api`, a loopback-only (`127.0.0.1`) HTTP server in `lanegate/api.py`. It has since grown past that first slice. Shipped as of this writing:
+A first slice of this design was implemented as `lanegate api`, a loopback-only (`127.0.0.1`) HTTP server in `lanegate/api.py`. It has since grown past that first slice. Shipped as of this writing:
 
 - `GET /api/board`, `GET /api/tickets`, `GET /api/tickets/{id}`,
   `GET /api/blocked`
@@ -136,7 +152,7 @@ TICK-146 implemented a first slice of this design as `lanegate api`, a loopback-
   `GET /api/runs/current/logs/stream`, `GET /api/runs/{id}`,
   `GET /api/runs/{id}/logs`, `GET /api/runs/{id}/events`
   (plus `GET /api/log` as a legacy alias)
-- `POST /api/orchestrate/start`, `POST /api/orchestrate/stop`
+- `POST /api/runs/start`, `POST /api/runs/stop` (with `/api/orchestrate/*` compatibility aliases)
 
 Not yet built from the original endpoint contract above: the per-ticket lifecycle mutators (`POST /api/tickets/{id}/start|complete|review|merge`). Those remain design-only until a follow-up ticket implements them. The CLI (`lanegate start`/`complete`/`review`/`merge`) is still the only way to drive per-ticket lifecycle transitions. `lanegate ui` (a bundled browser client) has not been built, though the API and the Go TUI (`lanegate tui`, see below) both exist.
 
@@ -170,21 +186,21 @@ Two things are **not** already answered by an existing function and need real ne
   releases the lock. There is no `run_id`, no background/async execution
   model, and no structured event stream. `context_log.py`'s SQLite logging
   records completed agent runs for analytics, not a live run's in-progress
-  state. Supporting `/api/orchestrate/start` (return immediately with a
+  state. Supporting `/api/runs/start` (return immediately with a
   `run_id`), `/api/runs/current` (poll live state), and log streaming means
   building that run-tracking scaffolding from scratch: running orchestrate in
   a background thread or subprocess, giving it an addressable run id, and
   emitting structured events a poller or SSE stream can read incrementally.
   This is the single largest unknown in this design and should probably be
-  its own follow-up ticket rather than an implementation detail of TICK-107.
+  its own follow-up ticket rather than an implementation detail of the API.
 
 Run lifecycle:
 
-1. `POST /api/orchestrate/start` creates a run id and starts the same orchestrator logic used by the CLI.
+1. `POST /api/runs/start` creates a run id and starts the same run logic used by the CLI.
 2. The run writes structured events alongside human-readable logs.
 3. `GET /api/runs/current` returns the current ticket/worker state.
 4. `GET /api/runs/current/logs/stream` streams events with SSE so a browser can reconnect using `Last-Event-ID`.
-5. `POST /api/orchestrate/stop` requests graceful stop first. Hard kill belongs to the optional runner/sandbox layer once that exists.
+5. `POST /api/runs/stop` requests graceful stop first. Hard kill belongs to the optional runner/sandbox layer once that exists.
 
 ## UI Add-on Responsibilities
 
@@ -193,16 +209,16 @@ The UI should start as an add-on over the local API, not as a replacement for th
 - board scanning by status, priority, milestone, dependency, touches, branch, executor, and flags
 - ticket detail views for body, close criteria, review findings, and actions
 - orchestration run views with current workers and streaming logs
-- blocked-ticket and changes-requested queues
+- categorized needs-human-decision queue (escalated, rejected, failed, stuck, awaiting merge), with its count surfaced in shared TUI chrome from Board rows
 - diff views for in-review tickets
 - executor health, quota/cooldown state, and active process visibility
 - memory and prompt/debug artifacts that are hard to inspect from a terminal
 
 A terminal-native Go TUI can share this same Python JSON/SSE boundary as an operator console. The concrete implementation plan, fixture map, launch model, and non-goals are documented in [Go TUI Implementation Plan](tui-plan.md).
 
-### TICK-118 Go TUI Runtime Spike Result
+### Go TUI Runtime Spike Result
 
-TICK-118 validated the Go TUI boundary with a small read-only prototype under `lanegate/tui_spike/` and Python command wiring through `lanegate tui`. The spike renders the existing `lanegate board --json` style payload from a fixture, stdin, or a loopback API response. It does not parse terminal tables, ANSI output, or prose CLI text, and it does not own ticket lifecycle, config, locks, git state, or orchestration policy.
+The Go TUI boundary was validated with a small read-only prototype under `lanegate/tui_spike/` and Python command wiring through `lanegate tui`. The spike renders the existing `lanegate board --json` style payload from a fixture, stdin, or a loopback API response. It does not parse terminal tables, ANSI output, or prose CLI text, and it does not own ticket lifecycle, config, locks, git state, or orchestration policy.
 
 **Since this spike:** the Go TUI (now a top-level `tui/` Go module, not `lanegate/tui_spike/`) has grown well past a single board-payload prototype. It now has board, ticket detail, blocked queue, diff, orchestration-run, and settings screens (`tui/internal/screens/`). It remains mostly read-only against the boundary described below, with one exception: the settings screen can reorder a pool's executor list and persist it via `PUT /api/pools/{name}/executors`. The launch/subprocess/packaging findings below still describe the current `lanegate tui` command shape.
 
@@ -211,7 +227,7 @@ Startup and launch shape:
 - `lanegate tui --fixture <board.json>` launches the Go spike directly against a structured board fixture.
 - `lanegate tui --fixture-dir <dir>` resolves `board.json` or `board/board_basic.json` for fixture-first development.
 - `lanegate tui --api-url http://127.0.0.1:<port>` connects to an existing loopback API and lets Go fetch `/api/board`.
-- Plain `lanegate tui` now starts its own `lanegate api` subprocess on a selected loopback port in the background (`lanegate/tui.py:cmd_tui`), waits for it to answer, then connects the Go renderer to it. The TICK-107 Python API auto-start this section originally described as pending has since landed. `--no-api-start` opts out and requires `--api-url`, `--fixture`, or `--fixture-dir` instead.
+- Plain `lanegate tui` now starts its own `lanegate api` subprocess on a selected loopback port in the background (`lanegate/tui.py:cmd_tui`), waits for it to answer, then connects the Go renderer to it. The Python API auto-start this section originally described as pending has since landed. `--no-api-start` opts out and requires `--api-url`, `--fixture`, or `--fixture-dir` instead.
 
 Subprocess and API lifecycle findings:
 
@@ -239,7 +255,7 @@ Packaging and cross-platform notes:
   `PATH`, then `go run ./cmd/lanegate-tui` against the Go source for
   editable/dev installs. The spike source has since moved from
   `lanegate/tui_spike/` to a top-level `tui/` Go module (`tui/cmd/lanegate-tui`),
-  matching the TICK-133 layout this section originally described as future
+  matching the planned layout this section originally described as future
   work, see [README.md](../README.md#local-api--ui-preview).
 - The Go module ships as repo source, not inside the installed wheel, a
   plain `pip install lanegate` does not provide `lanegate-tui`. Building from a
@@ -261,9 +277,9 @@ Tests:
   `lanegate tui --fixture` argument construction plus Go process failure
   propagation.
 
-TICK-133 alignment:
+Layout alignment:
 
-- The spike follows the TICK-133 plan's fixture-first direction and preserves
+- The spike follows the plan's fixture-first direction and preserves
   Python as the package/control-plane owner.
 - The only adjustment is path shape: this spike uses `lanegate/tui_spike/` rather
   than the full future `tui/cmd/lanegate-tui/internal/...` layout to keep the
@@ -276,7 +292,7 @@ Recommendation:
   that starts or connects to local structured data, then runs a separate Go
   renderer/client.
 - Before a full TUI implementation, stabilize `GET /api/board` as the board
-  contract and add the TICK-107 API startup hook behind the existing Python
+  contract and add the API startup hook behind the existing Python
   port-selection path.
 - V1.5 remains unblocked. The spike confirms the boundary is practical without
   moving lifecycle or orchestration ownership out of Python.
@@ -286,10 +302,10 @@ state, predictable API models, editor support, and the normal ecosystem for
 browser components, routing, charts, streaming logs, and diff viewers. That is
 a UI decision, not a reason to move the control plane out of Python.
 
-### TICK-108 UI MVP Design, superseded 2026-07-07 by TUI-first
+### UI MVP Design, superseded 2026-07-07 by TUI-first
 
 **Decision Update (2026-07-07):** the TypeScript-first recommendation below
-was TICK-108's original 2026-07-04 answer. It was reversed before any
+was the original 2026-07-04 answer. It was reversed before any
 implementation started. The current, approved decision is **TUI-first,
 browser-later**, see "UI Add-on Responsibilities" above and the
 [Go TUI Implementation Plan](tui-plan.md). The reasoning, launch shape, and
@@ -347,8 +363,8 @@ Deferred browser MVP screens (once built, the TUI's own screen map lives in
 |---|---|---|
 | Board | Group tickets by status and scan priority, milestone, dependencies, touches, branch, worktree, executor, and flags. | `GET /api/board`, `GET /api/tickets` |
 | Ticket detail | Inspect frontmatter, body, close criteria, review verdict, branch/worktree links, related logs, and lifecycle actions. | `GET /api/tickets/{id}`, lifecycle `POST /api/tickets/{id}/...` |
-| Blocked/review queue | Triage blocked or changes-requested tickets, checklist findings, drift warnings, and next actions. | `GET /api/blocked`, `GET /api/tickets/{id}` |
-| Orchestration run | See current workers, ticket state, structured events, human-readable logs, and request a graceful stop. | `POST /api/orchestrate/start`, `GET /api/runs/current`, `GET /api/runs/current/logs/stream`, `POST /api/orchestrate/stop` |
+| Needs-human-decision queue | Triage escalated, rejected, failed, stuck, and awaiting-merge tickets by reason category, checklist findings, and next actions. | `GET /api/blocked`, `GET /api/tickets/{id}` |
+| Run | See current workers, ticket state, structured events, human-readable logs, and request a graceful stop. | `POST /api/runs/start`, `GET /api/runs/current`, `GET /api/runs/current/logs/stream`, `POST /api/runs/stop` |
 | Diff view | Review changed files and patches for `code_complete`, `in_review`, and `needs_review` tickets. | `GET /api/diff/{id}` |
 | Settings preview | Read resolved config, executor selection, safeguards, and local paths without editing them. | `GET /api/config` or a later read-only config endpoint |
 
@@ -380,8 +396,8 @@ operations that need flags the UI has not exposed.
 Follow-up implementation tickets can be split without reopening the product
 boundary:
 
-- ~~build `lanegate api` with the TICK-107 loopback JSON/SSE contract~~, done,
-  TICK-146 (see [TICK-146 Build Result](#tick-146-build-result) above, a
+- ~~build `lanegate api` with the loopback JSON/SSE contract~~, done
+  (see [Build Result](#build-result) above, a
   subset of the endpoint contract, not the full design)
 - add `lanegate ui` command wiring, port selection, bundled asset serving, and
   optional browser opening
@@ -397,7 +413,7 @@ boundary:
 concrete security or process-supervision requirement justifies it. The
 contract below is recorded now so that if/when it is built, it fits the
 boundary already established here instead of forcing a redesign of the core,
-API, or UI to accommodate it later. TICK-109 should be treated as a design
+API, or UI to accommodate it later. The runner/sandbox contract should be treated as a design
 reference, not scheduled V1.5 work.
 
 A separate runner is justified only when the process boundary itself becomes
@@ -418,7 +434,7 @@ Do not move ticket parsing, board logic, prompt templates, memory retrieval, or
 ordinary executor routing to Rust without a concrete security, packaging, or
 process-control reason.
 
-### TICK-109 Runner/Sandbox Contract
+### Runner/Sandbox Contract
 
 The initial implementation remains Python. If no runner is configured, LaneGate
 keeps today's executor behavior: the Python orchestrator launches the executor
@@ -601,14 +617,14 @@ trusted surface more than it needs frontend-language ergonomics.
 
 Proposed target-layer updates for existing sandbox and safety tickets:
 
-| Ticket | Proposed target layer | Why |
+| Feature | Proposed target layer | Why |
 |---|---|---|
-| TICK-069 Executor sandbox | Optional runner/sandbox plus Python core config | Policy must be configured in Python, but enforcement belongs at the runner boundary. |
-| TICK-071 Tighten bwrap read profile | Optional runner/sandbox | This is enforcement detail for filesystem visibility. |
-| TICK-079 Network sandbox | Optional runner/sandbox | Network isolation is process/OS policy, not board logic. |
-| TICK-072 Git operation audit | Python core first, runner later if needed | Diff/git audit is currently a core post-executor control. |
-| TICK-077 Scope pinning | Python core | This compares intended scope against resulting diff and prompts. |
-| TICK-078 Ticket content sanitization | Python core | Ticket parsing and prompt safety stay in the control plane. |
+| Executor sandbox | Optional runner/sandbox plus Python core config | Policy must be configured in Python, but enforcement belongs at the runner boundary. |
+| Tighten bwrap read profile | Optional runner/sandbox | This is enforcement detail for filesystem visibility. |
+| Network sandbox | Optional runner/sandbox | Network isolation is process/OS policy, not board logic. |
+| Git operation audit | Python core first, runner later if needed | Diff/git audit is currently a core post-executor control. |
+| Scope pinning | Python core | This compares intended scope against resulting diff and prompts. |
+| Ticket content sanitization | Python core | Ticket parsing and prompt safety stay in the control plane. |
 
 ## Retargeting Older V2 Tickets
 
@@ -633,16 +649,16 @@ explicit. This keeps the backlog from accidentally forcing repeated rewrites as
 LaneGate grows from a terminal-first CLI into a local project control plane with
 an optional UI and, later, a hardened runner.
 
-## TICK-106 Through TICK-109 Review Packet
+## Review Packet
 
 Use this packet for the design discussion before starting the dependent tickets:
 
-| Ticket | Decision to confirm | Confirmed answer |
+| Scope | Decision to confirm | Confirmed answer |
 |---|---|---|
-| TICK-106 | What are the V1.5 layer boundaries? | Python remains the control plane. Local API exposes structured operations. A UI add-on sits over it. A runner remains optional for sandbox/process supervision only. |
-| TICK-107 | What local API should the UI use? | Loopback-only Python API with JSON endpoints and SSE logs, backed by shared core service functions rather than CLI scraping. |
-| TICK-108 | What is the first UI product shape? | **Revised 2026-07-07:** TUI-first, browser-later, a Go terminal console over Python-owned JSON/SSE contracts ships first (see [Go TUI Implementation Plan](tui-plan.md)). The TypeScript frontend (`lanegate ui`) originally proposed here is deferred to a later browser client over the same contracts, not the first UI. |
-| TICK-109 | When does a Rust/Go runner enter, and is it in V1.5 scope? | Out of V1.5 scope, deferred until a concrete security/process-supervision need justifies it. If built: Rust preferred for a security-sensitive process/sandbox boundary, Go a reasonable fallback for pure process supervision. |
+| Layer boundaries | What are the V1.5 layer boundaries? | Python remains the control plane. Local API exposes structured operations. A UI add-on sits over it. A runner remains optional for sandbox/process supervision only. |
+| Local API | What local API should the UI use? | Loopback-only Python API with JSON endpoints and SSE logs, backed by shared core service functions rather than CLI scraping. |
+| UI shape | What is the first UI product shape? | **Revised 2026-07-07:** TUI-first, browser-later, a Go terminal console over Python-owned JSON/SSE contracts ships first (see [Go TUI Implementation Plan](tui-plan.md)). The TypeScript frontend (`lanegate ui`) originally proposed here is deferred to a later browser client over the same contracts, not the first UI. |
+| Runner/Sandbox | When does a Rust/Go runner enter, and is it in V1.5 scope? | Out of V1.5 scope, deferred until a concrete security/process-supervision need justifies it. If built: Rust preferred for a security-sensitive process/sandbox boundary, Go a reasonable fallback for pure process supervision. |
 
-All four answers are settled. TICK-107 through TICK-109 can become detailed
+All four answers are settled. These decisions can become detailed
 docs or implementation tickets without reopening the language/runtime debate.

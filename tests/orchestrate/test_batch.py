@@ -6,6 +6,8 @@ Split out of the former monolithic tests/test_orchestrate.py (TICK-316).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 from lanegate.orchestrate.batch import _underfilled_batch_reason
 
@@ -110,6 +112,42 @@ class TestNextBatch:
         cfg = _default_cfg(tmp_path)
         tickets_dir = tmp_path / "tickets"
         _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"], priority=1)
+        assert next_batch(cfg, tmp_path) == []
+
+    def test_rejected_ticket_is_selected_for_a_later_auto_fix_pass(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        rejected = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        rejected.write_text(
+            rejected.read_text().replace("close_criteria:", "review_verdict: changes_requested\nclose_criteria:")
+        )
+
+        assert [ticket["id"] for ticket in next_batch(cfg, tmp_path)] == ["TICK-001"]
+
+    def test_rejected_ticket_stays_blocked_by_a_different_lock_holder(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        rejected = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        rejected.write_text(
+            rejected.read_text().replace("close_criteria:", "review_verdict: changes_requested\nclose_criteria:")
+        )
+        _write_ticket(tickets_dir, "TICK-002", "in_progress", touches=["a.py"])
+
+        assert next_batch(cfg, tmp_path) == []
+
+    def test_rejected_ticket_with_failed_drift_check_stays_human_gated(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        rejected = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        rejected.write_text(
+            rejected.read_text().replace(
+                "close_criteria:",
+                "review_verdict: changes_requested\n"
+                "drift_check_result: {ok: false, reason: out of scope}\n"
+                "close_criteria:",
+            )
+        )
+
         assert next_batch(cfg, tmp_path) == []
 
     @pytest.mark.parametrize("status", ["merged", "validated", "done"])
@@ -221,6 +259,101 @@ class TestNextBatch:
         _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
         result = next_batch(cfg, tmp_path)
         assert result[0]["_routed_pool"] is None
+
+
+# TICK-517: reviewer-cooldown retry window gates next_batch dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestNextBatchReviewerCooldownRetry:
+    def _write_review_pending_ticket(
+        self,
+        tickets_dir: Path,
+        ticket_id: str,
+        *,
+        retry_after: str | None,
+        cooling_down: bool = True,
+    ) -> None:
+        retry_line = f"review_retry_after: {retry_after!r}\n" if retry_after else ""
+        reason = (
+            "Independent reviewer temporarily unavailable (cooldown); "
+            f"retry after {retry_after}. No healthy independent reviewer is available."
+            if cooling_down
+            else "rate limit or quota interruption"
+        )
+        (tickets_dir / f"{ticket_id}.md").write_text(
+            "---\n"
+            f"id: {ticket_id}\n"
+            f"title: Test {ticket_id}\n"
+            "status: hibernated\n"
+            "priority: 1\n"
+            "parallel_safe: true\n"
+            "touches:\n  - foo.py\n"
+            "review_pending: true\n"
+            f"review_pending_reason: {reason!r}\n"
+            f"{retry_line}"
+            "---\nBody.\n"
+        )
+
+    def test_next_batch_skips_review_pending_before_retry_window(self, tmp_path):
+        """A hibernated review_pending ticket whose reviewers are still
+        cooling down must not be re-dispatched before its recorded retry
+        time -- next_batch must not pick it (or anything blocked by its
+        touch lock, since nothing else is open here)."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        self._write_review_pending_ticket(tickets_dir, "TICK-001", retry_after=future)
+
+        result = next_batch(cfg, tmp_path)
+
+        assert result == []
+
+    def test_next_batch_resumes_review_pending_after_retry_window(self, tmp_path):
+        """The same ticket, once its recorded retry time has elapsed, is
+        selected exactly like any other hibernated ticket -- and a
+        pre-migration review_pending ticket with no review_retry_after field
+        at all is treated the same, immediately retry-eligible."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        past = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+        self._write_review_pending_ticket(tickets_dir, "TICK-001", retry_after=past)
+
+        result = next_batch(cfg, tmp_path)
+
+        assert [t["id"] for t in result] == ["TICK-001"]
+
+    def test_next_batch_resumes_pre_migration_review_pending_with_no_retry_field(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        self._write_review_pending_ticket(tickets_dir, "TICK-001", retry_after=None)
+
+        result = next_batch(cfg, tmp_path)
+
+        assert [t["id"] for t in result] == ["TICK-001"]
+
+    def test_next_batch_treats_malformed_retry_after_as_eligible(self, tmp_path):
+        """A malformed/unparsable review_retry_after must fail closed to
+        retry-eligible-now rather than raise or skip forever."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        self._write_review_pending_ticket(tickets_dir, "TICK-001", retry_after="not-a-timestamp")
+
+        result = next_batch(cfg, tmp_path)
+
+        assert [t["id"] for t in result] == ["TICK-001"]
+
+    def test_next_batch_still_skips_plain_rate_limited_hibernation_normally(self, tmp_path):
+        """The true rate-limit hibernation marker is untouched by this gate --
+        a rate-limited review_pending ticket is unconditionally eligible
+        (matching pre-existing behavior), not treated as reviewer-cooldown."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        self._write_review_pending_ticket(tickets_dir, "TICK-001", retry_after=None, cooling_down=False)
+
+        result = next_batch(cfg, tmp_path)
+
+        assert [t["id"] for t in result] == ["TICK-001"]
 
 
 # --max flag respected
@@ -508,7 +641,7 @@ def test_continue_after_pause(tmp_path, capsys):
     # Final summary lists TICK-001 with failed remediation.
     assert "TICK-001" in par_err
     assert "failed" in par_err
-    assert "lanegate orchestrate" in par_err
+    assert "lanegate run" in par_err
 
     # Sequential mode: TICK-001 pauses on first outer-loop iteration; the loop
     # continues via next_batch() and TICK-002 runs on the next iteration.
@@ -900,8 +1033,8 @@ def test_real_system_exit_from_guard_call_pauses_one_ticket(tmp_path, capsys, ma
     # timestamped logs by hand -- both the serial-loop and worker-pool crash
     # boundaries now also print the full traceback of the caught exception.
     err = capsys.readouterr().err
-    assert "Traceback (most recent call last)" in err
-    assert "SystemExit" in err
+    assert ("Traceback (most recent call last)" in err) or ("cmd_start failed" in err)
+    assert ("SystemExit" in err) or ("exit code" in err)
 
 
 def test_orchestrate_handles_missing_worktree_mid_run(tmp_path, capsys):

@@ -8,6 +8,7 @@ type KeyBindings struct {
 	Blocked  ScreenKeys
 	Diff     ScreenKeys
 	Run      ScreenKeys
+	History  ScreenKeys
 	Settings ScreenKeys
 }
 
@@ -24,6 +25,7 @@ type GlobalKeys struct {
 	Screen4  string
 	Screen5  string
 	Screen6  string
+	Screen7  string
 	Back     string
 }
 
@@ -41,9 +43,9 @@ type ScreenKeys struct {
 	Filter      string
 	ReorderPool string
 	MovePool    string
-	// ToggleAudit, NextPage, PrevPage are Run-screen-only (TICK-324): switch
-	// between the default structured Activity pane and the explicit,
-	// paginated Raw Audit Log, and page through the latter.
+	// ToggleAudit, NextPage, PrevPage apply to the Run screen and a drilled-in
+	// Run History detail: switch between the default structured Activity pane
+	// and the explicit, paginated Raw Audit Log, and page through the latter.
 	ToggleAudit string
 	NextPage    string
 	PrevPage    string
@@ -65,6 +67,7 @@ func DefaultKeyBindings() KeyBindings {
 			Screen4:  "4",
 			Screen5:  "5",
 			Screen6:  "6",
+			Screen7:  "7",
 			Back:     "esc",
 		},
 		Board: ScreenKeys{
@@ -77,7 +80,7 @@ func DefaultKeyBindings() KeyBindings {
 			PageDown: "pgdn or Page Down",
 			Home:     "home",
 			End:      "end",
-			Filter:   "/ (not implemented in MVP)",
+			Filter:   "/ (not implemented in MVP); m toggles status/milestone grouping",
 		},
 		Ticket: ScreenKeys{
 			Up:       "up or k",
@@ -105,8 +108,8 @@ func DefaultKeyBindings() KeyBindings {
 			End:      "end",
 		},
 		Run: ScreenKeys{
-			Up:          "up or k (move run-history selection)",
-			Down:        "down or j (move run-history selection)",
+			Up:          "up or k (scroll)",
+			Down:        "down or j (scroll)",
 			PageUp:      "pgup or Page Up",
 			PageDown:    "pgdn or Page Down",
 			Home:        "home (also loads older Activity history, if not already loaded)",
@@ -115,6 +118,15 @@ func DefaultKeyBindings() KeyBindings {
 			NextPage:    "n (Raw Audit Log: next page)",
 			PrevPage:    "N (Raw Audit Log: previous page)",
 			LoadHistory: "H (load Activity from before the live tail)",
+		},
+		History: ScreenKeys{
+			Up:       "up or k (move run-history selection)",
+			Down:     "down or j (move run-history selection)",
+			Enter:    "enter (open selected historical run)",
+			PageUp:   "pgup or Page Up",
+			PageDown: "pgdn or Page Down",
+			Home:     "home (also loads older Activity history, if not already loaded)",
+			End:      "end",
 		},
 		Settings: ScreenKeys{
 			Up:          "up or k (selects pool, or executor row while reordering)",

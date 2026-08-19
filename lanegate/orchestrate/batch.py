@@ -7,7 +7,34 @@ from pathlib import Path
 
 from lanegate.concurrency import locked_touches, touches_overlap
 from lanegate.config import resolve_ticket_pool
-from lanegate.ticket import attention_summary, load_all_tickets, unresolved_dependencies
+from lanegate.ticket import (
+    attention_summary,
+    classify_needs_review_cause,
+    load_all_tickets,
+    needs_review_recovery_advice,
+    reviewer_cooldown_retry_pending,
+    unresolved_dependencies,
+)
+
+
+def _is_auto_fix_candidate(ticket: dict) -> bool:
+    """Return whether a rejected completed ticket can resume unattended.
+
+    A substantive reviewer rejection preserves the ticket's worktree and
+    keeps its touches locked.  It is therefore a continuation candidate, not
+    a terminal board item: the orchestrator can send the recorded findings
+    back through the normal fix -> drift-check -> re-review cycle on a later
+    run.  ``needs_review`` remains deliberately excluded because that state
+    represents an explicit safety escalation rather than a mechanical retry.
+    """
+    drift = ticket.get("drift_check_result")
+    return (
+        ticket.get("status") == "code_complete"
+        and ticket.get("review_verdict") == "changes_requested"
+        # A failed drift check is an intentional fail-closed human
+        # escalation, not a routine reviewer rejection to redispatch.
+        and not (isinstance(drift, dict) and drift.get("ok") is False)
+    )
 
 
 def next_batch(
@@ -18,7 +45,7 @@ def next_batch(
     exclude_touches: set[str] | None = None,
     ticket_ids: set[str] | None = None,
 ) -> list[dict]:
-    """Return the next parallel-safe batch of unblocked open tickets.
+    """Return the next parallel-safe batch of unblocked work.
 
     Mirrors the logic in board.cmd_next: greedy non-overlapping touches,
     priority-sorted, parallel_safe gate.
@@ -46,7 +73,16 @@ def next_batch(
 
     candidates = []
     for t in tickets:
-        if t.get("status") not in ("open", "hibernated"):
+        resumable_rejection = _is_auto_fix_candidate(t)
+        if t.get("status") not in ("open", "hibernated") and not resumable_rejection:
+            continue
+        if t.get("status") == "open" and not t.get("touches"):
+            continue
+        if (
+            t.get("status") == "hibernated"
+            and t.get("review_pending")
+            and reviewer_cooldown_retry_pending(t)
+        ):
             continue
         if milestone is not None and t.get("milestone") != milestone:
             continue
@@ -54,7 +90,19 @@ def next_batch(
             continue
         if unresolved_dependencies(t.get("depends_on"), status_map):
             continue
-        if touches_overlap(t.get("touches") or [], locked):
+        # A rejected ticket is itself a code_complete lock holder.  Its own
+        # lock must not make it permanently ineligible, while every *other*
+        # holder still blocks the retry exactly as it blocks new work.
+        candidate_locked = locked
+        if resumable_rejection:
+            candidate_locked = set(locked)
+            candidate_locked.difference_update(t.get("touches") or [])
+            for holder in tickets:
+                if holder is t or holder.get("status") not in lock_statuses:
+                    continue
+                if touches_overlap(t.get("touches") or [], holder.get("touches") or []):
+                    candidate_locked.update(holder.get("touches") or [])
+        if touches_overlap(t.get("touches") or [], candidate_locked):
             continue
         candidates.append(t)
 
@@ -252,14 +300,13 @@ def _ticket_next_step_line(ticket: dict) -> str | None:
     status = ticket.get("status")
     verdict = ticket.get("review_verdict")
     if status == "in_progress":
-        return f"{tid}: implementation running or claimed - check: lanegate orchestrate --status"
+        return f"{tid}: implementation running or claimed - check: lanegate run --status"
     if status == "hibernated":
-        return f"{tid}: hibernated - next: lanegate orchestrate"
+        return f"{tid}: hibernated - next: lanegate run"
     if status == "needs_review":
-        return (
-            f"{tid}: needs_review - inspect worktree, then: "
-            f"lanegate reopen {tid} && lanegate orchestrate"
-        )
+        cause = classify_needs_review_cause(ticket)
+        advice = needs_review_recovery_advice(ticket)
+        return f"{tid}: needs_review ({cause}) - {advice}"
     if status == "code_complete" and verdict == "changes_requested":
         return (
             f"{tid}: changes_requested - address feedback, then: "
@@ -274,7 +321,7 @@ def _ticket_next_step_line(ticket: dict) -> str | None:
     if status == "failed":
         return (
             f"{tid}: failed - inspect log/worktree, then: "
-            f"lanegate reopen {tid} && lanegate orchestrate"
+            f"lanegate reopen {tid} && lanegate run"
         )
     return None
 

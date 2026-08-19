@@ -36,7 +36,7 @@ from lanegate.concurrency import (
     release_orchestrator_lock,
 )
 from lanegate.lifecycle import spawn_detached
-from lanegate.watch import _pid_alive
+from lanegate.pidutil import pid_alive as _pid_alive
 
 
 class SmokeError(AssertionError):

@@ -44,8 +44,8 @@ LaneGate is a local coordinator for coding agents: it reads ticket files, dispat
 
 ### Trusted
 
-- **LaneGate's own process and source.** The orchestrator process itself is the trust root. Its source files (`lanegate/*.py`) are in the hard-blocked list so agents cannot modify the orchestrator mid-run.
-- **The `.lanegate.yml` config.** Also hard-blocked so agents cannot lower their own permission thresholds.
+- **LaneGate's own process and source.** The orchestrator process itself is the trust root. `lanegate/*.py` source is **not hard-blocked** so the dogfooding repo is not forced into `needs_review` on every ticket. Control configuration (`.lanegate.yml`) remains hard-blocked.
+- **The `.lanegate.yml` control config.** Hard-blocked so agents cannot lower their own permission thresholds. For lifecycle CLI commands launched from a linked worktree, config discovery is anchored to the shared control checkout; an uncommitted `.lanegate.yml` planted in the worktree is ignored.
 - **The prompt instruction layer.** The `build_implement_prompt` function places LaneGate's instructions before an `<untrusted-data>` fence. The executor prompt template (from `prompts/implement.md` or the built-in default) is considered trusted.
 - **Human-authored ticket frontmatter fields** that are machine-controlled: `status`, `worktree`, `branch`, `pr_number`, `review_verdict`. These are written by the orchestrator, not read from user input.
 
@@ -71,7 +71,7 @@ Each executor type is a subprocess launched by the orchestrator. All share the s
 
 ### Headless permission options for the `claude` executor
 
-`lanegate orchestrate` runs the Claude executor unattended, so it needs a permission configuration that never blocks on interactive input. Without one, the Claude Code process hangs waiting for terminal input that never comes. `lanegate doctor` and `lanegate init` recommend a scoped configuration first. The fully-open bypass flag remains supported and is the right choice for some setups, such as a sandboxed CI runner where the whole container is already the trust boundary.
+`lanegate run` runs the Claude executor unattended, so it needs a permission configuration that never blocks on interactive input. Without one, the Claude Code process hangs waiting for terminal input that never comes. `lanegate doctor` and `lanegate init` recommend a scoped configuration first. The fully-open bypass flag remains supported and is the right choice for some setups, such as a sandboxed CI runner where the whole container is already the trust boundary.
 
 **Scoped: `--allowedTools` / `--disallowedTools` (recommended default).** `lanegate init` now writes `flags: ["--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"]` by default. This auto-approves only the tool categories orchestrate's implement/fix/review steps actually use. Anything outside the list (`WebFetch`, `WebSearch`, MCP tools, `NotebookEdit`, ...) stays gated rather than silently permitted. This is not a sandbox: `Bash` itself still runs arbitrary shell commands with no argument restriction. See the OS-level sandboxing tickets (v2) for that layer. Edit the list in `.lanegate.yml` if your workflow needs more tools, e.g. add `WebSearch` for a ticket that requires it.
 
@@ -79,7 +79,7 @@ Each executor type is a subprocess launched by the orchestrator. All share the s
 
 **Fully open: `--dangerously-skip-permissions`.** This flag disables every permission check process-wide, including tools outside any allowlist. With it, the agent can read and write files, run shell commands, and use any MCP tool it has access to without asking. This remains fully supported for existing configs and for setups, like a disposable CI container, where the process boundary already is the trust boundary. It is a deliberate trade-off, not a misconfiguration, when chosen deliberately. It is no longer what `lanegate init` writes by default.
 
-Users who want per-action approval for every step, rather than either a scoped allowlist or full bypass, should not use `lanegate orchestrate`. They should use `lanegate start` manually and interact with the agent directly.
+Users who want per-action approval for every step, rather than either a scoped allowlist or full bypass, should not use `lanegate run`. They should use `lanegate start` manually and interact with the agent directly.
 
 ---
 
@@ -108,9 +108,9 @@ LaneGate does not sandbox agents at the OS level. The following limitations are 
 
 **No network egress filtering.** Agents can exfiltrate data over the network. LaneGate's gitleaks scan catches secrets committed to git but cannot catch data sent directly over HTTP/HTTPS from within the agent process.
 
-**Git diff inspection is the primary containment mechanism.** After the agent exits, LaneGate inspects the worktree diff. Files committed outside the `touches` list are caught. Files read but not committed are not observable. The static analysis gate catches common secret patterns and known-vulnerable dependencies in committed code but is not a substitute for OS-level isolation.
+**Git diff inspection is the primary containment mechanism.** After the agent exits, LaneGate inspects the worktree diff. Files committed outside the `touches` list are caught, and hard-blocked files (including `.lanegate.yml`) route to `needs_review` even when declared in `touches`. Lifecycle CLI commands launched from a linked worktree still resolve their configuration from the shared control checkout, so an uncommitted local config cannot disable their gates. Files read but not committed are not observable. The static analysis gate catches common secret patterns and known-vulnerable dependencies in committed code but is not a substitute for OS-level isolation.
 
-**The orchestrator lock is file-local.** The PID-based lock at `.lanegate/orchestrator.lock` prevents two `lanegate orchestrate` invocations on the same checkout from racing. It does not coordinate across separate clones or separate machines.
+**The orchestrator lock is file-local.** The PID-based lock at `.lanegate/orchestrator.lock` prevents two `lanegate run` invocations on the same checkout from racing. It does not coordinate across separate clones or separate machines.
 
 The runner/sandbox contract described in [V1.5 Interface Boundaries](v2-interface-boundaries.md#tick-109-runnersandbox-contract) is an optional future design, not current enforcement. Until a runner is explicitly configured and wired into orchestration, executors continue to run as host processes by default with the permissions described above.
 
@@ -128,9 +128,11 @@ The safest configuration is to create a dedicated OS user account for unattended
 
 ### Review worktree diffs before merging
 
-`lanegate orchestrate` with `--human-review final` stops after implementation is complete and leaves tickets in `in_review` state. You then run `lanegate board` to see what is ready, inspect the worktree diff with `git diff main...<branch>`, and run `lanegate merge <id>` only when you are satisfied. This is the recommended mode for any repository containing production code.
+`lanegate run` with `--human-review final` stops after implementation is complete and leaves tickets in `in_review` state. You then run `lanegate board` to see what is ready, inspect the worktree diff with `git diff main...<branch>`, and run `lanegate merge <id>` only when you are satisfied. This is the recommended mode for any repository containing production code.
 
 `--human-review per_ticket` pauses after each ticket only when the resolved reviewer is `human` (for example, `reviewer: human` in `.lanegate.yml`). Otherwise it can run a separate review agent per ticket, which is useful as an automated second opinion but does not replace human judgment for sensitive changes. **Note:** `--human-review per_ticket` has no effect in combined mode, where the implement and review steps use the same executor and the agent self-reviews as part of its implementation prompt. If you want an independent review step, configure `executor_steps` to use a separate reviewer, or use `--human-review final` for a batch-level human gate.
+
+Same-executor review (whether the review-independence ladder degraded to `self`, or an explicit same-executor pin) is not just the implementer talking to itself mid-thought: outside combined mode, it's a genuinely separate, cold subprocess dispatch by default — no `--resume`, no shared context with the session that wrote the code — specifically so an "independent" review isn't just the same reasoning trail rubber-stamping itself. See [`session_chaining.chain_review`](config-reference.md#session-chaining-resume-across-pipeline-steps) for the one opt-in exception to this (off by default) and [Combined mode](config-reference.md#combined-mode-default-for-single-accountsingle-model-setups) for when review has no separate dispatch to begin with.
 
 The default (`--human-review none`) auto-approves and auto-merges. Use this only on low-risk repositories such as personal projects or sandboxed demo repos. For a project-wide safe default that doesn't depend on remembering the flag on every invocation, set `default_human_review: per_ticket` (or `final`) in `.lanegate.yml`. `cmd_orchestrate` falls back to this value whenever `--human-review` isn't passed explicitly on the CLI. An explicit `--human-review` flag always overrides it, including `--human-review none` on a project that sets a stricter config default.
 
@@ -163,7 +165,7 @@ Avoid placing `.env` files, AWS credentials, SSH private keys, or API tokens in 
 
 ### Audit tickets before running orchestrate
 
-The ticket injection scanner (`_scan_injection_signals`) checks title, body, and close_criteria against known prompt injection patterns. It is a heuristic and not a complete defense. Before running `lanegate orchestrate --all`, review the ticket queue with `lanegate board` and manually inspect any ticket marked as untrusted (`trusted: false`).
+The ticket injection scanner (`_scan_injection_signals`) checks title, body, and close_criteria against known prompt injection patterns. It is a heuristic and not a complete defense. Before running `lanegate run --all`, review the ticket queue with `lanegate board` and manually inspect any ticket marked as untrusted (`trusted: false`).
 
 ### Use the MCP server only with trusted agents
 

@@ -83,8 +83,8 @@ var StatusSuccessStyle = lipgloss.NewStyle().
 	Foreground(ColorSuccess).
 	Padding(0, 1)
 
-// Semantic activity styles for the Run screen's structured Activity feed
-// (TICK-324). Each style pairs with a durable text symbol from
+// Semantic activity styles for the Run screen's structured Activity feed.
+// Each style pairs with a durable text symbol from
 // ActivitySymbol so an entry's meaning survives when color is unavailable or
 // stripped (e.g. golden-file tests, non-color terminals).
 var (
@@ -134,5 +134,29 @@ func ActivitySymbol(cat ActivityCategory) string {
 		return "✗"
 	default:
 		return "▶"
+	}
+}
+
+// AuditStyle and AuditSymbol format presentation-only audit metadata returned
+// by the API. They leave the raw audit message untouched, so copy/export
+// retains the exact diagnostic text.
+func AuditStyle(level string) lipgloss.Style {
+	return ActivityStyle(auditCategory(level))
+}
+
+func AuditSymbol(level string) string {
+	return ActivitySymbol(auditCategory(level))
+}
+
+func auditCategory(level string) ActivityCategory {
+	switch level {
+	case "error":
+		return ActivityCategoryDanger
+	case "warning":
+		return ActivityCategoryWaiting
+	case "success":
+		return ActivityCategorySuccess
+	default:
+		return ActivityCategoryActive
 	}
 }

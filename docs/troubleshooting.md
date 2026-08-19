@@ -92,6 +92,12 @@ After `lanegate merge`, the lock is released. If a ticket still shows as blocked
 
 If a ticket's status is stuck at `in_progress` because the executor crashed, reset it manually in the frontmatter and clean up its worktree directory.
 
+### A ticket is stuck in `needs_review` — which command clears it?
+
+`lanegate review TICK-NNN --verdict approved` (the reviewer's own verdict-recording command) only works on a ticket in `code_complete`, advancing it to `in_review`. It rejects a ticket already in `needs_review` — that status means an automated gate escalated the ticket for a human decision, and the command for that is different: `lanegate human-review TICK-NNN --rationale "..."`, which records your approval and returns the ticket to `code_complete` so the normal review/merge flow can pick it up again.
+
+`lanegate board` (or the CLI's own `next steps` output after a run) shows a cause-specific recovery line for every `needs_review` ticket — read that first rather than guessing. One cause worth knowing about specifically: a single-executor project with no independent reviewer configured escalates to `needs_review` with cause `no_independent_reviewer`, and `lanegate human-review` only clears the one ticket in front of you — every subsequent ticket will hit the identical wall until you either set `review_fallback: same_model` in `.lanegate.yml` (accepts same-model self-review) or configure a second reviewer/pool member.
+
 ---
 
 ## Executor issues
@@ -116,6 +122,15 @@ executors:
 ```
 
 See [Security Status](security-model.md#headless-permission-options-for-the-claude-executor) for the full set of options, including `--dangerously-skip-permissions`.
+
+### aider prints `OLLAMA_API_BASE: Not set` or a summarizer error, but the ticket still succeeds
+
+Both are aider's own native output, not LaneGate errors, and neither is fatal on their own:
+
+- `OLLAMA_API_BASE: Not set` — informational; aider falls back to its default local endpoint (`http://127.0.0.1:11434`) when unset. Set `OLLAMA_API_BASE` explicitly only if Ollama is running somewhere other than the default.
+- `Summarization failed ... cannot schedule new futures after shutdown` / `summarizer unexpectedly failed for all models` — aider's background chat-history summarizer failing on a short-lived process; it doesn't affect the actual edit/commit aider makes.
+
+If the ticket's diff and tests are correct despite these, they can be ignored. If aider actually fails to produce a working change, treat that as a separate, real failure rather than blaming these messages.
 
 ### `executor not found` or `No such file or directory` when orchestrating
 
@@ -149,6 +164,24 @@ executors:
 
 The preflight estimates the rendered prompt and selected files conservatively and includes an 8,192-token reserve. If it rejects a ticket, reduce the initial file set or prompt, use a model with a larger supported context window, or choose an executor that reads files incrementally. Raising the budget alone does not make a model accept more context than its server supports.
 
+### Aider produces unparseable output (or a verbose reasoning monologue) with a local "thinking" model
+
+Some local models (Qwen3-style hybrid-reasoning quants, for example) emit an internal reasoning block by default, which can break Aider's parsing — most visibly during `analyze`, where LaneGate expects a clean JSON reply. This is a property of the model, not a LaneGate or Aider bug: the model's own chat template renders differently depending on whether the request asks for reasoning.
+
+Aider supports steering this per-model via its own `.aider.model.settings.yml` (searched in `$HOME`, the git root, and the current directory — see [Aider's model-settings docs](https://aider.chat/docs/config/adv-model-settings.html)). This is a plain Aider mechanism, not a LaneGate feature or config surface — LaneGate does not read, write, or validate this file. A sample entry that suppresses reasoning for a hybrid-thinking Ollama model:
+
+```yaml
+- name: ollama_chat/<your-model-tag>
+  edit_format: whole
+  reasoning_tag: think
+  accepts_settings:
+    - reasoning_effort
+  extra_params:
+    reasoning_effort: "none"
+```
+
+Verify it actually reaches the model before relying on it — the exact parameter path from Aider through LiteLLM to Ollama's REST API can vary by version, and setting `reasoning_effort` via Aider's own `--reasoning-effort` CLI flag does *not* take the same path as `extra_params` in this file (the former was dropped by LiteLLM's Ollama transform in the versions tested; the latter was not).
+
 ---
 
 ## TUI
@@ -161,13 +194,13 @@ Fix: build the binary with `go build -o lanegate-tui ./tui/cmd/lanegate-tui` fro
 
 ---
 
-## Orchestration issues
+## Run issues
 
-### `lanegate orchestrate` exits immediately with no tickets processed
+### `lanegate run` exits immediately with no tickets processed
 
 Check `lanegate board`: there may be no tickets in `open`, `hibernated`, or `needs_review` status. Drafts and tickets with empty `touches` are skipped. If the board shows open tickets but orchestrate skips them, check whether there is a lock collision (overlapping `touches`) preventing all of them from starting. (A `max_parallel` of `0` or any other non-positive value is not a silent cause here: LaneGate rejects it at config-load time with `max_parallel must be a positive integer`, before orchestrate can run at all.)
 
-### Orchestration loop runs forever on one ticket (does not advance)
+### Run loop runs forever on one ticket (does not advance)
 
 In combined mode (same executor for implement and review), the executor is responsible for calling `lanegate complete` and `lanegate review --verdict ...` before exiting. If the executor exits without calling these commands, the ticket stays in `in_progress` and the run loop keeps re-trying.
 
@@ -184,7 +217,7 @@ In combined mode, if the executor exited 0 but did not run the full `lanegate co
 
 ```
 ERROR: TICK-NNN — combined-mode executor exited 0 but left ticket in unhandled state...
-  Pausing for manual review. Re-run: lanegate orchestrate
+  Pausing for manual review. Re-run: lanegate run
 ```
 
 This prevents the board from wedging: touches remain locked to the incomplete ticket, and the file lock prevents later tickets from being assigned the same files.
@@ -196,7 +229,7 @@ Causes:
 
 Fix: inspect the executor log in `.lanegate/logs/TICK-NNN.log` to see where execution stopped. Then:
 1. Manually complete the missing steps: `cd .lanegate/worktrees/TICK-NNN && lanegate complete && lanegate review --verdict approved` (or `changes_requested` as appropriate).
-2. Return to the repo root and re-run: `lanegate orchestrate`.
+2. Return to the repo root and re-run: `lanegate run`.
 
 Alternatively, if the ticket changes look wrong, reset it manually: edit `.lanegate/tickets/TICK-NNN.md` to set `status: open`, clear `review_verdict` if present, then re-run `lanegate start` to retry the whole ticket.
 
@@ -208,7 +241,7 @@ To resolve: go into the worktree (`cd .lanegate/worktrees/tick-NNN`), rebase or 
 
 ### `.lanegate/orchestrator.lock` is stale and blocks a new `orchestrate` run
 
-If `lanegate orchestrate` crashed (killed, SIGKILL, power loss), the lock file may not be cleaned up. The lock file is at `.lanegate/orchestrator.lock`. It contains the PID of the process that held it. If that process is no longer running, it is safe to delete the file manually and re-run orchestrate.
+If `lanegate run` crashed (killed, SIGKILL, power loss), the lock file may not be cleaned up. The lock file is at `.lanegate/orchestrator.lock`. It contains the PID of the process that held it. If that process is no longer running, it is safe to delete the file manually and re-run orchestrate.
 
 ```bash
 rm .lanegate/orchestrator.lock
@@ -216,7 +249,7 @@ rm .lanegate/orchestrator.lock
 
 Do not delete it while another orchestrate process is actively running.
 
-### How do I know if an overnight `lanegate orchestrate` run got stuck?
+### How do I know if an overnight `lanegate run` run got stuck?
 
 Left alone, orchestrate can wedge on any of the causes above (executor hang, lock collision, one ticket stalling the loop) with no visible sign until you come back and look. `lanegate notify-watch` is a small daemon that polls `.lanegate/active-orchestrate.json`, the orchestrator lock, and the ticket board, and pushes a phone notification (via ntfy.sh) the moment something looks wrong: a dead executor process, no heartbeat for a while, or the loop stopped with tickets still sitting in `needs_review` / `blocked` / `failed` / hibernated. See [Phone alerts for stuck runs](config-reference.md#phone-alerts-for-stuck-runs-notify-watch) in the config reference for setup.
 
@@ -237,7 +270,9 @@ LaneGate uses `git worktree add`. This requires:
 - Git 2.15 or later.
 - A clean working tree in the main checkout: `git status` should show no uncommitted changes (especially no conflicting untracked files in the worktrees directory).
 
-If the worktree creation fails, the most likely cause is a stale worktree directory or branch from a previous crashed run. Clean up manually:
+LaneGate automatically removes canonical ticket worktree directories and branches on `lanegate fail` and `lanegate reopen` (unless `review_verdict=changes_requested` on `cmd_fail` for human inspection). On a fresh dispatch, `create_worktree` validates and replaces a stale canonical worktree, but preserves an unattached ticket branch for recovery rather than silently reusing or deleting it.
+
+If an unmanaged process crash occurs before `lanegate fail` or `lanegate reopen` is run, you can manually clean up if needed:
 
 ```bash
 git worktree remove .lanegate/worktrees/tick-007 --force
@@ -248,7 +283,7 @@ Then retry `lanegate start`.
 
 ### Worktree directory left behind after a crash
 
-If `lanegate merge` was not reached (crash, manual abort), the worktree directory at `.lanegate/worktrees/tick-NNN/` may still exist. Clean up manually:
+If `lanegate merge` was not reached and a process crash prevented standard lifecycle commands from running, the worktree directory at `.lanegate/worktrees/tick-NNN/` may still exist. `lanegate reopen tick-NNN` (after `lanegate fail tick-NNN` if the ticket is still `in_progress`) cleans up a zero-commit stale worktree and branch automatically. `lanegate start tick-NNN` is not equivalent here: it removes a leftover, unregistered directory at the canonical path, but if a branch of the same name survives it refuses rather than reusing or deleting it (see above) — inspect or remove that branch yourself before retrying `start`. Otherwise, clean up manually:
 
 ```bash
 git worktree remove .lanegate/worktrees/tick-NNN --force
@@ -297,7 +332,7 @@ Matching uses an exact `[TICK-N]` prefix in the issue title. If issues were prev
 **See what LaneGate would do without touching anything:**
 
 ```bash
-lanegate orchestrate --dry-run
+lanegate run --dry-run
 ```
 
 **Check executor output after a failed run:**

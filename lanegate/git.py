@@ -105,3 +105,48 @@ def pending_commits(repo_root: Path, base: str, head: str) -> PendingCommits:
         return PendingCommits([], message)
 
     return PendingCommits([line for line in result.stdout.splitlines() if line])
+
+
+def has_tracking_remote(repo_root: Path) -> bool:
+    """Check if the repository has an upstream tracking remote branch."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "@{u}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.returncode == 0 and bool(result.stdout and result.stdout.strip())
+
+
+def verify_local_branch(repo_root: Path, branch: str) -> GitText:
+    """Return a local branch's object ID, or empty text when it is absent.
+
+    A missing local branch is an expected first-promotion state, so Git's
+    ``rev-parse --verify --quiet`` exit status of 1 is represented as a
+    successful empty result. Other failures retain their diagnostics.
+    """
+    ref = f"refs/heads/{branch}"
+    args = ["git", "rev-parse", "--verify", "--quiet", ref]
+    command = " ".join(args)
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=repo_root,
+        )
+    except OSError as exc:
+        return GitText("", f"could not run {command}: {exc}")
+
+    if result.returncode == 0:
+        return GitText(result.stdout.strip())
+    if result.returncode == 1:
+        return GitText("")
+
+    detail = next((line.strip() for line in result.stderr.splitlines() if line.strip()), None)
+    error = f"{command} failed (exit {result.returncode})"
+    if detail:
+        error = f"{error}: {detail}"
+    return GitText("", error)

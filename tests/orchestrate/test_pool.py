@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
+from lanegate.orchestrate.audit import has_step_bundle
+from lanegate.orchestrate.pool import _CONFIG_ERROR_EXIT_CODE, capture_manual_implement_step_run
+
 
 class TestBuildExecutorCmd:
     def test_claude(self):
@@ -80,6 +83,8 @@ class TestBuildExecutorCmd:
         assert cmd == ["openhands", "run", "--model", "gpt-4-turbo", "--task", "refactor this"]
 
     def test_codex_with_model(self):
+        # `codex exec` has no --timeout flag in current CLI releases, so
+        # none is passed (see lanegate.executor._effective_print_timeout_seconds).
         cmd = _build_executor_cmd("codex", "add feature", {}, model="o4-mini")
         assert cmd == ["codex", "exec", "--json", "--model", "o4-mini", "add feature"]
 
@@ -147,6 +152,26 @@ def test_resolve_driver_preserves_legacy_executor_steps_for_fix():
     }
 
     assert resolve_driver("fix", {}, cfg) == "codex"
+
+
+def test_invoke_executor_rejects_ollama_for_implement(tmp_path):
+    """Raw ollama has no code-application step; implement must fail closed
+    with the ordinary config-error sentinel instead of dispatching to
+    _invoke_ollama and silently producing zero commits."""
+    ticket = {
+        "id": "TICK-009",
+        "title": "Ollama implement",
+        "touches": ["a.py"],
+        "close_criteria": "Done.",
+        "_body": "Body.",
+    }
+    cfg = {"executor": "ollama"}
+
+    with patch("lanegate.orchestrate.pool._invoke_ollama") as mock_ollama:
+        exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, step="implement")
+
+    assert exit_code == _CONFIG_ERROR_EXIT_CODE
+    mock_ollama.assert_not_called()
 
 
 def test_ticket_executor_pins_implement_and_every_fix_dispatch_away_from_global_codex(tmp_path):
@@ -237,6 +262,27 @@ def test_build_env_merges_driver_env_and_expands_refs(monkeypatch):
 def test_build_env_rejects_non_mapping_env():
     with pytest.raises(ConfigError, match="driver env must be a mapping"):
         _build_env({"env": ["BAD"]})
+
+
+def test_invoke_executor_marks_child_as_internal_lane_run(tmp_path):
+    """Executor-owned lifecycle calls must not create direct-action history."""
+    from lanegate.orchestrate.run_report import INTERNAL_RUN_ENV
+
+    ticket = {
+        "id": "TICK-INTERNAL-ENV",
+        "title": "Internal run marker",
+        "touches": ["a.py"],
+        "close_criteria": "Done.",
+        "_body": "Body.",
+    }
+    cfg = _default_cfg(tmp_path)
+
+    with patch(
+        "lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")
+    ) as stream:
+        invoke_executor(ticket, cfg, tmp_path)
+
+    assert stream.call_args.kwargs["env"][INTERNAL_RUN_ENV] == "1"
 
 
 def test_lifecycle_resolve_reviewer_checks_steps_review_driver():
@@ -771,6 +817,53 @@ class TestInvokeExecutor:
 
         assert "--resume" not in captured_cmd["cmd"]
 
+    def test_invoke_executor_clamps_agy_duration_to_measured_elapsed(self, tmp_path):
+        """agy's self-reported duration_seconds reflects the whole resumed
+        --conversation session (prior turns included), not just this
+        invocation's turn -- confirmed live in a fresh-install smoke test
+        (~42s self-reported vs. ~22s LaneGate itself measured around the
+        same subprocess call). The written step_costs row must reflect the
+        actually-measured wall-clock elapsed time, not the inflated
+        self-reported one."""
+        import json
+
+        ticket = {
+            "id": "TICK-017",
+            "title": "Agy duration clamp",
+            "touches": ["r.py"],
+            "close_criteria": "Done.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "agy"
+
+        agy_stdout = json.dumps(
+            {
+                "conversation_id": "conv-1",
+                "status": "SUCCESS",
+                "response": "done",
+                "duration_seconds": 300.0,
+                "num_turns": 2,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }
+        )
+
+        def fake_subprocess(cmd, *args, **kwargs):
+            return 0, agy_stdout, ""
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_subprocess),
+            patch("lanegate.context_log._get_default_db_path", return_value=tmp_path / "analytics.db"),
+            patch("lanegate.context_log._get_project_id", return_value="proj"),
+        ):
+            invoke_executor(ticket, cfg, tmp_path, step="implement")
+
+        from lanegate.context_log import _load_step_costs_from_db
+
+        rows = _load_step_costs_from_db(tmp_path / "analytics.db", project="proj")
+        assert len(rows) == 1
+        assert rows[0]["duration_ms"] < 5000
+
     def test_invoke_executor_does_not_resume_legacy_session_without_origin_metadata(self, tmp_path):
         """A session id written before origin metadata existed (no
         analyze_session_executor/analyze_session_model on the ticket) must
@@ -1294,7 +1387,7 @@ class TestInvokeExecutor:
         assert bundle.parent.parent.parent.name == ".lanegate"
         assert (bundle / "prompt.md").exists()
         assert (bundle / "status.json").exists()
-        assert (bundle / "executor-session.jsonl").read_text() == '{"type":"message"}\n'
+        assert (bundle / "executor-session.jsonl").read_text() == '{\n  "type": "message"\n}\n'
         assert (bundle / "tasks" / "task-1.output").read_text() == "background command output\n"
         assert (bundle / "git-status.txt").exists()
         assert (bundle / "diff-stat.txt").exists()
@@ -1416,7 +1509,7 @@ class TestInvokeExecutor:
         assert "audit_bundle_path" in status, f"Status has no audit_bundle_path: {status}"
         bundle = Path(status["audit_bundle_path"])
         manifest = json.loads((bundle / "manifest.json").read_text())
-        assert (bundle / "executor-session.jsonl").read_text() == '{"event":"codex"}\n'
+        assert (bundle / "executor-session.jsonl").read_text() == '{\n  "event": "codex"\n}\n'
         assert "executor-session.jsonl" in manifest["captured"]
 
     def test_audit_bundle_missing_private_logs_is_manifested_without_failure(self, tmp_path):
@@ -1635,7 +1728,7 @@ class TestInvokeExecutor:
         cfg["drivers"] = {
             "fast": {
                 "type": "claude-process",
-                "model": "driver-model",
+                "model": "claude-driver-model",
                 "bin": "custom-claude",
                 "flags": ["--debug-driver"],
             }
@@ -1650,7 +1743,7 @@ class TestInvokeExecutor:
         assert cmd[0] == "custom-claude"
         assert "--debug-driver" in cmd
         assert "--model" in cmd
-        assert cmd[cmd.index("--model") + 1] == "driver-model"
+        assert cmd[cmd.index("--model") + 1] == "claude-driver-model"
 
     def test_legacy_executor_steps_fix_routes_fix_invocation(self, tmp_path):
         ticket = {
@@ -1678,7 +1771,11 @@ class TestInvokeExecutor:
         assert mock_stream.call_args.kwargs["stdin_text"] == "fix prompt"
 
     def test_ollama_executor_posts_to_generate_api_writes_response(self, tmp_path):
-        """Test that ollama executor posts to /api/generate and writes response."""
+        """Test that ollama executor posts to /api/generate and writes response.
+
+        Uses step="analyze" — the only step raw ollama is still permitted to
+        run (reject_ollama_for_code_step rejects implement/review/fix/drift_check).
+        """
         # requests is an optional extra (`lanegate[ollama]`); the executor falls back
         # to curl without it, which the sibling test below covers.
         pytest.importorskip("requests")
@@ -1697,7 +1794,7 @@ class TestInvokeExecutor:
 
         with patch("lanegate.orchestrate.pool._stream_subprocess") as mock_stream:
             with patch("requests.post", return_value=mock_response):
-                exit_code, *_ = invoke_executor(ticket, cfg, tmp_path)
+                exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, step="analyze")
 
         assert exit_code == 0
         response_file = tmp_path / ".ollama_response.md"
@@ -1749,7 +1846,7 @@ class TestInvokeExecutor:
 # ---------------------------------------------------------------------------
 
 
-def _pool_dispatch_scenario(tmp_path, *, pool_strategy: str, max_parallel: int = 2):
+def _pool_dispatch_scenario(tmp_path, *, pool_strategy: str, max_parallel: int = 2, executors: list[str] | None = None):
     """Shared harness for pool-dispatch tests: 2 disjoint-touch open tickets,
     a 2-instance pool, everything past invoke_executor faked through to
     merged so the run drains cleanly. Returns {ticket_id: executor_override
@@ -1764,7 +1861,8 @@ def _pool_dispatch_scenario(tmp_path, *, pool_strategy: str, max_parallel: int =
         "claude-1": {"type": "claude-process"},
         "claude-2": {"type": "claude-process"},
     }
-    cfg["pools"] = {"default": {"executors": ["claude-1", "claude-2"], "strategy": pool_strategy}}
+    if executors is None:
+        cfg["pools"] = {"default": {"executors": ["claude-1", "claude-2"], "strategy": pool_strategy}}
     tickets_dir = tmp_path / "tickets"
     _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"], priority=1)
     _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"], priority=2)
@@ -1809,7 +1907,8 @@ def _pool_dispatch_scenario(tmp_path, *, pool_strategy: str, max_parallel: int =
             human_review="none",
             all_milestones=True,
             auto_analyze=False,
-            pool="default",
+            pool=None if executors else "default",
+            executors=executors,
         )
 
     return used
@@ -1824,8 +1923,87 @@ class TestExecutorPools:
         used = _pool_dispatch_scenario(tmp_path, pool_strategy="least-loaded")
         assert set(used.values()) == {"claude-1", "claude-2"}
 
+    def test_least_loaded_splits_across_adhoc_executors_flag(self, tmp_path):
+        used = _pool_dispatch_scenario(tmp_path, pool_strategy="least-loaded", executors=["claude-1", "claude-2"])
+        assert set(used.values()) == {"claude-1", "claude-2"}
+
+    def test_executors_and_pool_mutually_exclusive(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        cfg["executors"] = {"claude-1": {"type": "claude-process"}}
+        cfg["pools"] = {"default": {"executors": ["claude-1"], "strategy": "least-loaded"}}
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                pool="default",
+                executors=["claude-1"],
+            )
+        assert exc_info.value.code == 1
+
+    def test_executors_unknown_name_rejected(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        cfg["executors"] = {"claude-1": {"type": "claude-process"}}
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                executors=["doesnotexist"],
+            )
+        assert exc_info.value.code == 1
+
 
 class TestResolvedDispatchDisplay:
+    def test_ticket_model_pin_applies_to_fix_dispatch(self, tmp_path):
+        """An operator-selected implementation model also governs auto-fix."""
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "claude"
+        cfg["models"] = {"fix": "claude-sonnet-5"}
+
+        dispatch = resolve_dispatch(
+            {"id": "TICK-999", "touches": [], "model": "claude-opus-5"},
+            cfg,
+            step="fix",
+        )
+
+        assert dispatch["model"] == "claude-opus-5"
+
+    def test_pool_dispatch_rejects_vendor_model_leaked_into_ollama_aider(self, tmp_path):
+        """A top-level `models:` block authored for cfg's own default executor
+        must not silently reach a pool-dispatched aider instance pinned to
+        provider: ollama, which cannot use a claude-* model at all. This must
+        fail loudly via ConfigError at dispatch time, not silently pass the
+        wrong model through -- mirrors the live pools.default.executors
+        aider-ollama-14b misconfiguration this ticket fixes."""
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "claude"
+        cfg["models"] = {"implement": "claude-sonnet-5"}
+        cfg["executors"] = {
+            "aider-ollama-14b": {"type": "aider", "provider": "ollama"},
+        }
+        ticket = {"id": "TICK-999", "touches": []}
+
+        with pytest.raises(ConfigError, match="unmapped model"):
+            resolve_dispatch(ticket, cfg, executor_override="aider-ollama-14b")
+
+    def test_pool_dispatch_rejects_vendor_model_leaked_into_ollama_aider_via_drivers_block(
+        self, tmp_path
+    ):
+        """Same leak as the `executors:` case above, but the ollama-pinned
+        aider route is declared as a `drivers:` entry instead -- provider
+        lives on driver_cfg here, not on an `executors:` instance, and must
+        still be found."""
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "claude"
+        cfg["models"] = {"implement": "claude-sonnet-5"}
+        cfg["drivers"] = {
+            "fast-ollama": {"type": "aider", "provider": "ollama"},
+        }
+        cfg["steps"] = {"implement": {"driver": "fast-ollama"}}
+        ticket = {"id": "TICK-998", "touches": []}
+
+        with pytest.raises(ConfigError, match="unmapped model"):
+            resolve_dispatch(ticket, cfg)
+
     def test_named_driver_lifecycle_and_api_fields(self, tmp_path):
         import io
 
@@ -2191,7 +2369,8 @@ class TestResolvedDispatchDisplay:
 
         assert used["TICK-001"] == "codex"
 
-    def test_explicit_ticket_executor_override_is_not_replaced_by_pool(self, tmp_path):
+    @pytest.mark.parametrize("max_parallel", [1, 2])
+    def test_explicit_ticket_executor_override_is_not_replaced_by_pool(self, tmp_path, max_parallel):
         """ticket.executor, when a user sets it directly, must win over pool
         selection. Uses a plain built-in driver type ('codex') rather than a
         named pool instance as the override value — a named-instance value
@@ -2217,6 +2396,24 @@ class TestResolvedDispatchDisplay:
             used[ticket["id"]] = kwargs.get("executor_override")
             return 0, "", ""
 
+        def fake_complete(tid, cfg_, repo_root):
+            ticket_path = tickets_dir / f"{tid}.md"
+            ticket_path.write_text(
+                ticket_path.read_text().replace("status: in_progress", "status: code_complete", 1)
+            )
+
+        def fake_review(tid, cfg_, repo_root, *, verdict=None, summary=None, findings=None):
+            ticket_path = tickets_dir / f"{tid}.md"
+            ticket_path.write_text(
+                ticket_path.read_text().replace("status: code_complete", "status: in_review", 1)
+            )
+
+        def fake_merge(tid, cfg_, repo_root):
+            ticket_path = tickets_dir / f"{tid}.md"
+            ticket_path.write_text(
+                ticket_path.read_text().replace("status: in_review", "status: merged", 1)
+            )
+
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
@@ -2226,15 +2423,16 @@ class TestResolvedDispatchDisplay:
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
-            patch("lanegate.lifecycle.cmd_complete"),
-            patch("lanegate.lifecycle.cmd_review"),
+            patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
+            patch("lanegate.lifecycle.cmd_review", side_effect=fake_review),
+            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
         ):
             cmd_orchestrate(
                 cfg,
                 tmp_path,
-                max_parallel=1,
+                max_parallel=max_parallel,
                 human_review="none",
                 all_milestones=True,
                 auto_analyze=False,
@@ -2766,6 +2964,7 @@ class TestCommitWorktreeChanges:
         assert mock_run.call_args_list[3].args[0] == [
             "git",
             "commit",
+            "-s",
             "-m",
             "feat: implement TICK-001",
         ]
@@ -2807,6 +3006,7 @@ class TestCommitWorktreeChanges:
         assert mock_run.call_args_list[3].args[0] == [
             "git",
             "commit",
+            "-s",
             "-m",
             "fix: address review findings for TICK-001",
         ]
@@ -3209,6 +3409,10 @@ class TestFailClosedOnExecutorError:
         captured = (fixtures_dir / "tick-348-weekly-limit.txt").read_text()
 
         assert _is_rate_limit(1, tmp_path, captured_stdout=captured) is True
+
+    def test_is_rate_limit_detects_structured_api_error_status_429(self, tmp_path):
+        captured_stdout = '{"is_error": true, "api_error_status": 429, "result": "Request failed without quota prose"}'
+        assert _is_rate_limit(1, tmp_path, captured_stdout=captured_stdout) is True
 
     def test_is_rate_limit_detects_explicit_rate_limit_error(self, tmp_path):
         assert _is_rate_limit(1, tmp_path, captured_stderr="ERROR: rate limit hit") is True
@@ -3677,4 +3881,434 @@ class TestCommittedFiles:
         assert result == {"lanegate/config.py"}
 
 
+class TestCaptureManualImplementStepRun:
+    def test_captures_manual_implement_evidence_and_diff(self, tmp_path):
+        repo_root = tmp_path
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo_root, check=True)
+        (repo_root / "example.txt").write_text("before\n")
+        subprocess.run(["git", "add", "example.txt"], cwd=repo_root, check=True)
+        subprocess.run(["git", "commit", "-m", "base"], cwd=repo_root, check=True, capture_output=True)
+        subprocess.run(["git", "checkout", "-b", "tick-373"], cwd=repo_root, check=True, capture_output=True)
+        (repo_root / "example.txt").write_text("manual change\n")
+        subprocess.run(["git", "add", "example.txt"], cwd=repo_root, check=True)
+        subprocess.run(["git", "commit", "-m", "manual implementation"], cwd=repo_root, check=True, capture_output=True)
+
+        ticket = {
+            "id": "TICK-373",
+            "branch": "tick-373",
+            "lifecycle_events": [
+                {"event": "implementation_started", "at": "2026-08-05T18:05:26Z"}
+            ],
+        }
+        bundle_path = capture_manual_implement_step_run(
+            repo_root,
+            repo_root,
+            ticket,
+            {"trunk_branch": "main"},
+            safeguards_passed=True,
+            safeguard_reason="all safeguards passed",
+        )
+
+        assert bundle_path is not None
+        assert bundle_path.parent == repo_root / ".lanegate" / "executor-runs" / "TICK-373"
+        status = json.loads((bundle_path / "status.json").read_text())
+        assert status["mode"] == "manual"
+        assert status["step"] == "implement"
+        assert status["before_sha"]
+        assert status["after_sha"]
+        assert status["safeguards_passed"] is True
+        assert status["safeguard_reason"] == "all safeguards passed"
+        assert "manual change" in (bundle_path / "diff.patch").read_text()
+        manifest = json.loads((bundle_path / "manifest.json").read_text())
+        assert any(item["artifact"] == "executor-session.jsonl" for item in manifest["missing"])
+        assert has_step_bundle(repo_root, "TICK-373", "implement") is True
+        assert has_step_bundle(repo_root, "TICK-373", "review") is False
+
+
 # ---------------------------------------------------------------------------
+
+
+def test_max_turns_exceeded(tmp_path):
+    from io import StringIO
+    from unittest.mock import patch
+    from lanegate.config import _default_config
+    from lanegate.orchestrate.pool import invoke_executor
+
+    ticket = {
+        "id": "TICK-411",
+        "title": "Budget Cap Test",
+        "touches": [],
+    }
+
+    # Test max_turns cap
+    cfg = _default_config()
+    cfg["executor"] = "claude"
+    cfg["max_turns"] = 2
+
+    lines = [
+        json.dumps({"type": "assistant", "message": {"content": [], "usage": {"input_tokens": 100, "output_tokens": 50}}}),
+        json.dumps({"type": "assistant", "message": {"content": [], "usage": {"input_tokens": 200, "output_tokens": 100}}}),
+        json.dumps({"type": "assistant", "message": {"content": [], "usage": {"input_tokens": 300, "output_tokens": 150}}}),
+    ]
+
+    def fake_subprocess(cmd, cwd, **kwargs):
+        on_line = kwargs.get("on_line")
+        if on_line:
+            for line in lines:
+                on_line(line, True)
+        return 0, "\n".join(lines), ""
+
+    log_stream = StringIO()
+
+    with patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_subprocess):
+        rc, out, err = invoke_executor(ticket, cfg, tmp_path, log_stream=log_stream)
+
+    assert rc != 0
+    logged_output = log_stream.getvalue()
+    assert "aborted early" in logged_output
+    assert "turns" in logged_output
+    assert "tokens" in logged_output
+
+    # Test max_cumulative_tokens ceiling
+    cfg_tokens = _default_config()
+    cfg_tokens["executor"] = "claude"
+    cfg_tokens["max_cumulative_tokens"] = 300
+
+    log_stream_tokens = StringIO()
+
+    with patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_subprocess):
+        rc_tok, out_tok, err_tok = invoke_executor(ticket, cfg_tokens, tmp_path, log_stream=log_stream_tokens)
+
+    assert rc_tok != 0
+    logged_tokens_output = log_stream_tokens.getvalue()
+    assert "aborted early" in logged_tokens_output
+    assert "tokens" in logged_tokens_output
+
+
+def test_select_pool_instance_returns_none_when_all_instances_cooling_down(tmp_path):
+    """When all instances in a pool are cooling down due to rate limits,
+    _select_pool_instance must return None rather than raising an AssertionError."""
+    from unittest.mock import patch
+    from lanegate.orchestrate.loop import _pool_instance_healthy
+
+    cfg = {
+        "pools": {"default": {"executors": ["inst-1", "inst-2"], "strategy": "least-loaded"}},
+        "executors": {
+            "inst-1": {"type": "claude-process"},
+            "inst-2": {"type": "claude-process"},
+        },
+    }
+
+    # Mock _pool_instance_healthy to simulate all pool instances cooling down
+    with patch("lanegate.orchestrate.loop._pool_instance_healthy", return_value=False), \
+         patch("lanegate.orchestrate.loop._COOLDOWN_POLL_SECONDS", 0):
+        # We also need a scope context inside _cmd_orchestrate_body or similar,
+        # but _select_pool_instance is an inner function defined inside _drain_loop.
+        # We test resolve_pool_executor returning None directly.
+        from lanegate.orchestrate.loop import resolve_pool_executor
+        result = resolve_pool_executor("implement", {}, cfg, tmp_path, pool_name="default")
+        assert result is None
+
+
+class TestWorktreeBoundaryGuard:
+    def test_write_outside_worktree_rejected(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"content_block": {"name": "Write", "input": {"TargetFile": str(outside_file)}}})
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            handler(line, is_stdout=True)
+
+    def test_write_inside_worktree_allowed(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        inside_file = worktree / "lanegate" / "cli.py"
+        inside_file.parent.mkdir(parents=True)
+        inside_file.write_text("test")
+
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"content_block": {"name": "Write", "input": {"TargetFile": str(inside_file)}}})
+        handler(line, is_stdout=True)
+
+    def test_edit_outside_worktree_rejected(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"content_block": {"name": "Edit", "input": {"path": str(outside_file)}}})
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            handler(line, is_stdout=True)
+
+    def test_edit_inside_worktree_allowed(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        inside_file = worktree / "lanegate" / "cli.py"
+        inside_file.parent.mkdir(parents=True)
+        inside_file.write_text("test")
+
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"content_block": {"name": "Edit", "input": {"path": str(inside_file)}}})
+        handler(line, is_stdout=True)
+
+    def test_list_shaped_content_block_outside_worktree_rejected(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"content_block": [{"name": "Write", "input": {"TargetFile": str(outside_file)}}]})
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            handler(line, is_stdout=True)
+
+    def test_direct_assert_path_in_worktree(self, tmp_path):
+        from lanegate.orchestrate.pool import _assert_path_in_worktree
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+        outside_file.parent.mkdir(parents=True)
+        outside_file.write_text("test")
+
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            _assert_path_in_worktree("Write", str(outside_file), worktree)
+
+    def test_direct_assert_path_in_worktree_raises_worktree_guard_violation_subclass(self, tmp_path):
+        from lanegate.orchestrate.pool import WorktreeGuardViolation, _assert_path_in_worktree
+
+        worktree = tmp_path / "worktrees" / "tick-585"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+        outside_file.parent.mkdir(parents=True)
+        outside_file.write_text("test")
+
+        with pytest.raises(WorktreeGuardViolation, match=r"\[worktree-guard\]"):
+            _assert_path_in_worktree("Write", str(outside_file), worktree)
+
+    def test_traversal_path_outside_worktree_rejected(self, tmp_path):
+        from lanegate.orchestrate.pool import _assert_path_in_worktree
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+
+        traversal_path = "../../outside/cli.py"
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            _assert_path_in_worktree("Write", traversal_path, worktree)
+
+    def test_symlink_outside_worktree_rejected(self, tmp_path):
+        from lanegate.orchestrate.pool import _assert_path_in_worktree
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("outside")
+
+        link_inside = worktree / "link_inside.txt"
+        os.symlink(outside_file, link_inside)
+
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            _assert_path_in_worktree("Write", str(link_inside), worktree)
+
+    def test_invoke_executor_wires_worktree_path_and_logs_guard_error(self, tmp_path):
+        from lanegate.orchestrate.pool import invoke_executor
+        import io
+        import sys
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+
+        ticket = {"id": "TICK-572", "executor": "mock"}
+        cfg = {"executors": {"mock": {"type": "claude", "command": "echo"}}}
+
+        log_stream = io.StringIO()
+        tool_call_json = json.dumps({"content_block": [{"name": "Write", "input": {"TargetFile": str(outside_file)}}]})
+        # A portable stand-in for "the executor prints a tool-call line, then
+        # keeps running briefly" — `bash -c` isn't reliable here since on the
+        # Windows CI runner it can resolve to the WSL launcher stub instead of
+        # Git Bash's bash.exe when no WSL distro is installed.
+        mock_cmd_script = (
+            f"import sys, time\n"
+            f"sys.stdout.write({tool_call_json!r} + chr(10))\n"
+            f"sys.stdout.flush()\n"
+            f"time.sleep(0.2)\n"
+        )
+        with patch(
+            "lanegate.orchestrate.pool.build_executor_cmd",
+            return_value=[sys.executable, "-c", mock_cmd_script],
+        ):
+            with patch("lanegate.orchestrate.pool._write_prompt_file"):
+                rc, stdout, stderr = invoke_executor(
+                    ticket,
+                    cfg,
+                    worktree,
+                    log_stream=log_stream,
+                )
+        assert rc != 0
+        assert "[worktree-guard]" in log_stream.getvalue()
+        assert "LaneGate worktree-isolation bug" in log_stream.getvalue()
+
+    def test_notes_symlink_write_allowed_and_normalized(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+        from lanegate.worktree import _ensure_notes_symlink
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir(parents=True)
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+
+        with patch("lanegate.worktree._run") as mock_run:
+            mock_run.return_value.returncode = 0
+            _ensure_notes_symlink(repo_root, worktree)
+
+        events = []
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            on_event=events.append,
+            worktree_path=worktree,
+        )
+
+        notes_file = worktree / ".lanegate" / "notes" / "global.md"
+        line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Write", "input": {"file_path": str(notes_file)}}
+                ]
+            }
+        })
+        handler(line, is_stdout=True)
+        assert len(events) == 1
+        assert events[0].activity == "writing_file"
+        assert events[0].tool_category == "file_write"
+
+    def test_graphify_symlink_write_allowed(self, tmp_path):
+        from lanegate.orchestrate.pool import _assert_path_in_worktree
+        from lanegate.worktree import _ensure_graphify_symlink
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir(parents=True)
+        graphify_dir = repo_root / "graphify-out"
+        graphify_dir.mkdir(parents=True)
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+
+        with patch("lanegate.worktree._run") as mock_run:
+            mock_run.return_value.returncode = 0
+            _ensure_graphify_symlink(repo_root, worktree)
+
+        graphify_file = worktree / "graphify-out" / "graph.json"
+        _assert_path_in_worktree("Write", str(graphify_file), worktree)
+
+    def test_non_dict_message_does_not_raise_attribute_error(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="codex",
+            model="test",
+            step="implement",
+            worktree_path=worktree,
+        )
+        line = json.dumps({"type": "item.completed", "message": "done", "usage": {"input_tokens": 1234}})
+        handler(line, is_stdout=True)
+
+    def test_boundary_violation_preserves_metering(self, tmp_path):
+        from lanegate.orchestrate.pool import make_event_line_handler
+        from lanegate.budget import DispatchMeter
+
+        worktree = tmp_path / "worktrees" / "tick-572"
+        worktree.mkdir(parents=True)
+        outside_file = tmp_path / "outside" / "cli.py"
+
+        meter = DispatchMeter()
+        handler = make_event_line_handler(
+            tmp_path,
+            "ts",
+            "tick-572",
+            executor="claude",
+            model="test",
+            step="implement",
+            meter=meter,
+            worktree_path=worktree,
+        )
+        line = json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Write", "input": {"file_path": str(outside_file)}}
+                ],
+                "usage": {"input_tokens": 5000, "output_tokens": 100},
+            },
+        })
+        with pytest.raises(RuntimeError, match=r"\[worktree-guard\]"):
+            handler(line, is_stdout=True)
+
+        assert meter.turns == 1
+        assert meter.tokens == 5100
+
+

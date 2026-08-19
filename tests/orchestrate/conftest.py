@@ -32,6 +32,7 @@ from lanegate.orchestrate import (
     _find_claude_transcript,
     _format_conflict_detail,
     _gather_rate_limit_texts,
+    _hibernate_orphaned,
     _is_auth_error,
     _is_blocked_file,
     _is_combined_mode,
@@ -181,6 +182,24 @@ def _resolve_executor_bins_to_their_names(monkeypatch):
     monkeypatch.setattr("lanegate.executor.shutil.which", lambda bin_name: bin_name)
 
 
+@pytest.fixture(autouse=True)
+def _virtual_worktree_risk_diff_is_clean(monkeypatch):
+    """Keep mocked-worktree tests explicit about their successful risk scan.
+
+    Board-clearing unit tests generally mock ``cmd_start`` and model lifecycle
+    state in ticket files without creating an actual Git worktree.  A missing
+    worktree is now correctly fail-closed in production, so these tests need a
+    successful diff result unless a test intentionally overrides it to cover
+    the failure path.
+    """
+    from lanegate.git import GitText
+
+    monkeypatch.setattr(
+        "lanegate.orchestrate.loop._git_text",
+        lambda *_args, **_kwargs: GitText(""),
+    )
+
+
 def _write_ticket(
     tickets_dir: Path,
     ticket_id: str,
@@ -285,6 +304,7 @@ __all__ = [
     "_find_claude_transcript",
     "_format_conflict_detail",
     "_gather_rate_limit_texts",
+    "_hibernate_orphaned",
     "_is_auth_error",
     "_is_blocked_file",
     "_is_combined_mode",

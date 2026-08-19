@@ -168,6 +168,34 @@ def test_claim_file_missing_ticket_exits_1(repo, capsys):
     assert "TICK-999" in err
 
 
+# ── Malformed ticket id elsewhere in the tickets directory ────────────────────
+
+
+def test_claim_files_skips_malformed_ticket_id_when_scanning(repo):
+    """A trailing-space id on an unrelated ticket must not crash the claim for a valid one."""
+    _write_ticket(repo / "tickets", "TICK-001", "in_progress", touches=[])
+    (repo / "tickets" / "TICK-900.md").write_text(
+        "---\nid: 'TICK-900 '\ntitle: Malformed\nstatus: open\ntouches: []\n---\n## Body\n"
+    )
+    ok, detail = claim_files(["src/foo.py"], "TICK-001", _CFG, repo)
+    assert ok
+    assert detail is None
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert "src/foo.py" in t["touches"]
+
+
+def test_claim_files_detects_conflict_from_malformed_id_ticket(repo):
+    """A malformed-id ticket that legitimately locks a file must still block the claim."""
+    (repo / "tickets" / "TICK-900.md").write_text(
+        "---\nid: 'TICK-900 '\ntitle: Malformed\nstatus: in_progress\n"
+        "touches:\n- src/shared.py\n---\n## Body\n"
+    )
+    _write_ticket(repo / "tickets", "TICK-001", "in_progress", touches=[])
+    ok, detail = claim_files(["src/shared.py"], "TICK-001", _CFG, repo)
+    assert not ok
+    assert detail and "src/shared.py" in detail
+
+
 # ── Git commit is called when commit_status_changes is True ───────────────────
 
 
@@ -185,3 +213,32 @@ def test_claim_file_commits_when_enabled(repo):
     assert commit_calls, "expected a git commit call"
     commit_cmd = commit_calls[0].args[0]
     assert "--only" in commit_cmd
+    assert "-s" in commit_cmd
+
+
+# ── Worktree redirect ─────────────────────────────────────────────────────────
+
+
+def test_claim_files_worktree_redirect(tmp_path):
+    """claim_files updates ticket in main control repo root even when given worktree path."""
+    control_dir = tmp_path / "control"
+    worktree_dir = tmp_path / "worktree"
+    (control_dir / "tickets").mkdir(parents=True)
+    (worktree_dir / "tickets").mkdir(parents=True)
+
+    _write_ticket(control_dir / "tickets", "TICK-001", "in_progress", touches=[])
+    _write_ticket(worktree_dir / "tickets", "TICK-001", "in_progress", touches=[])
+
+    with patch("lanegate.claim_file._control_repo_root", return_value=control_dir):
+        ok, err = claim_files(["src/new.py"], "TICK-001", _CFG, worktree_dir)
+
+    assert ok
+    assert err is None
+
+    # Ticket in control repo root was updated
+    control_ticket = (control_dir / "tickets" / "TICK-001.md").read_text(encoding="utf-8")
+    assert "src/new.py" in control_ticket
+
+    # Ticket in worktree was NOT updated
+    worktree_ticket = (worktree_dir / "tickets" / "TICK-001.md").read_text(encoding="utf-8")
+    assert "src/new.py" not in worktree_ticket

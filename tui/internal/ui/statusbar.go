@@ -20,7 +20,10 @@ type StatusBar struct {
 	// narrow width is a minor inconvenience, but a page position cut off
 	// mid-word ("entrie...") is actively misleading.
 	PageInfo string
-	Keys     []string
+	// AttentionCount is the number of tickets waiting for a human decision.
+	// It is derived from the server-owned board predicate, not UI status names.
+	AttentionCount int
+	Keys           []string
 }
 
 // NewStatusBar creates a new status bar
@@ -63,6 +66,7 @@ func (sb *StatusBar) Render(width int) string {
 			keys = []string{"? help"}
 		}
 		prefix := fmt.Sprintf("  %s", sb.ScreenName)
+		prefix += fmt.Sprintf("  attention: %d", sb.AttentionCount)
 		if sb.PageInfo != "" {
 			prefix += "  " + sb.PageInfo
 		}
@@ -126,6 +130,11 @@ func (sb *StatusBar) ClearInfo() {
 // SetPageInfo sets the protected "where am I" fragment shown after ScreenName.
 func (sb *StatusBar) SetPageInfo(info string) {
 	sb.PageInfo = info
+}
+
+// SetAttentionCount updates the cross-screen needs-human-decision badge.
+func (sb *StatusBar) SetAttentionCount(count int) {
+	sb.AttentionCount = count
 }
 
 // FormatProgress returns a progress indicator string

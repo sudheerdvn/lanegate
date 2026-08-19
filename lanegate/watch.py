@@ -18,8 +18,8 @@ import time
 from pathlib import Path
 
 from lanegate import APP_NAME
-from lanegate.pidutil import pid_alive
 from lanegate.ticket import load_all_tickets
+from lanegate.watch_common import read_pid as _read_pid, write_log as _write_log
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -40,42 +40,9 @@ def _watch_log_file(repo_root: Path) -> Path:
     return state_dir / "watch.log"
 
 
-def _write_log(log_path: Path, line: str) -> None:
-    """Append one already-terminated line to the watch log."""
-    with open(log_path, "a") as f:
-        f.write(line)
-
-
 # ---------------------------------------------------------------------------
 # PID helpers
 # ---------------------------------------------------------------------------
-
-
-def _pid_alive(pid: int) -> bool:
-    """Return True if a process with this PID is currently running.
-
-    Delegates to the shared cross-platform probe; on Windows a plain
-    ``os.kill(pid, 0)`` would *terminate* the process being checked.
-    """
-    return pid_alive(pid)
-
-
-def _read_pid(pid_path: Path) -> int | None:
-    """
-    Return the PID from the pid file, or None if missing, unreadable, or stale
-    (i.e. the process is no longer running).
-    """
-    try:
-        raw = pid_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        pid = int(raw)
-    except (ValueError, TypeError):
-        return None
-    if _pid_alive(pid):
-        return pid
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +54,11 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     """
     Internal polling loop. Called by cmd_watch when running as a daemon.
     Logs to .lanegate/watch.log.
+
+    Shares its name with resume_watch._run_loop and notify_watch._run_loop
+    (TICK-366 duplicate-drift sweep). Each daemon polls a different
+    condition with a different body — this one watches PR review decisions —
+    so the shared name is intentional and no consolidation is needed.
     """
     log_path = _watch_log_file(repo_root)
     tickets_dir = Path(cfg.get("tickets_dir", "tickets"))

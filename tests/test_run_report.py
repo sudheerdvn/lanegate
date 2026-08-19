@@ -13,13 +13,20 @@ from unittest.mock import patch
 import pytest
 
 from lanegate.orchestrate.run_report import (
+    INTERNAL_RUN_ENV,
     _append_run_event,
+    begin_direct_action,
+    direct_action_tracking_suppressed,
+    _resolve_run_session_ts,
     build_run_report,
     build_run_summary,
     cmd_run_report,
     print_run_summary,
     read_logs_paginated,
+    record_direct_action_event,
+    cmd_ps,
 )
+from lanegate.logs import _line_style, semantic_line_metadata
 from lanegate.orchestrate.run_summary import (
     RunReason,
     RunSummary,
@@ -35,6 +42,12 @@ def _default_cfg(tmp_path: Path) -> dict:
         "ticket_prefix": "TICK",
         "worktrees_dir": ".lanegate/worktrees",
     }
+
+
+def test_internal_run_environment_suppresses_direct_action_tracking(monkeypatch):
+    """A child executor's CLI process inherits suppression across exec()."""
+    monkeypatch.setenv(INTERNAL_RUN_ENV, "1")
+    assert direct_action_tracking_suppressed()
 
 
 class TestBuildRunSummary:
@@ -92,6 +105,35 @@ class TestBuildRunSummary:
         assert ticket.duration_seconds == 9.0
         assert ticket.failure_reason is None
         assert ticket.review_reason is None
+
+    def test_build_run_summary_surfaces_triggered_by(self, tmp_path: Path):
+        cfg = _default_cfg(tmp_path)
+        session_ts = "2026-07-30T17-00-00"
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "run_start",
+            pid=os.getpid(),
+            ts="2026-07-30T17:00:00Z",
+            triggered_by="resume-watch",
+            trigger_reason="rate limit on TICK-1",
+        )
+        _append_run_event(tmp_path, session_ts, "run_end", status="completed", ts="2026-07-30T17:01:00Z")
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+        assert summary is not None
+        assert summary.triggered_by == "resume-watch"
+        assert summary.trigger_reason == "rate limit on TICK-1"
+
+        # Companion case: older-style run_start missing triggered_by defaults to 'manual'
+        session_ts_old = "2026-07-30T18-00-00"
+        _append_run_event(tmp_path, session_ts_old, "run_start", pid=os.getpid(), ts="2026-07-30T18:00:00Z")
+        _append_run_event(tmp_path, session_ts_old, "run_end", status="completed", ts="2026-07-30T18:01:00Z")
+
+        summary_old = build_run_summary(cfg, tmp_path, session_ts=session_ts_old)
+        assert summary_old is not None
+        assert summary_old.triggered_by == "manual"
+        assert summary_old.trigger_reason is None
 
     def test_successful_run_without_live_tickets_directory(self, tmp_path: Path):
         """Historical summaries remain available after live tickets are removed."""
@@ -166,6 +208,99 @@ class TestBuildRunSummary:
         assert t.failure_reason == "pytest exited with code 1"
         assert t.review_reason is None
 
+    def test_auto_merged_ticket_reconciled_in_run_summary(self, tmp_path: Path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / cfg["tickets_dir"]
+        tickets_dir.mkdir(parents=True, exist_ok=True)
+        (tickets_dir / "TICK-001.md").write_text(
+            "---\n"
+            "id: TICK-001\n"
+            "title: Merged Ticket\n"
+            "status: merged\n"
+            "priority: 5\n"
+            "---\n"
+            "Body.\n"
+        )
+        session_ts = "2026-07-30T16-30-00"
+        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid(), ts="2026-07-30T16:30:00Z")
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_dispatch",
+            ticket_id="TICK-001",
+            executor="claude",
+            ts="2026-07-30T16:30:01Z",
+        )
+        _append_run_event(tmp_path, session_ts, "run_end", status="completed", ts="2026-07-30T16:30:10Z")
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+        assert summary is not None
+        assert len(summary.batch_tickets) == 1
+        t = summary.batch_tickets[0]
+        assert t.ticket_id == "TICK-001"
+        assert t.outcome == TicketOutcomeStatus.INTERRUPTED
+
+    def test_build_run_summary_skips_malformed_ticket_id(self, tmp_path: Path):
+        """A trailing-space id on an unrelated ticket must not crash the summary build."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / cfg["tickets_dir"]
+        tickets_dir.mkdir(parents=True, exist_ok=True)
+        (tickets_dir / "TICK-900.md").write_text(
+            "---\nid: 'TICK-900 '\ntitle: Malformed\nstatus: open\npriority: 5\n---\nBody.\n"
+        )
+        session_ts = "2026-07-30T16-14-00"
+        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid(), ts="2026-07-30T16:14:00Z")
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_dispatch",
+            ticket_id="TICK-001",
+            executor="claude-a",
+            ts="2026-07-30T16:14:01Z",
+        )
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_outcome",
+            ticket_id="TICK-001",
+            outcome="success",
+            ts="2026-07-30T16:14:10Z",
+        )
+        _append_run_event(tmp_path, session_ts, "run_end", status="completed", ts="2026-07-30T16:14:11Z")
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+        assert summary is not None
+        assert len(summary.batch_tickets) == 1
+        assert summary.batch_tickets[0].ticket_id == "TICK-001"
+        assert summary.batch_tickets[0].outcome == TicketOutcomeStatus.SUCCESS
+
+    def test_running_run_returns_running_reason(self, tmp_path: Path):
+        cfg = _default_cfg(tmp_path)
+        session_ts = "2026-07-30T16-15-00"
+        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid(), ts="2026-07-30T16:15:00Z")
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_dispatch",
+            ticket_id="TICK-003",
+            executor="gpt-4o",
+            ts="2026-07-30T16:15:01Z",
+        )
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_outcome",
+            ticket_id="TICK-003",
+            outcome="failed",
+            reason="pytest exited with code 1",
+            ts="2026-07-30T16:15:05Z",
+        )
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+
+        assert summary is not None
+        assert summary.reason == RunReason.RUNNING
+
     def test_changes_requested_run(self, tmp_path: Path):
         cfg = _default_cfg(tmp_path)
         session_ts = "2026-07-30T16-20-00"
@@ -202,6 +337,39 @@ class TestBuildRunSummary:
         assert t.duration_seconds == 7.0
         assert t.failure_reason is None
         assert t.review_reason == "review requested changes"
+
+    def test_awaiting_human_review_run(self, tmp_path: Path):
+        cfg = _default_cfg(tmp_path)
+        session_ts = "2026-07-30T16-20-30"
+        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid(), ts="2026-07-30T16:20:30Z")
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_dispatch",
+            ticket_id="TICK-003",
+            executor="claude-b",
+            was_hibernated=False,
+            ts="2026-07-30T16:20:31Z",
+        )
+        _append_run_event(
+            tmp_path,
+            session_ts,
+            "ticket_outcome",
+            ticket_id="TICK-003",
+            outcome="awaiting_human_review",
+            reason=None,
+            ts="2026-07-30T16:20:38Z",
+        )
+        _append_run_event(tmp_path, session_ts, "run_end", status="completed", ts="2026-07-30T16:20:39Z")
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+        assert summary is not None
+        assert summary.reason == RunReason.STOPPED
+        assert len(summary.batch_tickets) == 1
+
+        t = summary.batch_tickets[0]
+        assert t.outcome == TicketOutcomeStatus.AWAITING_MERGE
+        assert t.review_reason == "reviewer approved — run `lanegate merge` to land it"
 
     def test_changes_requested_run_prefers_verdict_json_reason(self, tmp_path: Path):
         cfg = _default_cfg(tmp_path)
@@ -397,6 +565,103 @@ def test_read_logs_paginated_prefers_raw_log_over_structured_events(tmp_path: Pa
     assert payload["total_count"] == 2
 
 
+def test_read_logs_paginated_includes_presentation_metadata(tmp_path: Path):
+    session_ts = "2026-07-30T15-30-01"
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text(
+        "[orchestrate] TICK-1: executor finished (exit 0)\n"
+        "[orchestrate] TICK-2: WARNING — rate limited\n"
+        "executor failed (exit 1)\n"
+        '{"type":"item.started"}\n'
+        "[orchestrate] review verdict CHANGES_REQUESTED\n"
+        "+added line\n"
+    )
+
+    payload = read_logs_paginated(tmp_path, session_ts)
+
+    assert payload is not None
+    assert [event["message"] for event in payload["events"]] == [
+        "[orchestrate] TICK-1: executor finished (exit 0)",
+        "[orchestrate] TICK-2: WARNING — rate limited",
+        "executor failed (exit 1)",
+        '{"type":"item.started"}',
+        "[orchestrate] review verdict CHANGES_REQUESTED",
+        "+added line",
+    ]
+    assert [
+        {key: event[key] for key in ("style", "level", "kind")}
+        for event in payload["events"]
+    ] == [
+        semantic_line_metadata(line)
+        for line in [
+            "[orchestrate] TICK-1: executor finished (exit 0)",
+            "[orchestrate] TICK-2: WARNING — rate limited",
+            "executor failed (exit 1)",
+            '{"type":"item.started"}',
+            "[orchestrate] review verdict CHANGES_REQUESTED",
+            "+added line",
+        ]
+    ]
+    assert [(event["level"], event["kind"]) for event in payload["events"]] == [
+        ("info", "orchestrator"),
+        ("warning", "orchestrator"),
+        ("error", "executor"),
+        ("info", "protocol"),
+        ("warning", "orchestrator"),
+        ("success", "executor"),
+    ]
+
+
+def test_line_style_anchored_error():
+    for line in (
+        "ERROR: executor could not start",
+        "[orchestrate] ERROR worker exited unexpectedly",
+        "Traceback (most recent call last):",
+        "  ERROR: executor could not start",
+        "  Traceback (most recent call last):",
+        "[orchestrate] TICK-500: executor configuration failed for 'codex': no such binary",
+        "[orchestrate] TICK-500 merge failed — downgrading to needs_review",
+        "FAILED tests/test_run_report.py::test_x - AssertionError",
+        "[orchestrate] TICK-500 executor finished (exit 1, 87s elapsed)",
+        "executor failed (exit code 1: general error)",
+    ):
+        assert _line_style(line) == "bold red"
+        assert semantic_line_metadata(line)["level"] == "error"
+
+    for line in (
+        "The ticket body mentions ERROR: handling.",
+        "The previous run FAILED after a retry.",
+        "See traceback details in the review notes.",
+        "executor completed (exit 0)",
+    ):
+        assert _line_style(line) != "bold red"
+        assert semantic_line_metadata(line)["level"] != "error"
+
+
+def test_read_logs_paginated_action_events_include_presentation_metadata(tmp_path: Path):
+    action_id = "action-2026-07-30T15-30-02Z"
+    record_direct_action_event(
+        tmp_path,
+        action_id,
+        "action_end",
+        status="failed",
+        message="ERROR: action could not complete",
+    )
+
+    payload = read_logs_paginated(tmp_path, action_id)
+
+    assert payload is not None
+    assert payload["run_id"] == action_id
+    event = payload["events"][0]
+    assert event["message"] == "ERROR: action could not complete"
+    assert {key: event[key] for key in ("level", "style", "kind")} == {
+        "level": "error",
+        "style": "bold red",
+        "kind": "structured",
+    }
+
+
 def test_read_logs_paginated_redacts_raw_log_messages_without_changing_pagination(tmp_path: Path):
     session_ts = "2026-07-30T15-31-00"
     _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid())
@@ -412,6 +677,102 @@ def test_read_logs_paginated_redacts_raw_log_messages_without_changing_paginatio
     assert payload["next_offset"] is None
     assert "sk-" not in payload["events"][0]["message"]
     assert "[REDACTED]" in payload["events"][0]["message"]
+
+
+def test_read_log_page_post_slice_enrichment(tmp_path: Path):
+    session_ts = "2026-07-30T15-31-01"
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    selected_line = "api_key=sk-1234567890123456789012"
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text(
+        f"before page\n{selected_line}\nafter page\n"
+    )
+
+    with patch(
+        "lanegate.orchestrate.run_report.redact_transcript_text",
+        side_effect=lambda message: f"redacted:{message}",
+    ) as redact, patch(
+        "lanegate.orchestrate.run_report.semantic_line_metadata",
+        return_value={"style": "", "level": "info", "kind": "executor"},
+    ) as metadata:
+        payload = read_logs_paginated(tmp_path, session_ts, offset=1, limit=1)
+
+    assert payload is not None
+    assert payload["total_count"] == 3
+    assert payload["offset"] == 1
+    assert payload["next_offset"] == 2
+    assert payload["events"] == [
+        {
+            "ts": "",
+            "event": "log",
+            "message": f"redacted:{selected_line}",
+            "level": "info",
+            "style": "",
+            "kind": "executor",
+        }
+    ]
+    redact.assert_called_once_with(selected_line)
+    metadata.assert_called_once_with(f"redacted:{selected_line}")
+
+
+def test_resolve_run_session_ts_validates_session_id(tmp_path: Path):
+    invalid_run_ids = (
+        "TICK-001-1700000000-1-implement",
+        "2026-08-10T18-32-45",
+    )
+
+    for run_id in invalid_run_ids:
+        assert _resolve_run_session_ts(tmp_path, run_id) is None
+        assert read_logs_paginated(tmp_path, run_id) is None
+
+
+def test_resolve_run_session_ts_maps_current_api_run_to_active_session(tmp_path: Path):
+    api_run_id = "run-20260810T050000Z-a1b2c3d4"
+    session_ts = "2026-08-10T18-32-45"
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True)
+    (tmp_path / ".lanegate" / "api-run-current.json").write_text(json.dumps({"run_id": api_run_id}))
+    (logs_dir / f"orchestrate-{session_ts}.log").write_text("API audit line\n")
+
+    with patch("lanegate.orchestrate.run_report.orchestrator_lock_status", return_value={"held": True}):
+        assert _resolve_run_session_ts(tmp_path, api_run_id) == session_ts
+        payload = read_logs_paginated(tmp_path, api_run_id)
+
+    assert payload is not None
+    assert payload["run_id"] == session_ts
+    assert [event["message"] for event in payload["events"]] == ["API audit line"]
+
+
+def test_run_summary_preserves_all_executors_that_handled_a_ticket(tmp_path: Path):
+    """A fix/review failover must not be reported as only its first worker."""
+    cfg = _default_cfg(tmp_path)
+    session_ts = "2026-08-11T16-35-23"
+    _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid(), ts="2026-08-11T23:35:23Z")
+    _append_run_event(
+        tmp_path, session_ts, "ticket_dispatch", ticket_id="TICK-500", executor="claude-a",
+        ts="2026-08-11T23:35:41Z",
+    )
+    _append_run_event(
+        tmp_path, session_ts, "executor_metrics", ticket_id="TICK-500",
+        metrics={"step": "fix", "executor": "codex"}, ts="2026-08-11T23:45:42Z",
+    )
+    _append_run_event(
+        tmp_path, session_ts, "executor_progress", ticket_id="TICK-500",
+        progress={"executor": "claude-b"}, ts="2026-08-11T23:46:39Z",
+    )
+    _append_run_event(
+        tmp_path, session_ts, "ticket_outcome", ticket_id="TICK-500", outcome="merged",
+        ts="2026-08-12T00:01:17Z",
+    )
+    _append_run_event(tmp_path, session_ts, "run_end", status="completed", ts="2026-08-12T00:01:32Z")
+
+    summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+    report = build_run_report(cfg, tmp_path, session_ts=session_ts)
+
+    assert summary is not None
+    assert summary.batch_tickets[0].executor == "claude-a → codex → claude-b"
+    assert report is not None
+    assert report["tickets"][0]["executor"] == "claude-a → codex → claude-b"
 
 
 class TestUnfinishedDispatchedTicket:
@@ -465,10 +826,25 @@ class TestUnfinishedDispatchedTicket:
         assert t.duration_seconds >= 0
         assert t.failure_reason is not None
         assert "lanegate ps" in t.failure_reason
-        assert "lanegate orchestrate --tickets TICK-601" in t.failure_reason
+        assert "lanegate run --tickets TICK-601" in t.failure_reason
 
 
 class TestCmdRunReport:
+    def test_run_report_accepts_direct_action_id(self, tmp_path: Path, capsys):
+        cfg = _default_cfg(tmp_path)
+        tracking = begin_direct_action(tmp_path, "merge", ticket_id="TICK-123", executor="cli")
+        record_direct_action_event(
+            tmp_path, tracking["action_id"], "action_end", action_type="merge",
+            ticket_id="TICK-123", status="success",
+        )
+
+        cmd_run_report(cfg, tmp_path, session_ts=tracking["action_id"])
+
+        out = capsys.readouterr().out
+        assert f"Action: {tracking['action_id']}" in out
+        assert "status: success" in out
+        assert "TICK-123" in out
+
     def test_run_report_text_output_includes_terminal_reason_and_summary(self, tmp_path: Path, capsys):
         cfg = _default_cfg(tmp_path)
         session_ts = "2026-07-30T17-00-00"
@@ -541,3 +917,60 @@ class TestCmdRunReport:
         assert t_data["duration_seconds"] == 9.0
         assert t_data["failure_reason"] is None
         assert t_data["review_reason"] is None
+
+
+def test_ps_includes_recent_completed_direct_actions(tmp_path: Path, capsys):
+    cfg = _default_cfg(tmp_path)
+    tracking = begin_direct_action(tmp_path, "review", ticket_id="TICK-123", executor="cli")
+    record_direct_action_event(
+        tmp_path, tracking["action_id"], "action_end", action_type="review",
+        ticket_id="TICK-123", status="success",
+    )
+
+    assert Path(tracking["log_path"]).is_file()
+    assert '"action_type": "review"' in Path(tracking["log_path"]).read_text()
+    cmd_ps(cfg, tmp_path)
+    out = capsys.readouterr().out
+    assert tracking["action_id"] in out
+    assert "Direct actions (recent):" in out
+
+
+def test_ps_includes_running_direct_actions(tmp_path: Path, capsys):
+    cfg = _default_cfg(tmp_path)
+    tracking = begin_direct_action(tmp_path, "review", ticket_id="TICK-123", executor="cli")
+
+    cmd_ps(cfg, tmp_path)
+    out = capsys.readouterr().out
+    assert tracking["action_id"] in out
+    assert "Direct actions (recent):" in out
+
+
+def test_stream_subprocess_kills_process_on_worktree_guard_violation(tmp_path: Path):
+    import sys
+    import time
+    from lanegate.orchestrate.pool import WorktreeGuardViolation
+    from lanegate.orchestrate.run_report import _stream_subprocess
+
+    cmd = [
+        sys.executable,
+        "-c",
+        "import time; [print(i, flush=True) or time.sleep(0.05) for i in range(200)]",
+    ]
+
+    def on_line_guard(line: str, is_stdout: bool = True):
+        raise WorktreeGuardViolation("[worktree-guard] test violation")
+
+    start_ts = time.time()
+    rc, stdout, stderr, kill_reason = _stream_subprocess(
+        cmd,
+        str(tmp_path),
+        on_line=on_line_guard,
+        idle_timeout=5,
+        absolute_ceiling=5,
+    )
+    elapsed = time.time() - start_ts
+
+    assert rc != 0
+    assert kill_reason == "worktree_violation"
+    assert elapsed < 3.0
+

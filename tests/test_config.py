@@ -1,6 +1,10 @@
 """Tests for config.py — load, walk-up discovery, environment validation."""
 
 import json
+import os
+import subprocess
+import sys
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +16,9 @@ from lanegate.config import (
     _DEFAULT_IMPLEMENT_MODEL,
     _DEFAULT_RESUME_CEILING_S,
     _DEFAULT_REVIEW_MODEL,
+    _control_checkout_root,
+    _trusted_git_executable,
+    _windows_git_candidates,
     _gitignore_entries,
     CONFIG_FILENAME,
     _default_config,
@@ -19,7 +26,9 @@ from lanegate.config import (
     _update_gitignore,
     detect_test_runner_safeguards,
     find_config,
+    find_repo_root,
     interactive_init,
+    is_high_reasoning_ticket,
     load_config,
     protected_branches,
     registry_add,
@@ -30,6 +39,7 @@ from lanegate.config import (
     resolve_model,
     resolve_session_chaining,
     suggested_safeguards_yaml,
+    validate_model_for_executor,
 )
 
 
@@ -53,6 +63,47 @@ def test_load_defaults_when_no_config(tmp_path):
     assert cfg["executor_idle_timeout_seconds"] == 75
     assert cfg["executor_stall_timeout_seconds"] == 900
     assert cfg["executor_absolute_ceiling_seconds"] == 1500
+    assert cfg["review_fallback"] == "needs_review"
+    assert cfg["reference_docs"] == []
+
+
+def test_pre_merge_worktree_safeguard_defaults_true_and_accepts_false(tmp_path):
+    assert load_config(tmp_path)["safeguards"].get("pre_merge_worktree", True) is True
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "safeguards:\n  pre_merge_worktree: false\n",
+    )
+    assert load_config(tmp_path)["safeguards"]["pre_merge_worktree"] is False
+
+
+def test_pre_merge_worktree_safeguard_requires_boolean(tmp_path):
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "safeguards:\n  pre_merge_worktree: sometimes\n",
+    )
+
+    with pytest.raises(ConfigError, match="pre_merge_worktree must be a boolean"):
+        load_config(tmp_path)
+
+
+def test_reference_docs_default(tmp_path):
+    cfg = load_config(tmp_path)
+    assert cfg["reference_docs"] == []
+
+
+def test_architecture_doc_deprecation_warning(tmp_path):
+    _write_config(tmp_path / CONFIG_FILENAME, "architecture_doc: docs/ARCHITECTURE.md\n")
+    with pytest.deprecated_call(match="architecture_doc"):
+        load_config(tmp_path)
+
+
+def test_review_fallback_is_validated(tmp_path):
+    _write_config(tmp_path / CONFIG_FILENAME, "review_fallback: same_model\n")
+    assert load_config(tmp_path)["review_fallback"] == "same_model"
+    _write_config(tmp_path / CONFIG_FILENAME, "review_fallback: arbitrary\n")
+    with pytest.raises(ConfigError, match="review_fallback"):
+        load_config(tmp_path)
 
 
 def test_trunk_branch_explicit_config_overrides_detection(tmp_path):
@@ -284,6 +335,323 @@ def test_find_config_returns_none_when_absent(tmp_path):
     assert find_config(tmp_path) is None
 
 
+def test_control_checkout_root_does_not_require_path_format_for_legacy_git(tmp_path):
+    """Git 2.25 supports --git-common-dir but not --path-format=absolute."""
+    control = tmp_path / "control"
+    result = subprocess.CompletedProcess([], 0, stdout=f"{control / '.git'}\n", stderr="")
+
+    with mock.patch("lanegate.config.subprocess.run", return_value=result) as run:
+        assert _control_checkout_root(tmp_path / "worktree") == control
+
+    assert "--path-format=absolute" not in run.call_args.args[0]
+
+
+def test_control_checkout_root_uses_platform_git_and_disables_prompts(tmp_path):
+    """The trusted probe neither resolves Git from caller PATH nor prompts."""
+    control = tmp_path / "control"
+    result = subprocess.CompletedProcess([], 0, stdout=f"{control / '.git'}\n", stderr="")
+
+    with (
+        mock.patch("lanegate.config._trusted_git_executable", return_value="/usr/bin/git") as git,
+        mock.patch("lanegate.config.subprocess.run", return_value=result) as run,
+    ):
+        assert _control_checkout_root(tmp_path / "worktree") == control
+
+    git.assert_called_once_with()
+    assert run.call_args.args[0][0] == "/usr/bin/git"
+    assert run.call_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
+    assert "input" not in run.call_args.kwargs
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="trust check is PATH+ownership based only on POSIX; Windows uses registry-only lookup",
+)
+def test_trusted_git_lookup_accepts_protected_nonstandard_path(tmp_path, monkeypatch):
+    """A protected Git installation need not live in a hard-coded prefix."""
+    install = tmp_path / "opt" / "company-git" / "bin"
+    install.mkdir(parents=True)
+    git = install / "git"
+    git.write_text("#!/bin/sh\n")
+    git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'agent-bin'}{os.pathsep}{install}")
+
+    def protected(path):
+        return path == git.resolve()
+
+    with mock.patch("lanegate.config._is_protected_executable", side_effect=protected):
+        assert _trusted_git_executable() == str(git.resolve())
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="trust check is PATH+ownership based only on POSIX; Windows uses registry-only lookup",
+)
+def test_trusted_git_lookup_rejects_current_directory_and_unprotected_path(tmp_path, monkeypatch):
+    """PATH cannot select an agent binary, including through an empty entry."""
+    agent_bin = tmp_path / "agent-bin"
+    agent_bin.mkdir()
+    fake_git = agent_bin / "git"
+    fake_git.write_text("#!/bin/sh\n")
+    fake_git.chmod(0o755)
+    monkeypatch.chdir(agent_bin)
+    monkeypatch.setenv("PATH", f"{os.pathsep}{agent_bin}")
+
+    with pytest.raises(ConfigError, match="trusted Git control checkout"):
+        _trusted_git_executable()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="os.geteuid does not exist on Windows; ownership trust check is POSIX-only",
+)
+def test_trusted_git_lookup_accepts_root_owned_path_when_running_as_root(tmp_path, monkeypatch):
+    """Root cannot use effective ownership as a meaningful trust boundary."""
+    git = tmp_path / "git"
+    git.write_text("#!/bin/sh\n")
+    git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with (
+        mock.patch("lanegate.config.os.geteuid", return_value=0),
+        mock.patch(
+            "lanegate.config.Path.stat",
+            return_value=mock.Mock(st_uid=0, st_mode=0o100755),
+        ),
+    ):
+        assert _trusted_git_executable() == str(git.resolve())
+
+
+def test_windows_git_candidates_include_machine_registered_custom_install():
+    """A custom admin-installed Git prefix is found without consulting PATH."""
+    class FakeWinreg:
+        HKEY_LOCAL_MACHINE = object()
+        KEY_READ = 1
+        KEY_WOW64_64KEY = 2
+        KEY_WOW64_32KEY = 4
+
+        @staticmethod
+        def OpenKey(root, key_name, reserved, access):
+            assert key_name in {
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\git.exe",
+                r"SOFTWARE\GitForWindows",
+            }
+            return nullcontext(key_name)
+
+        @staticmethod
+        def QueryValueEx(key, value_name):
+            if key == r"SOFTWARE\GitForWindows" and value_name == "InstallPath":
+                return r"D:\Tools\Git", 1
+            raise OSError("missing")
+
+    with mock.patch.dict("sys.modules", {"winreg": FakeWinreg}):
+        candidates = _windows_git_candidates()
+
+    custom_install = Path(r"D:\Tools\Git")
+    assert custom_install / "cmd" / "git.exe" in candidates
+    assert custom_install / "bin" / "git.exe" in candidates
+
+
+def test_windows_trusted_git_lookup_uses_registered_custom_install(tmp_path):
+    git = tmp_path / "git.exe"
+    git.write_text("git")
+    git.chmod(0o755)
+
+    with (
+        mock.patch("lanegate.config.os.name", "nt"),
+        mock.patch("lanegate.config._windows_git_candidates", return_value=(git,)),
+    ):
+        assert _trusted_git_executable() == str(git.resolve())
+
+
+def test_control_checkout_root_strips_caller_git_environment(tmp_path, monkeypatch):
+    """Agent Git overrides cannot make a worktree look like a non-repository."""
+    control = tmp_path / "control"
+    result = subprocess.CompletedProcess([], 0, stdout=f"{control / '.git'}\n", stderr="")
+    monkeypatch.setenv("GIT_DIR", "/tmp/attacker-controlled-git-dir")
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path / "worktree"))
+
+    with (
+        mock.patch("lanegate.config._trusted_git_executable", return_value="/usr/bin/git"),
+        mock.patch("lanegate.config.subprocess.run", return_value=result) as run,
+    ):
+        assert _control_checkout_root(tmp_path / "worktree") == control
+
+    probe_env = run.call_args.kwargs["env"]
+    assert "GIT_DIR" not in probe_env
+    assert "GIT_CEILING_DIRECTORIES" not in probe_env
+    assert probe_env["GIT_TERMINAL_PROMPT"] == "0"
+    assert run.call_args.args[0][1:] == ["-C", str(tmp_path / "worktree"), "rev-parse", "--git-common-dir"]
+
+
+def test_control_checkout_root_fails_closed_when_git_probe_fails(tmp_path):
+    """A failed Git probe must not restore worktree-local config discovery."""
+    result = subprocess.CompletedProcess([], 1, stdout="", stderr="git wrapper refused probe")
+
+    with mock.patch("lanegate.config.subprocess.run", return_value=result):
+        with pytest.raises(ConfigError, match="trusted Git control checkout"):
+            _control_checkout_root(tmp_path / "worktree")
+
+
+def test_control_checkout_root_allows_walk_up_outside_a_git_repository(tmp_path):
+    """The explicit non-repository result preserves standalone discovery."""
+    result = subprocess.CompletedProcess([], 128, stdout="", stderr="fatal: not a git repository")
+
+    with mock.patch("lanegate.config.subprocess.run", return_value=result):
+        assert _control_checkout_root(tmp_path) is None
+
+
+def test_linked_worktree_uses_control_checkout_config(tmp_path):
+    """A worktree-local config cannot override lifecycle command safeguards."""
+    control = tmp_path / "control"
+    worktree = tmp_path / "worktree"
+    control.mkdir()
+    subprocess.run(["git", "init", str(control)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.name", "LaneGate Test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "commit", "--allow-empty", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(control / CONFIG_FILENAME, "safeguards:\n  pre_complete: [trusted-check]\n")
+    subprocess.run(
+        ["git", "-C", str(control), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(worktree / CONFIG_FILENAME, "safeguards: {}\n")
+
+    assert find_config(worktree) == control / CONFIG_FILENAME
+    assert find_repo_root(worktree) == control
+    assert load_config(find_repo_root(worktree))["safeguards"]["pre_complete"] == ["trusted-check"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="a literal newline in a path is not a creatable git worktree name on Windows",
+)
+def test_newline_named_worktree_uses_control_checkout_config(tmp_path):
+    """A newline in a worktree path cannot restore walk-up config discovery."""
+    control = tmp_path / "control"
+    worktree = tmp_path / "worktree\nnewline"
+    control.mkdir()
+    subprocess.run(["git", "init", str(control)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.name", "LaneGate Test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "commit", "--allow-empty", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(control / CONFIG_FILENAME, "safeguards:\n  pre_complete: [trusted-check]\n")
+    subprocess.run(
+        ["git", "-C", str(control), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(worktree / CONFIG_FILENAME, "safeguards: {}\n")
+
+    assert find_config(worktree) == control / CONFIG_FILENAME
+    assert find_repo_root(worktree) == control
+
+
+def test_submodule_linked_worktree_uses_submodule_control_config(tmp_path):
+    """A submodule's linked worktree cannot use a worktree-local config."""
+    source = tmp_path / "submodule-source"
+    control = tmp_path / "control"
+    worktree = tmp_path / "submodule-worktree"
+    source.mkdir()
+    subprocess.run(["git", "init", str(source)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "LaneGate Test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(source / CONFIG_FILENAME, "safeguards:\n  pre_complete: [trusted-check]\n")
+    subprocess.run(
+        ["git", "-C", str(source), "add", CONFIG_FILENAME],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    control.mkdir()
+    subprocess.run(["git", "init", str(control)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "config", "user.name", "LaneGate Test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "-c", "protocol.file.allow=always", "submodule", "add", str(source), "sub"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(control), "commit", "-am", "add submodule"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    submodule = control / "sub"
+    subprocess.run(
+        ["git", "-C", str(submodule), "worktree", "add", "--detach", str(worktree)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _write_config(worktree / CONFIG_FILENAME, "safeguards: {}\n")
+
+    assert find_config(worktree) == submodule / CONFIG_FILENAME
+    assert find_repo_root(worktree) == submodule
+
+
 def test_environment_normalization(tmp_path):
     _write_config(
         tmp_path / CONFIG_FILENAME,
@@ -468,11 +836,12 @@ def test_resolve_max_parallel_falls_back_to_default():
 
 
 def test_resolve_max_parallel_with_pool(tmp_path):
-    """TICK-286: a bare `executor:` value that doesn't match any named
+    """TICK-618: a bare `executor:` value that doesn't match any named
     instance (only claude-a/claude-b are defined) must not silently fall
     through to the top-level/default value when a default_pool actually
-    governs dispatch — it should pick up the minimum per-instance cap across
-    that pool's instances instead."""
+    governs dispatch — it should pick up the summed per-instance cap across
+    that pool's instances instead, since per-instance caps and least-loaded
+    routing already prevent overloading any single instance."""
     _write_config(
         tmp_path / CONFIG_FILENAME,
         """
@@ -490,14 +859,122 @@ default_pool: default
     cfg = load_config(tmp_path)
 
     detail = resolve_max_parallel_detail(cfg)
-    assert detail["value"] == 2  # min(2, 5)
-    assert detail["source"] == "pool instance cap (min)"
+    assert detail["value"] == 7  # sum(2, 5)
+    assert detail["source"] == "pool instance cap (sum)"
     assert detail["pool"] == "default"
     assert detail["overrides"] == {
         "source": "global config",
         "value": 10,
         "config_key": "max_parallel",
     }
+    assert resolve_max_parallel(cfg) == 7
+
+
+def test_resolve_max_parallel_pool_sum_multi_instance(tmp_path):
+    """TICK-618: a single low-capacity pool instance (e.g. a GPU-bound local
+    model at max_parallel: 1) must not throttle the entire batch dispatcher
+    down to 1 — the resolved cap should reflect the pool's total capacity
+    across all instances."""
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """
+executor: claude
+executors:
+  aider-ollama-27b: { type: aider, max_parallel: 1 }
+  agy-claude: { type: agy, max_parallel: 3 }
+  claude-b: { type: claude-process, max_parallel: 3 }
+  claude-a: { type: claude-process, max_parallel: 3 }
+pools:
+  default:
+    executors: [aider-ollama-27b, agy-claude, claude-b, claude-a]
+default_pool: default
+""",
+    )
+    cfg = load_config(tmp_path)
+
+    detail = resolve_max_parallel_detail(cfg)
+    assert detail["value"] == 10  # sum(1, 3, 3, 3)
+    assert detail["source"] == "pool instance cap (sum)"
+    assert resolve_max_parallel(cfg) == 10
+
+
+def test_resolve_max_parallel_pool_all_uncapped(tmp_path):
+    """TICK-618: when every pool instance omits max_parallel, capped == []
+    and the resolver must fall through to the top-level/default value rather
+    than sum([]) == 0 admitting zero work."""
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """
+executor: claude
+max_parallel: 4
+executors:
+  claude-a: { type: claude-process }
+  claude-b: { type: claude-process }
+pools:
+  default:
+    executors: [claude-a, claude-b]
+default_pool: default
+""",
+    )
+    cfg = load_config(tmp_path)
+
+    detail = resolve_max_parallel_detail(cfg)
+    assert detail["value"] == 4
+    assert detail["source"] == "global config"
+    assert resolve_max_parallel(cfg) == 4
+
+
+def test_resolve_max_parallel_pool_partially_uncapped(tmp_path):
+    """TICK-618 review finding: if even one pool instance omits max_parallel,
+    that instance has unbounded capacity, so summing only the capped
+    instances (e.g. sum([3]) == 3 while claude-b is uncapped) would wrongly
+    throttle the whole pool to 3 instead of treating the pool as unbounded
+    and falling through to the global max_parallel cap."""
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """
+executor: claude
+max_parallel: 10
+executors:
+  claude-a: { type: claude-process, max_parallel: 3 }
+  claude-b: { type: claude-process }
+pools:
+  default:
+    executors: [claude-a, claude-b]
+default_pool: default
+""",
+    )
+    cfg = load_config(tmp_path)
+
+    detail = resolve_max_parallel_detail(cfg)
+    assert detail["value"] == 10
+    assert detail["source"] == "global config"
+    assert resolve_max_parallel(cfg) == 10
+
+
+def test_resolve_max_parallel_pool_present_executor_still_short_circuits(tmp_path):
+    """TICK-618: a top-level `executor:` value that DOES match a named pool
+    instance must short-circuit at the default-executor-override case and
+    never reach the pool-sum branch."""
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """
+executor: claude-process
+executors:
+  claude-process: { type: claude-process, max_parallel: 2 }
+  claude-b: { type: claude-process, max_parallel: 5 }
+pools:
+  default:
+    executors: [claude-process, claude-b]
+default_pool: default
+""",
+    )
+    cfg = load_config(tmp_path)
+
+    detail = resolve_max_parallel_detail(cfg)
+    assert detail["value"] == 2
+    assert detail["source"] == "default executor override"
+    assert detail["default_executor"] == "claude-process"
     assert resolve_max_parallel(cfg) == 2
 
 
@@ -764,6 +1241,64 @@ default_pool: default
     assert cfg["pools"]["default"]["executors"] == ["claude-2", "claude-1"]
     # Unrelated top-level settings must survive the round-trip.
     assert cfg["ticket_prefix"] == "TICK"
+
+
+def test_update_pool_executor_order_preserves_comments(tmp_path):
+    from lanegate.config import update_pool_executor_order
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """# top-of-file comment
+ticket_prefix: TICK  # inline comment
+executors:
+  claude-1: { type: claude-process }
+  claude-2: { type: claude-process }
+# comment above pools
+pools:
+  default:
+    executors: [claude-1, claude-2]
+    strategy: least-loaded
+default_pool: default
+""",
+    )
+
+    update_pool_executor_order(tmp_path, "default", ["claude-2", "claude-1"])
+
+    text = (tmp_path / CONFIG_FILENAME).read_text(encoding="utf-8")
+    assert "# top-of-file comment" in text
+    assert "# inline comment" in text
+    assert "# comment above pools" in text
+    assert "executors: [claude-2, claude-1]" in text
+
+    cfg = load_config(tmp_path)
+    assert cfg["pools"]["default"]["executors"] == ["claude-2", "claude-1"]
+
+
+def test_update_pool_executor_order_preserves_comments_block_style(tmp_path):
+    from lanegate.config import update_pool_executor_order
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        """executors:
+  claude-1: { type: claude-process }
+  claude-2: { type: claude-process }
+pools:
+  default:
+    executors:
+      - claude-1  # primary
+      - claude-2
+    strategy: least-loaded
+default_pool: default
+""",
+    )
+
+    update_pool_executor_order(tmp_path, "default", ["claude-2", "claude-1"])
+
+    text = (tmp_path / CONFIG_FILENAME).read_text(encoding="utf-8")
+    assert "- claude-2\n      - claude-1  # primary" in text
+
+    cfg = load_config(tmp_path)
+    assert cfg["pools"]["default"]["executors"] == ["claude-2", "claude-1"]
 
 
 def test_update_pool_executor_order_unknown_pool_raises(tmp_path):
@@ -1099,6 +1634,32 @@ def test_detects_npm_test_script(tmp_path):
     assert _detected_commands(tmp_path) == ["npm test"]
 
 
+def test_detects_npm_test_cra_and_angular(tmp_path):
+    cra_dir = tmp_path / "cra"
+    cra_dir.mkdir()
+    (cra_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {"test": "react-scripts test"},
+                "dependencies": {"react-scripts": "5.0.1"},
+            }
+        )
+    )
+    assert _detected_commands(cra_dir) == ["CI=true npm test"]
+
+    angular_dir = tmp_path / "angular"
+    angular_dir.mkdir()
+    (angular_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {"test": "ng test"},
+                "devDependencies": {"@angular/cli": "17.0.0"},
+            }
+        )
+    )
+    assert _detected_commands(angular_dir) == ["ng test --watch=false"]
+
+
 def test_detects_cargo_test(tmp_path):
     (tmp_path / "Cargo.toml").write_text("[package]\nname = \"demo\"\n")
 
@@ -1109,6 +1670,24 @@ def test_detects_go_test(tmp_path):
     (tmp_path / "go.mod").write_text("module example.com/demo\n")
 
     assert _detected_commands(tmp_path) == ["go test"]
+
+
+def test_detects_maven(tmp_path):
+    (tmp_path / "pom.xml").write_text("<project></project>\n")
+
+    assert _detected_commands(tmp_path) == ["mvn test"]
+
+
+def test_detects_gradle(tmp_path):
+    (tmp_path / "build.gradle").write_text("plugins { id 'java' }\n")
+
+    assert _detected_commands(tmp_path) == ["./gradlew test"]
+
+
+def test_detects_gradle_kts(tmp_path):
+    (tmp_path / "build.gradle.kts").write_text("plugins { id(\"java\") }\n")
+
+    assert _detected_commands(tmp_path) == ["./gradlew test"]
 
 
 def test_detects_no_runner(tmp_path):
@@ -1222,6 +1801,179 @@ class TestInteractiveInit:
         assert cfg is not None
         assert cfg["ticket_prefix"] == "TICK"
 
+    def test_invalid_model_input_reprompts_until_valid(self, tmp_path, capsys):
+        """An unmapped model string (e.g. a GPT model for a claude executor)
+        must not be written into models: silently -- it previously left the
+        resulting .lanegate.yml unable to load at all (unmapped model error
+        on every `lanegate` command, with no way to re-run init to fix it)."""
+        responses = {"  models.implement": iter(["gpt-4-turbo", "claude-sonnet-5"])}
+
+        def fake_input(prompt_text: str = "") -> str:
+            for key, it in responses.items():
+                if key in prompt_text:
+                    return next(it, "")
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert cfg["models"]["implement"] == "claude-sonnet-5"
+        assert "Invalid model" in capsys.readouterr().out
+
+    def test_edit_format_rejects_yn_shaped_input_then_accepts_valid(self, tmp_path, capsys):
+        """Every other optional step in this wizard is an input(...[y/N])
+        confirm; typing 'y' here from muscle memory must not land in config
+        verbatim as `edit_format: y`, which every aider dispatch would then
+        pass straight through as `aider --edit-format y`."""
+        responses = {
+            "executor ": iter(["aider"]),
+            "executors.aider.edit_format": iter(["y", "whole"]),
+        }
+
+        def fake_input(prompt_text: str = "") -> str:
+            for key, it in responses.items():
+                if key in prompt_text:
+                    return next(it, "")
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert cfg["executors"]["aider"]["edit_format"] == "whole"
+        assert "Invalid edit_format" in capsys.readouterr().out
+
+    def test_blank_reviewer_prompt_leaves_reviewer_unset(self, tmp_path):
+        """Accepting a blank reviewer prompt must not silently write an
+        explicit `reviewer: <executor>` pin -- an explicit pin always wins
+        outright over resolve_independent_review_driver's ladder, including
+        the review_fallback: needs_review safety escalation that would
+        otherwise apply to an unconfigured single-account setup. Confirmed
+        live in a fresh-install smoke test: this previously meant every
+        interactively-initialized project permanently disabled that safety
+        net, even for someone who just hit Enter through the wizard."""
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=lambda _="": ""),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert cfg["executor"] == "claude"
+        assert "reviewer" not in cfg
+
+    def test_reviewer_prompt_bracket_shows_auto_not_executor_name(self, tmp_path):
+        """The reviewer prompt's bracketed default must not display the
+        executor name (e.g. '[agy]'): every other prompt in this wizard uses
+        the bracket to mean 'this is what Enter accepts', but a blank
+        reviewer answer does NOT write that value into config the way a
+        normal default would -- it leaves reviewer unset so the independence
+        ladder runs at dispatch time. Showing the executor name there looks
+        exactly like a normal default and misleads a user into thinking
+        blank == pinned to that executor. Confirmed live in a fresh-install
+        smoke test (agy round)."""
+        seen_prompts: list[str] = []
+
+        def fake_input(prompt_text: str = "") -> str:
+            seen_prompts.append(prompt_text)
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            interactive_init(tmp_path, force_interactive=True)
+
+        reviewer_prompt = next(p for p in seen_prompts if p.startswith("reviewer "))
+        assert "[auto]" in reviewer_prompt
+        assert "[claude]" not in reviewer_prompt
+
+    def test_explicit_reviewer_prompt_input_is_still_written(self, tmp_path):
+        """Typing a value at the reviewer prompt -- even one matching the
+        executor -- is a deliberate choice and must still be written as an
+        explicit pin, unlike leaving it blank."""
+
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("reviewer "):
+                return "claude"
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert cfg["reviewer"] == "claude"
+
+    def test_wizard_tolerates_stdin_exhausted_mid_prompt(self, tmp_path, capsys):
+        """Piped stdin that runs out mid-wizard (input() raises EOFError)
+        must degrade every remaining prompt to its default instead of
+        crashing with a raw traceback -- confirmed live in a fresh-install
+        smoke test: some prompts tolerated an empty/exhausted stdin while
+        others (anything routed through _prompt, the majority of the
+        wizard) did not. EOFError should behave exactly like an accepted
+        blank answer throughout, including the reviewer prompt's stricter
+        blank-vs-typed distinction. It must also print a one-time warning
+        (not one per remaining prompt) -- confirmed live in a later
+        fresh-install round: silently defaulting the rest of the wizard on
+        exhausted stdin gave no signal that a piped answer string was the
+        wrong length, so a miscounted/misaligned answer set could write an
+        unintended config with nothing flagging it."""
+
+        def raise_eof(_: str = "") -> str:
+            raise EOFError()
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=raise_eof),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert cfg["executor"] == "claude"
+        assert "reviewer" not in cfg
+        err = capsys.readouterr().err
+        assert err.count("stdin ran out mid-wizard") == 1
+
+    def test_typo_reviewer_prompt_input_leaves_reviewer_unset(self, tmp_path, capsys):
+        """An unrecognized (typo'd) reviewer answer must not pin reviewer to
+        the executor the same way a deliberate match does -- that would
+        disable the independence ladder's safety net by mistake instead of
+        by an informed choice, the exact footgun the blank-answer fix
+        already covers for an empty Enter."""
+
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("reviewer "):
+                return "clualde"  # typo
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            cfg = interactive_init(tmp_path, force_interactive=True)
+
+        assert "reviewer" not in cfg
+        assert "not a recognised reviewer" in capsys.readouterr().out
+
     def test_non_tty_without_force_prints_hint(self, tmp_path, capsys):
         """Non-TTY without force_interactive prints the --interactive hint to stderr."""
         with mock.patch("sys.stdin") as mock_stdin, mock.patch("lanegate.config._registry_save"):
@@ -1231,7 +1983,9 @@ class TestInteractiveInit:
         assert "--interactive" in err
 
     def test_init_adds_gitignore_entries(self, tmp_path):
-        """lanegate init appends .lanegate/ and .lanegate.yml to .gitignore."""
+        """lanegate init appends .lanegate/ to .gitignore, but not .lanegate.yml
+        itself -- a worktree only sees committed content, so an ignored config
+        would leave the first ticket's worktree without one at all."""
         with mock.patch("lanegate.config._registry_save"):
             interactive_init(tmp_path, use_defaults=True)
 
@@ -1240,7 +1994,51 @@ class TestInteractiveInit:
         content = gitignore.read_text()
         assert ".lanegate/" in content
         assert "!.lanegate/tickets/" in content
-        assert ".lanegate.yml" in content
+        assert ".lanegate.yml" not in content
+        assert ".aider.*" not in content
+
+    def test_init_with_aider_executor_gitignores_its_scratch_files(self, tmp_path):
+        """aider's own scratch/cache files (chat history, input history,
+        tags cache) are normally kept out of git by aider silently editing
+        .gitignore itself at startup -- an uncommitted side effect LaneGate's
+        scope-drift check then flags as an unexpected file. Writing the
+        pattern into the project's own .gitignore up front means aider's own
+        gitignore-editing is a no-op, and the pattern still holds even if a
+        hand-written config later adds --no-gitignore to skip that edit."""
+
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            return ""
+
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            interactive_init(tmp_path, force_interactive=True)
+
+        content = (tmp_path / ".gitignore").read_text()
+        assert ".aider.*" in content
+
+    def test_init_migrates_stale_config_filename_gitignore_entry(self, tmp_path):
+        """A project initialized before .lanegate.yml was excluded from
+        _gitignore_entries() has that stale line in its own .gitignore.
+        Re-running init must strip it, not just leave it there forever --
+        otherwise the config stays gitignored/uncommitted on every upgrade,
+        reproducing the exact never-committed-config bug the exclusion
+        itself was meant to fix."""
+        (tmp_path / ".gitignore").write_text("node_modules/\n.lanegate.yml\n*.log\n")
+
+        with mock.patch("lanegate.config._registry_save"):
+            interactive_init(tmp_path, use_defaults=True)
+
+        content = (tmp_path / ".gitignore").read_text()
+        assert ".lanegate.yml" not in content
+        assert "node_modules/" in content
+        assert "*.log" in content
+        assert ".lanegate/" in content
 
     def test_init_does_not_duplicate_gitignore_entries(self, tmp_path):
         """Running init twice does not produce duplicate .gitignore entries."""
@@ -1255,7 +2053,6 @@ class TestInteractiveInit:
 
         content = (tmp_path / ".gitignore").read_text()
         assert content.splitlines().count(".lanegate/*") == 1
-        assert content.count(".lanegate.yml") == 1
 
     def test_init_appends_to_existing_gitignore(self, tmp_path):
         """When .gitignore already exists, entries are appended not overwritten."""
@@ -1267,7 +2064,7 @@ class TestInteractiveInit:
         assert "__pycache__/" in content
         assert "*.pyc" in content
         assert ".lanegate/" in content
-        assert ".lanegate.yml" in content
+        assert ".lanegate.yml" not in content
 
     def test_explicit_tickets_dir_in_config_is_preserved(self, tmp_path):
         """An existing explicit tickets_dir in .lanegate.yml is never overridden by init."""
@@ -1363,7 +2160,7 @@ class TestDefaultConfig:
         cfg = _default_config()
         assert cfg["tickets_dir"] == ".testbrand/tickets"
         assert cfg["worktrees_dir"] == ".testbrand/worktrees"
-        assert _gitignore_entries() == [".testbrand/*", ".testbrand.yml", "testbrand-context-log.jsonl"]
+        assert _gitignore_entries() == [".testbrand/*", "testbrand-context-log.jsonl"]
 
 
 # ---------------------------------------------------------------------------
@@ -1689,6 +2486,22 @@ class TestResolveModel:
         ticket = {"model": "claude-haiku-4-5"}
         assert resolve_model(cfg, "implement", ticket=ticket) == "claude-haiku-4-5"
 
+    def test_ticket_review_model_pin_wins_over_all_for_review(self):
+        """TICK-554: route --model pins the subsequent review model."""
+        cfg = {
+            "executor": "claude",
+            "models": {"review": "claude-sonnet-4-5"},
+            "executors": {"claude": {"models": {"review": "claude-opus-4-5"}}},
+        }
+        ticket = {"review_model_pin": "claude-haiku-4-5"}
+        assert resolve_model(cfg, "review", ticket=ticket) == "claude-haiku-4-5"
+
+    def test_review_attribution_does_not_override_review_model_resolution(self):
+        """TICK-554: prior review metadata must not become a route pin."""
+        cfg = {"executor": "codex", "models": {"review": "gpt-5.6-terra"}}
+        ticket = {"review_model": "gpt-5.6-sol"}
+        assert resolve_model(cfg, "review", ticket=ticket) == "gpt-5.6-terra"
+
     def test_per_executor_wins_over_top_level(self):
         """executors.<name>.models.<step> beats top-level models.<step>."""
         cfg = {
@@ -1785,6 +2598,32 @@ class TestResolveModel:
             "executors": {"local-ollama": {"type": "ollama"}},
         }
         assert resolve_model(cfg, "implement") is None
+
+
+class TestValidateModelForExecutorProvider:
+    """Tests for validate_model_for_executor()'s provider-aware aider branch."""
+
+    def test_ollama_provider_rejects_vendor_model(self):
+        """An aider instance pinned to provider: ollama cannot use a
+        claude-*/gemini-*/gpt-* model name -- that's a misconfiguration
+        (e.g. a top-level `models:` block leaking into a pool-dispatched
+        Ollama-backed aider executor), not a legitimate multi-provider setup."""
+        with pytest.raises(ConfigError, match="unmapped model"):
+            validate_model_for_executor("claude-sonnet-5", "aider", "test", provider="ollama")
+
+    def test_ollama_provider_accepts_ollama_model(self):
+        validate_model_for_executor(
+            "ollama_chat/qwen2.5-coder:14b", "aider", "test", provider="ollama"
+        )
+
+    def test_no_provider_preserves_existing_permissive_behavior(self):
+        """Without a provider hint, aider's existing multi-vendor allowance
+        (aider can proxy to Claude/GPT/Gemini APIs directly) is unchanged."""
+        validate_model_for_executor("claude-sonnet-5", "aider", "test")
+        validate_model_for_executor("gpt-5.6-terra", "aider", "test")
+
+    def test_non_ollama_provider_preserves_existing_permissive_behavior(self):
+        validate_model_for_executor("claude-sonnet-5", "aider", "test", provider="anthropic")
 
 
 # ---------------------------------------------------------------------------
@@ -1924,6 +2763,20 @@ executor_steps:
         cfg = load_config(tmp_path)
         assert cfg["executor_steps"] == {}
 
+    def test_executor_steps_accepts_analyze(self, tmp_path):
+        """analyze is a valid executor_steps key (TICK-573) -- lets a ticket
+        route analyze to a dedicated executor instance without changing the
+        ticket-level executor: entirely."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executor_steps:
+  analyze: claude
+""",
+        )
+        cfg = load_config(tmp_path)
+        assert cfg["executor_steps"]["analyze"] == "claude"
+
     def test_executor_steps_unknown_step_raises(self, tmp_path):
         """Unknown step key under executor_steps raises ConfigError."""
         from lanegate.config import ConfigError
@@ -2050,6 +2903,76 @@ class TestAutonomyValidation:
             load_config(tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# Risk-based autonomy lanes (TICK-467)
+# ---------------------------------------------------------------------------
+
+
+class TestRiskAutonomyLanesConfigValidation:
+    def test_risk_autonomy_lanes_config_validation(self, tmp_path):
+        """green/yellow/red are accepted as top-level autonomy, resolve_autonomy
+        surfaces them unchanged, and human_escalation triggers validate/resolve
+        with defaults merged onto project overrides."""
+        from lanegate.config import (
+            ConfigError,
+            is_auto_fix_lane,
+            is_red_lane,
+            resolve_autonomy,
+            resolve_human_escalation,
+        )
+
+        for lane in ("green", "yellow", "red"):
+            _write_config(tmp_path / CONFIG_FILENAME, f"autonomy: {lane}\n")
+            cfg = load_config(tmp_path)
+            assert cfg["autonomy"] == lane
+            assert resolve_autonomy(cfg) == lane
+
+        assert is_auto_fix_lane("green") is True
+        assert is_auto_fix_lane("yellow") is True
+        assert is_auto_fix_lane("full") is True
+        assert is_auto_fix_lane("red") is False
+        assert is_auto_fix_lane("supervised") is False
+        assert is_red_lane("red") is True
+        assert is_red_lane("green") is False
+
+        # human_escalation defaults, with no project override.
+        _write_config(tmp_path / CONFIG_FILENAME, "ticket_prefix: TICK\n")
+        cfg = load_config(tmp_path)
+        assert resolve_human_escalation(cfg) == {
+            "credentials": True,
+            "security_actions": True,
+            "retry_limit": 3,
+        }
+
+        # Project overrides merge onto defaults.
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            "human_escalation:\n  credentials: false\n  retry_limit: 5\n",
+        )
+        cfg = load_config(tmp_path)
+        escalation = resolve_human_escalation(cfg)
+        assert escalation["credentials"] is False
+        assert escalation["security_actions"] is True
+        assert escalation["retry_limit"] == 5
+
+        # Invalid human_escalation shapes raise.
+        _write_config(tmp_path / CONFIG_FILENAME, "human_escalation: not-a-mapping\n")
+        with pytest.raises(ConfigError, match="human_escalation"):
+            load_config(tmp_path)
+
+        _write_config(
+            tmp_path / CONFIG_FILENAME, "human_escalation:\n  credentials: not-a-bool\n"
+        )
+        with pytest.raises(ConfigError, match="human_escalation.credentials"):
+            load_config(tmp_path)
+
+        _write_config(
+            tmp_path / CONFIG_FILENAME, "human_escalation:\n  retry_limit: 0\n"
+        )
+        with pytest.raises(ConfigError, match="human_escalation.retry_limit"):
+            load_config(tmp_path)
+
+
 class TestMaxAutoFixAttemptsValidation:
     def test_default_is_one(self, tmp_path):
         _write_config(tmp_path / CONFIG_FILENAME, "ticket_prefix: TICK\n")
@@ -2080,6 +3003,75 @@ class TestMaxAutoFixAttemptsValidation:
 
         _write_config(tmp_path / CONFIG_FILENAME, "max_auto_fix_attempts: not-a-number\n")
         with pytest.raises(ConfigError, match="max_auto_fix_attempts"):
+            load_config(tmp_path)
+
+    def test_repo_config_effective_fix_budget(self, tmp_path):
+        from lanegate.config import load_config, resolve_human_escalation
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_auto_fix_attempts: 2\n")
+        cfg = load_config(tmp_path)
+
+        assert cfg["max_auto_fix_attempts"] == 2
+        retry_limit = resolve_human_escalation(cfg)["retry_limit"]
+        assert retry_limit >= cfg["max_auto_fix_attempts"]
+        effective_budget = min(cfg["max_auto_fix_attempts"], retry_limit)
+        assert effective_budget == 2
+
+
+class TestBudgetCapsValidation:
+    def test_defaults_are_none(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "ticket_prefix: TICK\n")
+        cfg = load_config(tmp_path)
+        assert cfg["max_turns"] is None
+        assert cfg["max_cumulative_tokens"] is None
+
+    def test_custom_positive_integers_accepted(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "max_turns: 50\nmax_cumulative_tokens: 1000000\n")
+        cfg = load_config(tmp_path)
+        assert cfg["max_turns"] == 50
+        assert cfg["max_cumulative_tokens"] == 1000000
+
+    def test_per_step_mapping_accepted(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "max_turns:\n  implement: 50\n  review: 30\n")
+        cfg = load_config(tmp_path)
+        assert cfg["max_turns"] == {"implement": 50, "review": 30}
+
+    def test_unknown_step_key_raises(self, tmp_path):
+        from lanegate.config import ConfigError
+
+        for key in ("max_turns", "max_cumulative_tokens"):
+            _write_config(tmp_path / CONFIG_FILENAME, f"{key}:\n  fixx: 30\n")
+            with pytest.raises(ConfigError, match="unknown key"):
+                load_config(tmp_path)
+
+    def test_invalid_max_turns_raises(self, tmp_path):
+        from lanegate.config import ConfigError
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_turns: 0\n")
+        with pytest.raises(ConfigError, match="max_turns"):
+            load_config(tmp_path)
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_turns: -5\n")
+        with pytest.raises(ConfigError, match="max_turns"):
+            load_config(tmp_path)
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_turns: invalid\n")
+        with pytest.raises(ConfigError, match="max_turns"):
+            load_config(tmp_path)
+
+    def test_invalid_max_cumulative_tokens_raises(self, tmp_path):
+        from lanegate.config import ConfigError
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_cumulative_tokens: 0\n")
+        with pytest.raises(ConfigError, match="max_cumulative_tokens"):
+            load_config(tmp_path)
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_cumulative_tokens: -100\n")
+        with pytest.raises(ConfigError, match="max_cumulative_tokens"):
+            load_config(tmp_path)
+
+        _write_config(tmp_path / CONFIG_FILENAME, "max_cumulative_tokens: invalid\n")
+        with pytest.raises(ConfigError, match="max_cumulative_tokens"):
             load_config(tmp_path)
 
 
@@ -2133,6 +3125,70 @@ class TestResolveAcceptanceContractMode:
         from lanegate.config import resolve_acceptance_contract_mode
 
         assert resolve_acceptance_contract_mode({"acceptance_contract_mode": "bogus"}) == "advisory"
+
+    def test_strict_profile_defaults_to_blocker(self):
+        from lanegate.config import resolve_acceptance_contract_mode
+
+        assert resolve_acceptance_contract_mode({"profile": "strict"}) == "blocker"
+
+    def test_strict_profile_explicit_advisory_wins(self):
+        from lanegate.config import resolve_acceptance_contract_mode
+
+        cfg = {"profile": "strict", "acceptance_contract_mode": "advisory"}
+        assert resolve_acceptance_contract_mode(cfg) == "advisory"
+
+    def test_default_profile_still_defaults_to_advisory(self):
+        from lanegate.config import resolve_acceptance_contract_mode
+
+        assert resolve_acceptance_contract_mode({"profile": "default"}) == "advisory"
+
+    def test_invalid_acceptance_contract_mode_raises(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "acceptance_contract_mode: blockr\n")
+        with pytest.raises(ConfigError, match="acceptance_contract_mode"):
+            load_config(tmp_path)
+
+
+
+class TestProfileValidation:
+    """Tests for the profile config key and its interaction with review_fallback."""
+
+    def test_profile_defaults_to_default(self, tmp_path):
+        assert load_config(tmp_path)["profile"] == "default"
+
+    def test_valid_strict_profile_loads(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "profile: strict\n")
+        assert load_config(tmp_path)["profile"] == "strict"
+
+    def test_invalid_profile_raises(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "profile: yolo\n")
+        with pytest.raises(ConfigError, match="profile"):
+            load_config(tmp_path)
+
+    def test_strict_profile_rejects_same_model_fallback(self, tmp_path):
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            "profile: strict\nreview_fallback: same_model\n",
+        )
+        with pytest.raises(ConfigError, match="same_model"):
+            load_config(tmp_path)
+
+    def test_strict_profile_allows_needs_review_fallback(self, tmp_path):
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            "profile: strict\nreview_fallback: needs_review\n",
+        )
+        assert load_config(tmp_path)["review_fallback"] == "needs_review"
+
+    def test_strict_profile_allows_different_model_fallback(self, tmp_path):
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            "profile: strict\nreview_fallback: different_model\n",
+        )
+        assert load_config(tmp_path)["review_fallback"] == "different_model"
+
+    def test_default_profile_still_allows_same_model_fallback(self, tmp_path):
+        _write_config(tmp_path / CONFIG_FILENAME, "review_fallback: same_model\n")
+        assert load_config(tmp_path)["review_fallback"] == "same_model"
 
 
 # ---------------------------------------------------------------------------
@@ -2526,6 +3582,46 @@ def test_fail_fast_model_validation_agy_valid_model(tmp_path):
     assert cfg["models"]["implement"] == "gemini-3.6-flash-medium"
 
 
+def test_fail_fast_model_validation_agy_gemini_3_1_pro(tmp_path):
+    from lanegate.config import load_config
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: agy\nmodels:\n  implement: gemini-3.1-pro-high\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["implement"] == "gemini-3.1-pro-high"
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: agy\nmodels:\n  implement: gemini-3.1-pro-low\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["implement"] == "gemini-3.1-pro-low"
+
+
+def test_fail_fast_model_validation_agy_gpt_oss_medium(tmp_path):
+    from lanegate.config import load_config
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: agy\nmodels:\n  implement: gpt-oss-120b-medium\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["implement"] == "gpt-oss-120b-medium"
+
+
+def test_fail_fast_model_validation_agy_bare_gemini_pro_rejected(tmp_path):
+    from lanegate.config import ConfigError, load_config
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: agy\nmodels:\n  implement: gemini-3.1-pro\n",
+    )
+    with pytest.raises(ConfigError, match="unmapped model 'gemini-3.1-pro' for executor 'agy'"):
+        load_config(tmp_path)
+
+
 def test_fail_fast_model_validation_agy_claude_model(tmp_path):
     from lanegate.config import load_config
 
@@ -2546,3 +3642,115 @@ def test_fail_fast_model_validation_claude_unmapped_model(tmp_path):
     )
     with pytest.raises(ConfigError, match="unmapped model 'gpt-4o' for executor 'claude'"):
         load_config(tmp_path)
+
+
+def test_fail_fast_model_validation_aider_ollama(tmp_path):
+    """Aider executor: ollama_chat/ and ollama/ prefixes are accepted; bare names raise."""
+    from lanegate.config import ConfigError, load_config
+
+    # --- valid: ollama_chat/ prefix ---
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: aider\nmodels:\n  implement: ollama_chat/qwen2.5-coder:14b\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["implement"] == "ollama_chat/qwen2.5-coder:14b"
+
+    # --- valid: ollama/ prefix ---
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: aider\nmodels:\n  implement: ollama/llama3.1\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["implement"] == "ollama/llama3.1"
+
+    # --- adversarial: bare Ollama tag without any prefix raises ConfigError ---
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: aider\nmodels:\n  implement: qwen2.5-coder:14b\n",
+    )
+    with pytest.raises(ConfigError, match="unmapped model 'qwen2.5-coder:14b' for executor 'aider'"):
+        load_config(tmp_path)
+
+    # --- compatibility: other supported prefixes still pass (claude-, gpt-, deepseek) ---
+    for valid_model in ("claude-sonnet-4-5", "gpt-4o", "deepseek-coder"):
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            f"executor: aider\nmodels:\n  implement: {valid_model}\n",
+        )
+        cfg = load_config(tmp_path)
+        assert cfg["models"]["implement"] == valid_model
+
+
+def test_cmd_open_and_load_config_skips_models_analyze_validation(tmp_path):
+    from lanegate.config import load_config, CONFIG_FILENAME
+    from lanegate.lifecycle import cmd_open
+    from lanegate.analyze import cmd_analyze
+    from lanegate.ticket import parse_ticket
+
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executor: aider\nmodels:\n  analyze: qwen2.5-coder:14b\n",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg["models"]["analyze"] == "qwen2.5-coder:14b"
+
+    tickets_dir = tmp_path / cfg["tickets_dir"]
+    tickets_dir.mkdir(parents=True, exist_ok=True)
+    ticket_file = tickets_dir / "TICK-001.md"
+    ticket_file.write_text(
+        "---\nid: TICK-001\ntitle: Test Ticket\nstatus: draft\ntouches:\n  - src/foo.py\n---\n"
+    )
+
+    cmd_open("TICK-001", cfg, tmp_path)
+    ticket = parse_ticket(ticket_file)
+    assert ticket["status"] == "open"
+
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", cfg, tmp_path, model_fn=lambda p: '{"touches": ["src/foo.py"], "close_criteria": "done"}')
+
+
+
+
+@pytest.mark.parametrize("signal", [
+    "configuration", "security", "lifecycle", "orchestration", "prompt-trust",
+])
+def test_high_reasoning_control_plane_tickets_use_opus_default(signal):
+    ticket = {"title": f"Harden {signal} behavior", "touches": []}
+    for step in ("analyze", "implement", "review"):
+        assert resolve_model({"executor": "claude"}, step, ticket) == "claude-opus-5"
+
+
+@pytest.mark.parametrize("signal", [
+    "configuration", "security", "lifecycle", "orchestration", "prompt-trust",
+])
+def test_high_reasoning_control_plane_maintenance_uses_opus_default(signal):
+    """Routine repairs must not bypass the high-risk analysis contract."""
+    ticket = {"title": f"Fix {signal} behavior", "touches": []}
+    for step in ("analyze", "implement", "review"):
+        assert resolve_model({"executor": "claude"}, step, ticket) == "claude-opus-5"
+
+
+def test_high_reasoning_route_ignores_free_form_body_mentions():
+    ticket = {
+        "title": "Fix README typo",
+        "_body": "Correct the wording in the configuration section.",
+        "touches": ["README.md"],
+    }
+    assert not is_high_reasoning_ticket(ticket)
+    assert resolve_model({"executor": "claude"}, "implement", ticket) == _DEFAULT_IMPLEMENT_MODEL
+
+
+def test_high_reasoning_route_ignores_unqualified_category_words():
+    ticket = {"title": "Exercise real lifecycle", "touches": ["src/app.ext"]}
+    assert not is_high_reasoning_ticket(ticket)
+    assert resolve_model({"executor": "claude"}, "analyze", ticket) == _DEFAULT_ANALYZE_MODEL
+
+
+def test_high_reasoning_route_preserves_explicit_model_precedence():
+    ticket = {"title": "Harden lifecycle behavior", "model": "claude-haiku-4-5-20251001"}
+    assert resolve_model({"executor": "claude"}, "implement", ticket) == "claude-haiku-4-5-20251001"
+    assert resolve_model(
+        {"executor": "claude", "models": {"implement": "claude-sonnet-4-6"}},
+        "implement", {"title": "Harden lifecycle behavior"},
+    ) == "claude-sonnet-4-6"

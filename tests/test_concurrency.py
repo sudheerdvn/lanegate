@@ -21,6 +21,7 @@ from lanegate.concurrency import (  # noqa: E402
     check_local_not_behind_remote,
     claim_lock,
     locked_touches,
+    metadata_commit_lock,
     orchestrator_lock_status,
     release_orchestrator_lock,
     reread_and_assert_open,
@@ -234,6 +235,10 @@ def test_divergence_check_passes_when_not_behind(tmp_path):
         ]
         check_local_not_behind_remote(tmp_path, "tick-007")  # must not raise
 
+    assert mock_run.call_args_list[2].args[0] == [
+        "git", "rev-list", "--count", "tick-007..origin/tick-007"
+    ]
+
 
 def test_divergence_check_raises_when_behind(tmp_path):
     with patch("lanegate.concurrency.subprocess.run") as mock_run:
@@ -243,6 +248,17 @@ def test_divergence_check_raises_when_behind(tmp_path):
             MagicMock(returncode=0, stdout="3\n"),  # rev-list count = 3 (behind!)
         ]
         with pytest.raises(RuntimeError, match="behind origin"):
+            check_local_not_behind_remote(tmp_path, "tick-007")
+
+
+def test_divergence_check_raises_when_local_branch_is_missing(tmp_path):
+    with patch("lanegate.concurrency.subprocess.run") as mock_run:
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # git fetch
+            MagicMock(returncode=0),  # git rev-parse -- remote exists
+            MagicMock(returncode=128),  # rev-list cannot resolve local branch
+        ]
+        with pytest.raises(RuntimeError, match="could not compare local branch"):
             check_local_not_behind_remote(tmp_path, "tick-007")
 
 
@@ -264,6 +280,13 @@ def test_claim_lock_is_reentrant_after_release(tmp_path):
     for _ in range(3):
         with claim_lock(tmp_path):
             pass  # released each time
+
+
+@_unix_only
+def test_metadata_commit_lock_is_reentrant_after_release(tmp_path):
+    for _ in range(3):
+        with metadata_commit_lock(tmp_path):
+            assert (tmp_path / ".lanegate" / "metadata-commit.lock").exists()
 
 
 @_unix_only

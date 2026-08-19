@@ -75,3 +75,28 @@ def test_scope_recovery_does_not_bypass_hard_blocked_paths(tmp_path):
     reopen.assert_not_called()
     ticket = parse_ticket(path)
     assert ".github/workflows/checks.yml" not in ticket["touches"]
+
+
+def test_recover_scope_only_continues_on_static_analysis_failure(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    cfg["auto_claim_touches"] = True
+    cfg["static_analysis"] = {"threshold": 0}
+    path = _scope_paused_ticket(tmp_path)
+
+    def fake_reopen(tid, cfg_, repo_root):
+        path.write_text(path.read_text().replace("status: needs_review", "status: code_complete"))
+
+    with (
+        patch("lanegate.orchestrate._committed_files", return_value={"src/declared.py", "src/support.py"}),
+        patch("lanegate.orchestrate._run_static_analysis", return_value=["finding 1"]),
+        patch("lanegate.lifecycle.cmd_reopen", side_effect=fake_reopen),
+        patch("lanegate.lifecycle.cmd_review") as review,
+        patch("lanegate.lifecycle._mark_needs_review") as mark_nr,
+    ):
+        recovered = recover_scope_only_needs_review_tickets(cfg, tmp_path)
+
+    assert recovered == []
+    mark_nr.assert_called_once()
+    assert "static analysis findings" in mark_nr.call_args.kwargs.get("reason", "")
+    review.assert_not_called()
+

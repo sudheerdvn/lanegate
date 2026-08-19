@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -66,23 +68,68 @@ def _line_style(line: str) -> str:
     upper = line.upper()
     lower = line.lower()
 
-    if "TRACEBACK" in upper or "ERROR" in upper or "FAILED" in upper:
+    if (
+        re.match(
+            r"^(?:ERROR:|\[orchestrate\]\s+ERROR\b|Traceback \(most recent call last\)|"
+            r"FAILED\b|\[orchestrate\].*\bfailed\b)",
+            stripped,
+            re.IGNORECASE,
+        )
+        or re.search(r"\(exit\s+(?:code\s+)?-?[1-9]\d*(?:[,)\s:])", stripped, re.IGNORECASE)
+    ):
         return "bold red"
     if "WARNING" in upper or "CHANGES_REQUESTED" in upper:
         return "yellow"
-    if stripped.startswith("+") and not stripped.startswith("+++"):
+    if line.startswith("+") and not line.startswith("+++"):
         return "green"
-    if stripped.startswith("-") and not stripped.startswith("---"):
-        return "red"
+    if line.startswith("-") and not line.startswith("---"):
+        if re.match(r"^-(?:\t| {1,3})\S", line):
+            pass
+        else:
+            return "red"
     if stripped.startswith("@@"):
         return "magenta"
     if stripped.startswith(("diff --git", "index ", "+++", "---")):
         return "bold blue"
     if line.startswith("[orchestrate]") or line.startswith("  ") and "[" in line and "]" in line:
         return "cyan"
-    if " passed" in lower or "approved" in lower or "merged" in lower:
+    if (
+        re.search(r":\s*(?:passed|approved|merged)\.?\s*$", lower)
+        or re.search(r"^\s*\[?(?:passed|approved|merged)\]?:?\s*$", lower)
+    ):
         return "green"
     return ""
+
+
+def semantic_line_metadata(line: str) -> dict[str, str]:
+    """Return the shared presentation metadata for one raw audit-log line.
+
+    The CLI, API, and TUI consume the same classifier so an audit line has
+    the same meaning everywhere. ``line`` itself is never altered: callers
+    can safely retain it for copying, export, and durable incident recovery.
+    """
+    style = _line_style(line)
+    if style in {"bold red", "red"}:
+        level = "error"
+    elif style == "yellow":
+        level = "warning"
+    elif style == "green":
+        level = "success"
+    else:
+        level = "info"
+
+    if line.lstrip().startswith("[orchestrate]"):
+        kind = "orchestrator"
+    elif line.lstrip().startswith(("{", "[")):
+        try:
+            json.loads(line)
+            kind = "protocol"
+        except (TypeError, json.JSONDecodeError):
+            kind = "executor"
+    else:
+        kind = "executor"
+
+    return {"style": style, "level": level, "kind": kind}
 
 
 def _render_line(line: str, *, use_color: bool) -> None:

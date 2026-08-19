@@ -6,9 +6,14 @@ from pathlib import Path
 import pytest
 
 from lanegate.reconciliation import (
+    audit_merged_ticket_status_tracking,
     branch_reachable_from_main,
+    conflicted_paths,
     find_equivalent_merged_ticket,
+    is_metadata_only_conflict,
     reconcile_ticket,
+    resolve_metadata_conflict,
+    _split_frontmatter,
 )
 
 
@@ -127,6 +132,162 @@ def test_branch_reachable_from_main_none_when_branch_missing(git_repo):
 
 def test_branch_reachable_from_main_none_when_not_a_git_repo(tmp_path):
     assert branch_reachable_from_main(tmp_path, "main") is None
+
+
+# ---------------------------------------------------------------------------
+# audit_merged_ticket_status_tracking
+# ---------------------------------------------------------------------------
+
+
+def test_audit_merged_tickets_detects_unreachable_commit(git_repo):
+    """A ticket marked merged whose branch was never actually merged into
+    trunk (the TICK-365 scenario) must be flagged."""
+    _run_git(git_repo, "checkout", "-b", "tick-365")
+    (git_repo / "unmerged.txt").write_text("unmerged\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "unmerged work")
+    _run_git(git_repo, "checkout", "main")
+
+    ticket = {"id": "TICK-365", "status": "merged", "branch": "tick-365"}
+
+    discrepancies = audit_merged_ticket_status_tracking(git_repo, [ticket])
+
+    assert len(discrepancies) == 1
+    assert discrepancies[0]["ticket_id"] == "TICK-365"
+    assert discrepancies[0]["branch"] == "tick-365"
+
+
+def test_audit_merged_tickets_passes_valid_merged(git_repo):
+    """A ticket marked merged whose branch really did land on trunk must not
+    be flagged."""
+    _run_git(git_repo, "checkout", "-b", "tick-366")
+    (git_repo / "feature.txt").write_text("feature\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "feature work")
+    _run_git(git_repo, "checkout", "main")
+    _run_git(git_repo, "merge", "--no-ff", "tick-366", "-m", "merge tick-366")
+
+    ticket = {"id": "TICK-366", "status": "merged", "branch": "tick-366"}
+
+    assert audit_merged_ticket_status_tracking(git_repo, [ticket]) == []
+
+
+def test_audit_merged_tickets_passes_valid_merged_with_deleted_branch(git_repo):
+    """Deleting a branch after merging is routine post-merge cleanup (`lanegate
+    merge` leaves the branch behind; something else prunes it later). The
+    branch ref being gone must not, by itself, be treated as proof the merge
+    never happened -- the commit is still reachable from trunk via the merge
+    commit `cmd_merge` creates, and that commit-level fact must be checked as
+    a fallback before flagging."""
+    _run_git(git_repo, "checkout", "-b", "tick-366")
+    (git_repo / "feature.txt").write_text("feature\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "feature work")
+    _run_git(git_repo, "checkout", "main")
+    _run_git(git_repo, "merge", "--no-ff", "tick-366", "-m", "Merge TICK-366: add feature")
+    _run_git(git_repo, "branch", "-d", "tick-366")
+
+    ticket = {"id": "TICK-366", "status": "merged", "branch": "tick-366"}
+
+    assert audit_merged_ticket_status_tracking(git_repo, [ticket]) == []
+
+
+def test_audit_merged_tickets_detects_unreachable_commit_with_deleted_branch(git_repo):
+    """A ticket marked merged whose branch was never actually merged, and
+    whose (never-merged) branch ref has since been deleted, must still be
+    flagged -- a missing ref only excuses a ticket when a real merge commit
+    for it exists on trunk, not unconditionally."""
+    _run_git(git_repo, "checkout", "-b", "tick-367")
+    (git_repo / "unmerged.txt").write_text("unmerged\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "unmerged work")
+    _run_git(git_repo, "checkout", "main")
+    _run_git(git_repo, "branch", "-D", "tick-367")
+
+    ticket = {"id": "TICK-367", "status": "merged", "branch": "tick-367"}
+
+    discrepancies = audit_merged_ticket_status_tracking(git_repo, [ticket])
+
+    assert len(discrepancies) == 1
+    assert discrepancies[0]["ticket_id"] == "TICK-367"
+    assert discrepancies[0]["branch"] == "tick-367"
+
+
+def test_audit_merged_tickets_passes_drifted_but_merged_branch(git_repo):
+    """A branch that really was merged into trunk, then kept moving (rebase,
+    an unrelated follow-up commit reusing the same local branch), is no
+    longer an ancestor of trunk even though its integration was real -- the
+    merge-commit fallback must run for an *existing* drifted branch too, not
+    only when the branch ref is missing."""
+    _run_git(git_repo, "checkout", "-b", "tick-100")
+    (git_repo / "feature.txt").write_text("feature\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "feature work")
+    _run_git(git_repo, "checkout", "main")
+    _run_git(git_repo, "merge", "--no-ff", "tick-100", "-m", "Merge TICK-100: feature")
+
+    _run_git(git_repo, "checkout", "tick-100")
+    (git_repo / "extra.txt").write_text("extra\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "extra work after merge")
+    _run_git(git_repo, "checkout", "main")
+
+    ticket = {"id": "TICK-100", "status": "merged", "branch": "tick-100"}
+
+    assert audit_merged_ticket_status_tracking(git_repo, [ticket]) == []
+
+
+def test_audit_merged_tickets_passes_already_integrated_with_deleted_branch(git_repo):
+    """`cmd_merge`'s "already integrated" path (lifecycle/__init__.py) skips
+    `git merge` entirely, so it never writes a "Merge {tid}: ..." commit --
+    the only trunk-side evidence it leaves is the "chore: {tid} status →
+    merged" commit that `_commit_generated_ticket_write` always makes when
+    finalizing. That must be accepted as proof once the branch is pruned,
+    the same as the real-merge-commit case."""
+    _run_git(git_repo, "checkout", "-b", "tick-200")
+    (git_repo / "feature200.txt").write_text("feature\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "feature work")
+    _run_git(git_repo, "checkout", "main")
+    # No `git merge` -- simulate the already-integrated finalize path, which
+    # only ever writes the ticket-status chore commit.
+    (git_repo / "ticket.md").write_text("status: merged\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "chore: TICK-200 status → merged")
+    _run_git(git_repo, "branch", "-D", "tick-200")
+
+    ticket = {"id": "TICK-200", "status": "merged", "branch": "tick-200"}
+
+    assert audit_merged_ticket_status_tracking(git_repo, [ticket]) == []
+
+
+def test_audit_merged_tickets_passes_no_branch_field_but_merge_commit_present(git_repo):
+    """A merged ticket with no `branch` field at all (missing metadata, not a
+    deleted branch) must still fall back to the trunk-side merge-commit
+    check rather than being flagged outright."""
+    _run_git(git_repo, "checkout", "-b", "tick-057")
+    (git_repo / "feature057.txt").write_text("feature\n")
+    _run_git(git_repo, "add", ".")
+    _run_git(git_repo, "commit", "-m", "feature work")
+    _run_git(git_repo, "checkout", "main")
+    _run_git(git_repo, "merge", "--no-ff", "tick-057", "-m", "Merge TICK-057: feature")
+    _run_git(git_repo, "branch", "-D", "tick-057")
+
+    ticket = {"id": "TICK-057", "status": "merged"}
+
+    assert audit_merged_ticket_status_tracking(git_repo, [ticket]) == []
+
+
+def test_audit_merged_tickets_flags_no_branch_field_without_merge_commit(git_repo):
+    """A merged ticket with no `branch` field and no trunk-side evidence
+    must still be flagged."""
+    ticket = {"id": "TICK-058", "status": "merged"}
+
+    discrepancies = audit_merged_ticket_status_tracking(git_repo, [ticket])
+
+    assert len(discrepancies) == 1
+    assert discrepancies[0]["ticket_id"] == "TICK-058"
+    assert discrepancies[0]["branch"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -270,3 +431,103 @@ def test_reconcile_ticket_none_when_no_evidence(git_repo):
         "touches": ["lanegate/novel_module.py"],
     }
     assert reconcile_ticket(ticket, [ticket], git_repo) is None
+
+
+# ---------------------------------------------------------------------------
+# conflicted_paths / is_metadata_only_conflict / resolve_metadata_conflict
+# ---------------------------------------------------------------------------
+
+
+def _write_and_commit(repo: Path, rel: str, content: str, msg: str) -> None:
+    p = repo / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    _run_git(repo, "add", rel)
+    _run_git(repo, "commit", "-m", msg)
+
+
+def test_conflicted_paths_lists_unmerged_files_during_conflict(git_repo):
+    _write_and_commit(
+        git_repo, "tickets/TICK-1.md", "---\nid: TICK-1\nstatus: open\n---\nbody\n", "add ticket"
+    )
+    _run_git(git_repo, "checkout", "-b", "tick-400")
+    _write_and_commit(
+        git_repo,
+        "tickets/TICK-1.md",
+        "---\nid: TICK-1\nstatus: in_review\n---\nbody\n",
+        "branch update",
+    )
+    _run_git(git_repo, "checkout", "main")
+    _write_and_commit(
+        git_repo,
+        "tickets/TICK-1.md",
+        "---\nid: TICK-1\nstatus: merged\n---\nbody\n",
+        "trunk update",
+    )
+    subprocess.run(
+        ["git", "merge", "--no-ff", "tick-400", "-m", "merge"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+    )
+
+    assert conflicted_paths(git_repo) == ["tickets/TICK-1.md"]
+
+
+def test_is_metadata_only_conflict_true_for_ticket_files():
+    assert (
+        is_metadata_only_conflict(["tickets/TICK-1.md", "tickets/TICK-2.md"], "tickets") is True
+    )
+
+
+def test_is_metadata_only_conflict_false_for_source_file():
+    assert (
+        is_metadata_only_conflict(["tickets/TICK-1.md", "lanegate/foo.py"], "tickets") is False
+    )
+
+
+def test_resolve_metadata_conflict_keeps_trunk_lifecycle_fields_and_unions_history(git_repo):
+    _write_and_commit(
+        git_repo,
+        "tickets/TICK-5.md",
+        "---\nid: TICK-5\nstatus: open\n---\nbody\n",
+        "add ticket",
+    )
+    _run_git(git_repo, "checkout", "-b", "tick-500")
+    _write_and_commit(
+        git_repo,
+        "tickets/TICK-5.md",
+        (
+            "---\nid: TICK-5\nstatus: in_review\n"
+            "lifecycle_events:\n- at: '2026-01-02T00:00:00Z'\n  event: review_requested\n"
+            "---\nbody\n"
+        ),
+        "branch update",
+    )
+    _run_git(git_repo, "checkout", "main")
+    _write_and_commit(
+        git_repo,
+        "tickets/TICK-5.md",
+        (
+            "---\nid: TICK-5\nstatus: merged\nreview_verdict: approved\n"
+            "lifecycle_events:\n- at: '2026-01-01T00:00:00Z'\n  event: merged\n"
+            "---\nbody\n"
+        ),
+        "trunk update",
+    )
+    r = subprocess.run(
+        ["git", "merge", "--no-ff", "tick-500", "-m", "merge"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0
+
+    resolve_metadata_conflict(git_repo, "tickets/TICK-5.md")
+
+    meta, _ = _split_frontmatter((git_repo / "tickets/TICK-5.md").read_text())
+    assert meta["status"] == "merged"
+    assert meta["review_verdict"] == "approved"
+    events = {(e["at"], e["event"]) for e in meta["lifecycle_events"]}
+    assert ("2026-01-01T00:00:00Z", "merged") in events
+    assert ("2026-01-02T00:00:00Z", "review_requested") in events

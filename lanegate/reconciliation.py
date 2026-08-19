@@ -24,10 +24,33 @@ import re
 import subprocess
 from pathlib import Path
 
+import yaml
+
 from lanegate.analyze import _STOPWORDS
 from lanegate.config import load_config, resolve_trunk_branch
 
 _DEFAULT_SIMILARITY_THRESHOLD = 0.6
+
+# Frontmatter delimiter regex, mirroring ticket.py's parse_ticket -- reconciliation
+# reads blobs via `git show`, not a real file on disk, so ticket.parse_ticket
+# (which requires a Path) doesn't apply directly.
+_FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+# Frontmatter scalars that only the lifecycle machinery on trunk should ever
+# set -- a ticket branch's stale copy must never clobber these during a
+# metadata-only conflict reconciliation.
+_LIFECYCLE_AUTHORITATIVE_KEYS = (
+    "status",
+    "review_verdict",
+    "review_summary",
+    "verification",
+    "worktree",
+    "branch",
+    "pr_number",
+    "status_changed_at",
+)
+
+_HISTORY_SECTION_HEADERS = ("## Status History", "## Lifecycle Timeline")
 
 
 def branch_reachable_from_main(
@@ -204,3 +227,247 @@ def reconcile_ticket(
         return {"equivalent_ticket_id": equivalent}
 
     return None
+
+
+def audit_merged_ticket_status_tracking(
+    repo_root: Path,
+    all_tickets: list[dict],
+    trunk_branch: str | None = None,
+) -> list[dict]:
+    """Flag tickets marked 'merged' whose branch is not actually reachable
+    from trunk -- i.e. status was set to merged without the work ever
+    landing on trunk (see TICK-365, which was marked merged with no merge
+    commit or reachable branch tip).
+
+    Returns a list of discrepancy records: {'ticket_id', 'branch', 'reason'}.
+    "merged" is meant to be a hard guarantee about trunk state, so this check
+    is deliberately strict (unlike the conservative supersession heuristics
+    above): a missing branch, or an existing branch tip that is not an
+    ancestor of trunk, is flagged UNLESS trunk-side commit evidence proves
+    the work landed anyway (see `_find_merge_commit`). Neither a missing
+    branch ref nor a drifted/rebased branch tip is flagged by itself --
+    branches are routinely deleted as post-merge cleanup, and a branch can
+    keep moving (rebase, follow-up commits reusing the same local branch)
+    after its own contents were already merged into trunk -- so both cases
+    fall back to the commit-level check before being treated as a
+    discrepancy.
+    """
+    trunk_branch = trunk_branch or resolve_trunk_branch(load_config(repo_root), repo_root)
+    discrepancies: list[dict] = []
+    for ticket in all_tickets:
+        if ticket.get("status") != "merged":
+            continue
+        ticket_id = ticket.get("id")
+        branch = ticket.get("branch")
+        if not branch:
+            if ticket_id and _find_merge_commit(repo_root, trunk_branch, ticket_id):
+                continue
+            discrepancies.append({
+                "ticket_id": ticket_id,
+                "branch": None,
+                "reason": "no branch recorded on a merged ticket and no merge commit found on trunk",
+            })
+            continue
+
+        exists = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8",
+        )
+        branch_reachable = False
+        if exists.returncode == 0:
+            ancestor = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", branch, trunk_branch],
+                cwd=repo_root,
+                capture_output=True,
+                text=True, encoding="utf-8",
+            )
+            branch_reachable = ancestor.returncode == 0
+
+        if branch_reachable:
+            continue
+
+        # Neither a missing branch ref nor a branch tip that has drifted past
+        # trunk is proof by itself that the work never landed: the branch is
+        # routinely deleted as post-merge cleanup once its work has landed,
+        # and equally, a branch that keeps existing (and moving -- rebase,
+        # unrelated follow-up commits) after the commits it *had* at merge
+        # time were already integrated is no longer expected to be an
+        # ancestor of trunk even though that integration was real. Trunk-side
+        # commit evidence is exactly as strong a guarantee either way, so
+        # fall back to it before flagging.
+        if ticket_id and _find_merge_commit(repo_root, trunk_branch, ticket_id):
+            continue
+        reason = (
+            "branch does not exist and no merge commit found on trunk"
+            if exists.returncode != 0
+            else "branch tip is not reachable from trunk and no merge commit found on trunk"
+        )
+        discrepancies.append({
+            "ticket_id": ticket_id,
+            "branch": branch,
+            "reason": reason,
+        })
+
+    return discrepancies
+
+
+def _find_merge_commit(repo_root: Path, trunk_branch: str, ticket_id: str) -> str | None:
+    """Return a trunk commit hash proving `ticket_id` really landed, or None
+    if trunk has no such commit -- used as the commit-level fallback when a
+    merged ticket's branch ref is missing or its tip is no longer an
+    ancestor of trunk.
+
+    Matches either of the two commit subjects `cmd_merge` (lifecycle/__init__.py)
+    writes to trunk when it finalizes a merge:
+    - "Merge {ticket_id}: ..." from the real `git merge --no-ff`, when one ran.
+    - "chore: {ticket_id} status → merged" from `_commit_generated_ticket_write`,
+      which lifecycle only reaches after either that real merge succeeded, or
+      `branch_reachable_from_main` confirmed (against this exact repo, at
+      finalize time) that the branch's commits were already an ancestor of
+      trunk -- the "already integrated" path that skips `git merge`
+      entirely and so never writes a "Merge {ticket_id}:" commit at all.
+    """
+    result = subprocess.run(
+        [
+            "git", "log", trunk_branch,
+            "--fixed-strings",
+            f"--grep=Merge {ticket_id}:",
+            f"--grep=chore: {ticket_id} status → merged",
+            "--format=%H", "-n", "1",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def conflicted_paths(repo_root: Path) -> list[str]:
+    """Return the repo-relative paths still unmerged during an in-progress
+    git conflict.
+
+    Must be called BEFORE ``git merge --abort`` -- abort clears the conflict
+    state that this reads.
+    """
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=U"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def is_metadata_only_conflict(paths: list[str], tickets_dir: str) -> bool:
+    """True iff every conflicted path is a LaneGate-owned ticket markdown
+    file under `tickets_dir` -- never a source file."""
+    if not paths:
+        return False
+    prefix = tickets_dir.replace("\\", "/").rstrip("/") + "/"
+    return all(p.replace("\\", "/").startswith(prefix) and p.endswith(".md") for p in paths)
+
+
+def _split_frontmatter(text: str) -> tuple[dict, str]:
+    """Split a ticket file's raw text into (frontmatter dict, body)."""
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+    meta = yaml.safe_load(match.group(1)) or {}
+    return meta, match.group(2).strip()
+
+
+def _extract_history_section(body: str, header: str) -> list[str]:
+    if header not in body:
+        return []
+    after = body.split(header, 1)[1]
+    next_heading = after.find("\n##")
+    section = after if next_heading == -1 else after[:next_heading]
+    return [line for line in section.splitlines() if line.strip()]
+
+
+def _set_history_section(body: str, header: str, lines: list[str]) -> str:
+    if not lines:
+        return body
+    if header not in body:
+        return body.rstrip() + f"\n\n{header}\n" + "\n".join(lines) + "\n"
+    before, _, after = body.partition(header)
+    next_heading = after.find("\n##")
+    tail = "" if next_heading == -1 else after[next_heading:]
+    return before + header + "\n" + "\n".join(lines) + "\n" + tail
+
+
+def _merge_history_sections(ours_body: str, theirs_body: str) -> str:
+    """Concatenate each history section from both sides, ours first, deduping
+    identical lines."""
+    merged = ours_body
+    for header in _HISTORY_SECTION_HEADERS:
+        ours_lines = _extract_history_section(ours_body, header)
+        theirs_lines = _extract_history_section(theirs_body, header)
+        combined = list(ours_lines)
+        for line in theirs_lines:
+            if line not in combined:
+                combined.append(line)
+        merged = _set_history_section(merged, header, combined)
+    return merged
+
+
+def _merge_lifecycle_events(ours_meta: dict, theirs_meta: dict) -> list:
+    seen: set[tuple] = set()
+    merged: list = []
+    for event in list(ours_meta.get("lifecycle_events") or []) + list(
+        theirs_meta.get("lifecycle_events") or []
+    ):
+        key = (event.get("at"), event.get("event")) if isinstance(event, dict) else (event, None)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(event)
+    return merged
+
+
+def resolve_metadata_conflict(repo_root: Path, path: str) -> None:
+    """Auto-resolve a merge conflict limited to a single LaneGate ticket
+    file's frontmatter/history: trunk's lifecycle-authoritative fields win,
+    keys unique to the incoming branch are kept, `lifecycle_events` is
+    unioned, and the history body sections are concatenated from both sides.
+
+    Writes the merged ticket text and stages it with `git add`, leaving the
+    caller to complete the merge commit.
+    """
+    ours_text = subprocess.run(
+        ["git", "show", f":2:{path}"],
+        cwd=repo_root, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+    theirs_text = subprocess.run(
+        ["git", "show", f":3:{path}"],
+        cwd=repo_root, capture_output=True, text=True, encoding="utf-8",
+    ).stdout
+
+    ours_meta, ours_body = _split_frontmatter(ours_text)
+    theirs_meta, theirs_body = _split_frontmatter(theirs_text)
+
+    merged_meta: dict = dict(ours_meta)
+    for key, value in theirs_meta.items():
+        if key not in merged_meta:
+            merged_meta[key] = value
+    for key in _LIFECYCLE_AUTHORITATIVE_KEYS:
+        if key in ours_meta:
+            merged_meta[key] = ours_meta[key]
+
+    merged_events = _merge_lifecycle_events(ours_meta, theirs_meta)
+    if merged_events:
+        merged_meta["lifecycle_events"] = merged_events
+
+    merged_body = _merge_history_sections(ours_body, theirs_body)
+
+    front = yaml.dump(merged_meta, default_flow_style=None, sort_keys=False, allow_unicode=True)
+    (repo_root / path).write_text(f"---\n{front}---\n{merged_body}\n", encoding="utf-8")
+
+    subprocess.run(["git", "add", path], cwd=repo_root, capture_output=True)

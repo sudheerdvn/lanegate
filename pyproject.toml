@@ -1,10 +1,14 @@
 [build-system]
-requires = ["hatchling"]
+# Pinned below 1.26: newer hatchling emits Metadata-Version 2.5, which twine
+# <= 6.2.0 hard-codes an allowlist that stops at 2.4 (twine/package.py) and
+# rejects outright (see https://github.com/pypa/twine/issues/1327). Remove
+# this pin once a twine release adds 2.5 support.
+requires = ["hatchling<1.26"]
 build-backend = "hatchling.build"
 
 [project]
 name = "lanegate"
-version = "1.0.3"
+version = "1.1.0"
 description = "Git-native agentic delivery engine — queue, parallel agents, quality gates, staged deployment"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -25,6 +29,9 @@ classifiers = [
 ]
 dependencies = [
     "pyyaml>=6.0",
+    # comment-preserving round-trip loader/dumper for config.py's
+    # update_pool_executor_order — plain PyYAML has no concept of comments.
+    "ruamel.yaml>=0.18",
     # <2 is load-bearing: mcp 2.0.0 removed mcp.server.fastmcp, which lanegate/mcp.py imports.
     "mcp>=1.0.0,<2",
     "portalocker>=2.0",
@@ -32,6 +39,12 @@ dependencies = [
     # Windows has no OS-level IANA tz database; zoneinfo needs this to resolve
     # zone keys like "America/Los_Angeles" there. No-op on Linux/macOS.
     "tzdata; sys_platform == 'win32'",
+    # Core only -- language grammars are opt-in via [project.optional-dependencies]
+    # below (`pip install lanegate[go]`, `lanegate[lang-all]`, etc.). Python
+    # itself is parsed with stdlib ast, not tree-sitter, so no grammar package
+    # is needed for it at all. Everything degrades to ripgrep when a grammar
+    # isn't installed (see analyze._ts_load_language) -- never a hard failure.
+    "tree-sitter>=0.21",
 ]
 
 [project.urls]
@@ -43,20 +56,9 @@ Repository = "https://github.com/sudheerdvn/lanegate"
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
+    "pytest-xdist>=3.8",
     "ruff>=0.8",
     "mypy>=1.8",
-]
-treesitter = [
-    "tree-sitter>=0.21",
-    "tree-sitter-python>=0.21",
-    "tree-sitter-javascript>=0.21",
-    "tree-sitter-typescript>=0.21",
-    "tree-sitter-go>=0.21",
-    "tree-sitter-rust>=0.21",
-    "tree-sitter-java>=0.21",
-    "tree-sitter-ruby>=0.21",
-    "tree-sitter-c>=0.21",
-    "tree-sitter-cpp>=0.21",
 ]
 security = [
     "semgrep",
@@ -67,9 +69,43 @@ ollama = [
     "requests>=2.31",
 ]
 
+# AST-quality skeletons/symbol-search per language (analyze + review). Install
+# only what your project(s) actually use, e.g. `pip install lanegate[java]`;
+# combine multiple with `lanegate[go,rust]`; or `lanegate[lang-all]` for
+# everything. A project can also add a language LaneGate doesn't list here at
+# all via .lanegate.yml's tree_sitter_languages key -- see .lanegate.yml.example.
+go = ["tree-sitter-go>=0.21"]
+js = ["tree-sitter-javascript>=0.21"]
+ts = ["tree-sitter-typescript>=0.21"]
+rust = ["tree-sitter-rust>=0.21"]
+java = ["tree-sitter-java>=0.21"]
+ruby = ["tree-sitter-ruby>=0.21"]
+c = ["tree-sitter-c>=0.21"]
+cpp = ["tree-sitter-cpp>=0.21"]
+php = ["tree-sitter-php>=0.21"]
+csharp = ["tree-sitter-c-sharp>=0.21"]
+swift = ["tree-sitter-swift>=0.21"]
+kotlin = ["tree-sitter-kotlin>=0.21"]
+lang-all = [
+    "tree-sitter-go>=0.21",
+    "tree-sitter-javascript>=0.21",
+    "tree-sitter-typescript>=0.21",
+    "tree-sitter-rust>=0.21",
+    "tree-sitter-java>=0.21",
+    "tree-sitter-ruby>=0.21",
+    "tree-sitter-c>=0.21",
+    "tree-sitter-cpp>=0.21",
+    "tree-sitter-php>=0.21",
+    "tree-sitter-c-sharp>=0.21",
+    "tree-sitter-swift>=0.21",
+    "tree-sitter-kotlin>=0.21",
+]
+
 [project.scripts]
 lanegate = "lanegate.cli:main"
 lgt = "lanegate.cli:main"
+lane = "lanegate.cli:main"
+
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -102,11 +138,17 @@ packages = ["lanegate"]
 "lanegate/skills/integrate.md" = "lanegate/skills/integrate.md"
 "lanegate/skills/next-ticket.md" = "lanegate/skills/next-ticket.md"
 "lanegate/skills/orchestrate.md" = "lanegate/skills/orchestrate.md"
+"lanegate/skills/run.md" = "lanegate/skills/run.md"
 "lanegate/skills/tickets.md" = "lanegate/skills/tickets.md"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 tmp_path_retention_policy = "failed"
+# Agents run the suite themselves several times per ticket and the full output
+# lands in their context, so keep it compact: -q collapses the green run from
+# ~6.4KB to ~2.7KB, --tb=short bounds the failure case (the only unbounded one),
+# and -ra keeps the failed-test list readable despite the shorter tracebacks.
+addopts = "-q --tb=short -ra"
 
 [tool.ruff]
 line-length = 100

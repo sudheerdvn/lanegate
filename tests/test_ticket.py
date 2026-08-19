@@ -3,8 +3,10 @@
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
+import pytest
 
 import lanegate.ticket as ticket_module
 from lanegate.ticket import (
@@ -14,17 +16,24 @@ from lanegate.ticket import (
     TERMINAL_STATUSES,
     QuarantinedTicket,
     append_status_history,
+    attention_category,
+    attention_summary,
     branch_name,
     canonical_id,
+    collect_cross_ticket_change_notes,
+    find_control_plane_touch_overlaps,
     display_order,
     get_ticket_diff,
+    get_ticket_summary,
     group_by_status,
     load_all_tickets,
     is_paired_test_file,
     load_file_skeletons,
+    needs_attention,
     parse_ticket,
     ticket_glob,
     validate_ticket,
+    validate_acceptance_matrix,
     unresolved_dependencies,
     write_file_skeletons_sidecar,
     write_ticket,
@@ -180,6 +189,13 @@ def test_canonical_id():
     assert canonical_id("tick-007") == "TICK-007"
     assert canonical_id("TICK-007") == "TICK-007"
     assert canonical_id("tick-7") == "TICK-007"
+    assert canonical_id("acme.proj-7") == "ACME.PROJ-007"
+
+
+@pytest.mark.parametrize("ticket_id", ["../TICK-001", "ACME..PROJ-001", "ACME.PROJ-001.", "TICK-001.lock"])
+def test_canonical_id_rejects_path_and_git_ref_syntax(ticket_id):
+    with pytest.raises(ValueError, match="invalid ticket ID"):
+        canonical_id(ticket_id)
 
 
 def test_branch_name():
@@ -251,6 +267,139 @@ def test_get_ticket_diff_truncates_large_patch(tmp_path):
     assert result["files"][0]["patch"].endswith("... [truncated]\n")
 
 
+def test_get_ticket_diff_include_patches_false_skips_per_file_diff(tmp_path):
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "notes.txt").write_text("old\n")
+    _git(tmp_path, "add", "notes.txt")
+    _git(tmp_path, "commit", "-m", "base")
+    _git(tmp_path, "checkout", "-b", "tick-002")
+    (tmp_path / "notes.txt").write_text("new\n")
+    _git(tmp_path, "add", "notes.txt")
+    _git(tmp_path, "commit", "-m", "change notes")
+
+    with patch("lanegate.ticket._run_git", wraps=ticket_module._run_git) as spy:
+        result = get_ticket_diff("TICK-002", tmp_path, include_patches=False)
+
+    assert result["files"][0]["path"] == "notes.txt"
+    assert result["files"][0]["status"] == "M"
+    assert result["files"][0]["patch"] == ""
+    assert "notes.txt" in result["stat"]
+    # rev-parse + stat + name-status only -- no per-file `git diff -- <path>` call.
+    diff_calls = [c for c in spy.call_args_list if c.args[1][:2] == ["diff", "main..tick-002"] and "--" in c.args[1]]
+    assert diff_calls == []
+
+
+def test_get_ticket_summary_aggregates_reason_cause_and_diff(tmp_path):
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "README.md").write_text("hello\n")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "base")
+    _git(tmp_path, "checkout", "-b", "tick-001")
+    (tmp_path / "src.py").write_text("changed\n")
+    _git(tmp_path, "add", "src.py")
+    _git(tmp_path, "commit", "-m", "change")
+
+    (tickets_dir / "TICK-001.md").write_text(
+        "---\n"
+        "id: TICK-001\n"
+        "title: Fix the thing\n"
+        "status: needs_review\n"
+        "priority: 2\n"
+        "milestone: v1.7\n"
+        "review_verdict: changes_requested\n"
+        "review_summary: nope\n"
+        "---\n"
+        "Body.\n\n"
+        "## Needs Review Reason\n"
+        "static analysis findings: unused import in src.py\n"
+    )
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+
+    result = get_ticket_summary("TICK-001", cfg, tmp_path)
+
+    assert result["id"] == "TICK-001"
+    assert result["status"] == "needs_review"
+    assert result["title"] == "Fix the thing"
+    assert "unused import in src.py" in result["reason"]
+    assert result["needs_review_cause"] == "static_analysis"
+    assert "lanegate reopen" in result["needs_review_recovery"]
+    assert result["next_step"] == result["needs_review_recovery"]
+    assert result["review_verdict"] == "changes_requested"
+    assert result["review_summary"] == "nope"
+    assert "src.py" in result["diff_stat"]
+    assert result["files_changed"] == [{"path": "src.py", "status": "A"}]
+
+
+def test_get_ticket_summary_code_complete_next_step_by_verdict(tmp_path):
+    """A code_complete ticket with findings but no recorded verdict (e.g. from an
+    ad-hoc/audit review) must not look identical to one still awaiting its first
+    review -- it needs its own next-step advisory."""
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "README.md").write_text("hello\n")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "base")
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+
+    (tickets_dir / "TICK-002.md").write_text(
+        "---\nid: TICK-002\ntitle: Stalled\nstatus: code_complete\n"
+        "review_findings:\n  - a real bug\n---\nBody.\n"
+    )
+    stalled = get_ticket_summary("TICK-002", cfg, tmp_path)
+    assert "no verdict recorded" in stalled["next_step"]
+    assert "lanegate review TICK-002" in stalled["next_step"]
+
+    (tickets_dir / "TICK-003.md").write_text(
+        "---\nid: TICK-003\ntitle: Rejected\nstatus: code_complete\n"
+        "review_verdict: changes_requested\n---\nBody.\n"
+    )
+    rejected = get_ticket_summary("TICK-003", cfg, tmp_path)
+    assert rejected["next_step"] == "address feedback, then: lanegate review TICK-003 --verdict approved"
+
+    (tickets_dir / "TICK-004.md").write_text(
+        "---\nid: TICK-004\ntitle: Approved\nstatus: code_complete\n"
+        "review_verdict: approved\n---\nBody.\n"
+    )
+    approved = get_ticket_summary("TICK-004", cfg, tmp_path)
+    assert approved["next_step"] == "lanegate merge TICK-004"
+
+
+def test_get_ticket_summary_does_not_surface_stale_reason_on_a_healthy_ticket(tmp_path):
+    """A ticket resumed via `lanegate start` (which bypasses cmd_reopen's body-
+    stripping) can carry an old `## Needs Review Reason` section through to a
+    later, healthy status -- it must not be reported as the current reason."""
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    (tickets_dir / "TICK-005.md").write_text(
+        "---\nid: TICK-005\ntitle: Done\nstatus: merged\n---\n"
+        "Body.\n\n## Needs Review Reason\nstale: unused import in src.py\n"
+    )
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+
+    result = get_ticket_summary("TICK-005", cfg, tmp_path)
+
+    assert "reason" not in result
+
+
+def test_get_ticket_summary_missing_ticket_returns_error(tmp_path):
+    (tmp_path / "tickets").mkdir()
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+
+    result = get_ticket_summary("TICK-999", cfg, tmp_path)
+
+    assert result["status"] == 404
+    assert "TICK-999" in result["error"]
+
+
 def test_load_all_tickets(tmp_path):
     _make_ticket(tmp_path, "TICK-001", status="open")
     _make_ticket(tmp_path, "TICK-002", status="in_progress")
@@ -305,6 +454,17 @@ def test_unresolved_dependencies_uses_delivered_statuses_and_canonical_ids():
     }
     assert unresolved_dependencies(["tick-1", "TICK-002", "TICK-3"], status_map) == []
     assert unresolved_dependencies(["TICK-004", "tick-5"], status_map) == ["TICK-004", "tick-5"]
+
+
+def test_unresolved_dependencies_treats_malformed_id_as_unresolved_not_a_crash():
+    """A malformed depends_on entry (executor/LLM-writable, unvalidated by
+    validate_ticket) can never resolve to a real ticket -- it must count as
+    unresolved like any other unmet dependency, not raise ValueError out of
+    canonical_id() and crash board/next/batch selection for every ticket."""
+    status_map = {"TICK-001": "merged"}
+    assert unresolved_dependencies(["TICK-123 (blocked)", "tick-1"], status_map) == [
+        "TICK-123 (blocked)"
+    ]
 
 
 # --- validate_ticket ---
@@ -500,6 +660,31 @@ def test_load_file_skeletons_falls_back_to_legacy_inline():
     }
 
 
+def test_load_file_skeletons_regenerates(tmp_path):
+    """TICK-412: regenerate=True re-parses the current worktree file instead of
+    replaying the stale analyze-time sidecar snapshot."""
+    sidecar = tmp_path / ".lanegate" / "context" / "TICK-001" / "file_skeletons.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(json.dumps({"src/foo.py": "src/foo.py  (1 lines)\n  line   1: def stale()"}))
+
+    src = tmp_path / "src" / "foo.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("def fresh(x, y):\n    pass\n")
+
+    ticket = {
+        "id": "TICK-001",
+        "touches": ["src/foo.py"],
+        "file_skeletons_ref": ".lanegate/context/TICK-001/file_skeletons.json",
+    }
+
+    stale = load_file_skeletons(ticket, tmp_path)
+    assert "def stale()" in stale["src/foo.py"]
+
+    fresh = load_file_skeletons(ticket, tmp_path, regenerate=True)
+    assert "def fresh(x, y)" in fresh["src/foo.py"]
+    assert "def stale()" not in fresh["src/foo.py"]
+
+
 def test_validate_ticket_bad_autonomy():
     errors = validate_ticket(
         {"id": "TICK-001", "title": "Foo", "status": "open", "autonomy": "robot"}
@@ -513,6 +698,21 @@ def test_validate_ticket_valid_autonomy_values():
             validate_ticket({"id": "TICK-001", "title": "Foo", "status": "open", "autonomy": val})
             == []
         )
+
+
+def test_validate_ticket_risk_autonomy_lanes():
+    """green/yellow/red risk-lane autonomy values (TICK-467) validate like
+    the existing full/supervised/manual values; anything else still errors."""
+    for val in ("green", "yellow", "red"):
+        assert (
+            validate_ticket({"id": "TICK-001", "title": "Foo", "status": "open", "autonomy": val})
+            == []
+        )
+
+    errors = validate_ticket(
+        {"id": "TICK-001", "title": "Foo", "status": "open", "autonomy": "orange"}
+    )
+    assert any("autonomy" in e for e in errors)
 
 
 def test_validate_ticket_human_reviewer_ok():
@@ -644,6 +844,135 @@ def test_clean_attention_reason_exit_codes():
     assert _clean_attention_reason("executor exited with code 2") == "executor failed (exit code 2: CLI / configuration error)"
     assert _clean_attention_reason("executor exited with code 137") == "executor failed (exit code 137: process killed / out of memory)"
     assert _clean_attention_reason("executor exited with code 1") == "executor failed (exit code 1: general error)"
+
+
+def test_classify_needs_review_cause_prioritizes_explicit_patterns():
+    from lanegate.ticket import classify_needs_review_cause
+
+    ticket = {
+        "status": "needs_review",
+        "_body": (
+            "## Hibernation Reason\n\n"
+            "rate limit or quota interruption (executor exited 429)\n\n"
+            "## Needs Review Reason\n\n"
+            "security_sensitive_paths — human review required"
+        ),
+    }
+
+    assert classify_needs_review_cause(ticket) == "protected_path"
+
+
+def test_classify_needs_review_cause_identifies_exhausted_auto_fix():
+    from lanegate.ticket import classify_needs_review_cause, needs_review_recovery_advice
+
+    ticket = {
+        "id": "TICK-001",
+        "status": "needs_review",
+        "_body": "## Needs Review Reason\n\nbounded auto-fix/re-review exhausted (1/1)\n",
+    }
+
+    assert classify_needs_review_cause(ticket) == "auto_fix_exhausted"
+    assert "lanegate reopen TICK-001, then lanegate review TICK-001" in needs_review_recovery_advice(ticket)
+
+
+def test_needs_review_recovery_advice_rate_limit_with_auto_fix_attempts():
+    from lanegate.ticket import classify_needs_review_cause, needs_review_recovery_advice
+
+    ticket = {
+        "id": "TICK-590",
+        "status": "needs_review",
+        "auto_fix_attempts": 1,
+        "_body": "## Hibernation Reason\n\nrate limit or quota interruption (executor exited 429)\n",
+    }
+
+    assert classify_needs_review_cause(ticket) == "rate_limit"
+    advice = needs_review_recovery_advice(ticket)
+    assert "lanegate reopen TICK-590" in advice
+    assert "recover-rate-limited-reviews" not in advice
+
+
+def test_needs_review_recovery_advice_rate_limit_without_auto_fix_attempts():
+    from lanegate.ticket import classify_needs_review_cause, needs_review_recovery_advice
+
+    ticket = {
+        "id": "TICK-590",
+        "status": "needs_review",
+        "_body": "## Hibernation Reason\n\nrate limit or quota interruption (executor exited 429)\n",
+    }
+
+    assert classify_needs_review_cause(ticket) == "rate_limit"
+    assert "recover-rate-limited-reviews" in needs_review_recovery_advice(ticket)
+
+
+def test_needs_attention():
+    """Only tickets requiring a person enter the needs-human-decision queue."""
+    cases = [
+        ({"status": "needs_review"}, "escalated", "Manual review required"),
+        ({"status": "failed"}, "failed", "Ticket failed; inspect log and worktree"),
+        ({"status": "code_complete", "review_verdict": "changes_requested"}, "rejected", "Review changes requested"),
+        (
+            {
+                "status": "hibernated",
+                "_body": "## Hibernation Reason\n\nexecutor requires re-authentication",
+            },
+            "stuck",
+            "executor requires re-authentication",
+        ),
+        (
+            {"status": "in_review", "review_verdict": "approved", "autonomy": "manual"},
+            "awaiting_merge",
+            "Approved; awaiting human merge decision",
+        ),
+        (
+            {"status": "in_review", "review_verdict": "approved", "autonomy": "red"},
+            "awaiting_merge",
+            "Approved; awaiting human merge decision",
+        ),
+        (
+            {
+                "status": "in_review",
+                "review_verdict": "approved",
+                "autonomy": "full",
+                "requires_human_merge": True,
+                "rebase_conflict_files": ["src/auth.py"],
+            },
+            "awaiting_merge",
+            "Automated rebase conflict recovery; human merge approval required; inspect recovered files: src/auth.py",
+        ),
+    ]
+    for ticket, category, summary in cases:
+        assert needs_attention(ticket)
+        assert attention_category(ticket) == category
+        assert attention_summary(ticket) == summary
+
+    excluded = [
+        {
+            "status": "hibernated",
+            "_body": "## Hibernation Reason\n\nrate limit or quota interruption (executor exited 429)",
+        },
+        # Reviewer-cooldown hibernations auto-retry after review_retry_after
+        # (TICK-517) -- they must not show up as "Stuck"/needing human
+        # action, same as a genuine rate-limit hibernation above.
+        {
+            "status": "hibernated",
+            "review_pending": True,
+            "review_pending_reason": "Independent reviewer temporarily unavailable (cooldown); retry after 2026-08-13T01:00:00Z.",
+        },
+        {"status": "in_progress", "review_verdict": "changes_requested"},
+        {"status": "in_review", "review_verdict": "changes_requested"},
+        {"status": "in_review", "review_verdict": "approved", "autonomy": "full"},
+        # A ticket closed via `lanegate supersede` flips status without
+        # clearing review_verdict -- a stale changes_requested from before
+        # closure must not resurrect a closed/merged/validated/done ticket
+        # into the Next Steps queue forever.
+        {"status": "closed", "review_verdict": "changes_requested"},
+        {"status": "merged", "review_verdict": "changes_requested"},
+        {"status": "validated", "review_verdict": "changes_requested"},
+        {"status": "done", "review_verdict": "changes_requested"},
+    ]
+    for ticket in excluded:
+        assert not needs_attention(ticket)
+        assert attention_category(ticket) == ""
 
 
 
@@ -1099,7 +1428,7 @@ def test_append_lifecycle_event_writes_structured_and_readable_timeline():
     assert event["summary"] == "merge completed on main"
     assert event["at"].endswith("Z")
     assert "## Lifecycle Timeline" in ticket["_body"]
-    assert "in_review → merged — merge completed on main" in ticket["_body"]
+    assert "in_review → merged — merged: merge completed on main" in ticket["_body"]
 
 
 def test_append_lifecycle_event_preserves_later_ticket_sections():
@@ -1110,6 +1439,215 @@ def test_append_lifecycle_event_preserves_later_ticket_sections():
     assert "## Lifecycle Timeline" in body
     assert "## Needs Review Reason" in body
     assert body.index("## Lifecycle Timeline") > body.index("## Needs Review Reason")
+
+
+def test_append_lifecycle_event_roundtrip_preserves_event_name_and_summary(tmp_path):
+    path = tmp_path / "TICK-100.md"
+    path.write_text(
+        "---\n"
+        "id: TICK-100\n"
+        "title: Test event preservation\n"
+        "status: open\n"
+        "---\n"
+        "## Background\n\nProse.\n",
+        encoding="utf-8",
+    )
+    t = parse_ticket(path)
+    append_lifecycle_event(
+        t,
+        event="implementation_started",
+        from_status="open",
+        to_status="in_progress",
+        summary="worktree claimed for implementation",
+    )
+    write_ticket(t)
+
+    reloaded = parse_ticket(path)
+    assert len(reloaded["lifecycle_events"]) == 1
+    evt = reloaded["lifecycle_events"][0]
+    assert evt["event"] == "implementation_started"
+    assert evt["summary"] == "worktree claimed for implementation"
+    assert evt["from_status"] == "open"
+    assert evt["to_status"] == "in_progress"
+
+    from lanegate.orchestrate.pool import _last_lifecycle_event_epoch
+    epoch = _last_lifecycle_event_epoch(reloaded, "implementation_started")
+    assert epoch is not None
+
+
+def test_write_ticket_migrates_legacy_nested_frontmatter_to_readable_body_and_scalar_summaries(tmp_path):
+    path = tmp_path / "TICK-999.md"
+    legacy_text = (
+        "---\n"
+        "id: TICK-999\n"
+        "title: Test ticket\n"
+        "status: open\n"
+        "change_notes:\n"
+        "  lanegate/ticket.py: update serialization\n"
+        "  lanegate/analyze.py: update analyze\n"
+        "acceptance_contract_audit:\n"
+        "  ok: false\n"
+        "  findings:\n"
+        "    - close_criteria omits item X\n"
+        "  omitted_items:\n"
+        "    - item X\n"
+        "  checked_items:\n"
+        "    - item Y\n"
+        "  sources:\n"
+        "    - docs/ARCHITECTURE.md\n"
+        "lifecycle_events:\n"
+        "  - at: 2026-08-06T05:21:10Z\n"
+        "    event: start\n"
+        "    from_status: open\n"
+        "    to_status: in_progress\n"
+        "    summary: claimed for implementation\n"
+        "---\n"
+        "## Background\n\n"
+        "Test background prose.\n"
+    )
+    path.write_text(legacy_text, encoding="utf-8")
+
+    t = parse_ticket(path)
+    assert t["change_notes"]["lanegate/ticket.py"] == "update serialization"
+    assert t["acceptance_contract_audit"]["ok"] is False
+    assert t["lifecycle_events"][0]["from_status"] == "open"
+
+    write_ticket(t)
+
+    raw = path.read_text(encoding="utf-8")
+    frontmatter_part = raw.split("---\n")[1]
+
+    assert "change_notes_summary: 2" in frontmatter_part
+    assert "acceptance_contract_audit_summary:" in frontmatter_part
+    assert "lifecycle_events_summary: 1" in frontmatter_part
+
+    # Ensure raw frontmatter YAML no longer has nested dicts/lists
+    assert "\nchange_notes:\n" not in frontmatter_part
+    assert "\nacceptance_contract_audit:\n" not in frontmatter_part
+    assert "\nlifecycle_events:\n" not in frontmatter_part
+
+    # Ensure raw body has readable sections
+    assert "## Change Notes" in raw
+    assert "**lanegate/ticket.py**: update serialization" in raw
+    assert "## Acceptance Contract Audit" in raw
+    assert "close_criteria omits item X" in raw
+    assert "## Lifecycle Timeline" in raw
+    assert "open → in_progress — start: claimed for implementation" in raw
+
+    # Re-parse ticket and verify structured fields are rehydrated from body
+    reloaded = parse_ticket(path)
+    assert reloaded["change_notes"]["lanegate/ticket.py"] == "update serialization"
+    assert reloaded["change_notes"]["lanegate/analyze.py"] == "update analyze"
+    assert reloaded["acceptance_contract_audit"]["ok"] is False
+    assert reloaded["acceptance_contract_audit"]["findings"] == ["close_criteria omits item X"]
+    assert reloaded["lifecycle_events"][0]["at"] == "2026-08-06T05:21:10Z"
+    assert reloaded["lifecycle_events"][0]["from_status"] == "open"
+    assert reloaded["lifecycle_events"][0]["to_status"] == "in_progress"
+    assert reloaded["lifecycle_events"][0]["event"] == "start"
+    assert reloaded["lifecycle_events"][0]["summary"] == "claimed for implementation"
+
+
+def test_load_change_notes_and_audit_and_lifecycle_from_body_and_legacy():
+    # Legacy in-memory dicts take precedence
+    t1 = {
+        "change_notes": {"foo.py": "note 1"},
+        "acceptance_contract_audit": {"ok": True, "findings": []},
+        "lifecycle_events": [{"at": "2026-01-01T00:00:00Z", "event": "start", "summary": "test"}],
+        "_body": "## Change Notes\n**bar.py**: note 2\n",
+    }
+    from lanegate.ticket import load_change_notes, load_acceptance_contract_audit, load_lifecycle_events
+    assert load_change_notes(t1) == {"foo.py": "note 1"}
+    assert load_acceptance_contract_audit(t1)["ok"] is True
+    assert len(load_lifecycle_events(t1)) == 1
+
+    # Hydration from body when frontmatter is missing or contains scalar summary
+    t2 = {
+        "change_notes_summary": 1,
+        "acceptance_contract_audit_summary": "ok (0 findings)",
+        "lifecycle_events_summary": 1,
+        "_body": (
+            "Background prose.\n\n"
+            "## Change Notes\n"
+            "**bar.py**: note 2\n\n"
+            "## Acceptance Contract Audit\n"
+            "**Status**: ok (0 findings)\n"
+            "**Checked Items**:\n"
+            "- item 1\n\n"
+            "## Lifecycle Timeline\n"
+            "- 2026-08-06T05:21:10Z: open → in_progress — claimed\n"
+        ),
+    }
+    assert load_change_notes(t2) == {"bar.py": "note 2"}
+    assert load_acceptance_contract_audit(t2)["ok"] is True
+    assert load_acceptance_contract_audit(t2)["checked_items"] == ["item 1"]
+    events = load_lifecycle_events(t2)
+    assert len(events) == 1
+    assert events[0]["from_status"] == "open"
+    assert events[0]["to_status"] == "in_progress"
+
+
+def test_collect_cross_ticket_change_notes(tmp_path):
+    """A new ticket touching a file a prior *merged* ticket also touched should
+    surface that prior ticket's change_notes for the overlapping file, tagged
+    with the prior ticket's ID for provenance (TICK-481: replaces the dead
+    worktree-vs-repo_root per-file .lanegate/notes/ mechanism with a lookup
+    over the already git-tracked change_notes field)."""
+    prior = {
+        "_path": tmp_path / "TICK-100.md",
+        "id": "TICK-100",
+        "title": "Prior ticket",
+        "status": "merged",
+        "touches": ["foo.py"],
+        "change_notes": {"foo.py": "some constraint discovered while implementing TICK-100"},
+    }
+    write_ticket(prior)
+
+    new_ticket = {"id": "TICK-200", "touches": ["foo.py"]}
+
+    result = collect_cross_ticket_change_notes(new_ticket, tmp_path, {"ticket_prefix": "TICK"})
+
+    assert "Prior Change Notes" in result
+    assert "TICK-100" in result
+    assert "some constraint discovered while implementing TICK-100" in result
+
+
+def test_collect_cross_ticket_change_notes_no_overlap_returns_empty(tmp_path):
+    prior = {
+        "_path": tmp_path / "TICK-101.md",
+        "id": "TICK-101",
+        "title": "Prior ticket",
+        "status": "merged",
+        "touches": ["bar.py"],
+        "change_notes": {"bar.py": "unrelated constraint"},
+    }
+    write_ticket(prior)
+
+    new_ticket = {"id": "TICK-201", "touches": ["foo.py"]}
+
+    result = collect_cross_ticket_change_notes(new_ticket, tmp_path, {"ticket_prefix": "TICK"})
+
+    assert result == ""
+
+
+def test_collect_cross_ticket_change_notes_ignores_non_terminal_status(tmp_path):
+    """An in-progress prior ticket's change_notes should not leak into a new
+    ticket's prompt -- only merged/done tickets are considered settled."""
+    prior = {
+        "_path": tmp_path / "TICK-102.md",
+        "id": "TICK-102",
+        "title": "In-flight ticket",
+        "status": "in_progress",
+        "touches": ["foo.py"],
+        "change_notes": {"foo.py": "not yet settled"},
+    }
+    write_ticket(prior)
+
+    new_ticket = {"id": "TICK-202", "touches": ["foo.py"]}
+
+    result = collect_cross_ticket_change_notes(new_ticket, tmp_path, {"ticket_prefix": "TICK"})
+
+    assert result == ""
+
 
 
 # --- F35: delimiter parsing resilience ---
@@ -1207,3 +1745,68 @@ class TestIsPairedTestFile:
     def test_paired_test_file_when_touched_module_nested(self):
         """Matches by module stem regardless of the touched module's own directory depth."""
         assert is_paired_test_file("tests/test_foo.py", {"myapp/sub/foo.py"})
+
+
+def test_explanatory_docstrings():
+    """TICK-391 stripped these down to one-liners; TICK-452 restores the
+    architectural context (canonical-parser and status/lifecycle-auditing
+    invariants) so it isn't lost again to a future rewrite."""
+    funcs = [
+        ticket_module.review_findings_sections,
+        ticket_module.next_review_findings_header,
+        append_status_history,
+        append_lifecycle_event,
+    ]
+    for func in funcs:
+        doc = func.__doc__ or ""
+        assert len(doc.strip().splitlines()) > 1, f"{func.__name__} is missing its explanatory docstring"
+        assert len(doc.strip()) > 120, f"{func.__name__} docstring is too short to be explanatory"
+
+
+def test_acceptance_matrix_requires_every_contract_category():
+    complete = {
+        "invariants": ["The lock remains atomic."],
+        "adversarial_cases": ["Malformed input is rejected."],
+        "compatibility_cases": ["Existing CLI output remains accepted."],
+        "regression_tests": ["test_lock_rejects_malformed_input"],
+    }
+    assert validate_acceptance_matrix(complete, required=True) == []
+    incomplete = dict(complete, adversarial_cases=[])
+    assert "adversarial_cases" in " ".join(validate_acceptance_matrix(incomplete, required=True))
+    assert validate_acceptance_matrix(incomplete) == []
+    assert validate_acceptance_matrix({"invariants": complete["invariants"]}) == []
+
+
+def test_find_control_plane_touch_overlaps_ignores_terminal_tickets(tmp_path):
+    _make_ticket(tmp_path, "TICK-001", status="open", touches=["src/control.ext"], title="Harden configuration routing")
+    _make_ticket(tmp_path, "TICK-002", status="merged", touches=["src/control.ext"], title="Harden configuration routing")
+    _make_ticket(tmp_path, "TICK-003", status="open", touches=["docs/guide.md"], title="Harden configuration routing")
+    overlaps = find_control_plane_touch_overlaps(
+        {"id": "TICK-004", "title": "Harden configuration routing", "touches": ["src/control.ext"]}, tmp_path
+    )
+    assert overlaps == [{"ticket_id": "TICK-001", "paths": ["src/control.ext"]}]
+
+
+def test_upsert_body_section_with_nested_subheadings():
+    """Verify _upsert_body_section correctly replaces sections containing ### subheadings
+    without treating ### as an H2 section boundary."""
+    from lanegate.ticket import _upsert_body_section
+
+    header = "## Archived Review Findings (2026-08-17)"
+    sec1 = f"{header}\n\n**Summary**: summary 1\n**Reviewed At**: 2026-08-17T10:00:00Z\n**Dismissal Rationale**: rationale 1\n\n### Findings\n- finding 1\n"
+    sec2 = f"{header}\n\n**Summary**: summary 2\n**Reviewed At**: 2026-08-17T11:00:00Z\n**Dismissal Rationale**: rationale 2\n\n### Findings\n- finding 2\n"
+
+    body0 = "Initial body prose.\n\n## Change Notes\n**foo.py**: updated\n"
+    body1 = _upsert_body_section(body0, header, sec1)
+    assert "summary 1" in body1
+    assert "finding 1" in body1
+    assert "## Change Notes" in body1
+
+    body2 = _upsert_body_section(body1, header, sec2)
+    assert "summary 2" in body2
+    assert "finding 2" in body2
+    assert "## Change Notes" in body2
+    assert "summary 1" not in body2
+    assert "finding 1" not in body2
+    assert body2.count("### Findings") == 1
+

@@ -72,6 +72,18 @@ def claim_lock(repo_root: Path):
         yield
 
 
+@contextlib.contextmanager
+def metadata_commit_lock(repo_root: Path):
+    """Serialize only Git commits for generated ticket metadata.
+
+    Reviews and implementations remain parallel in their worktrees; their
+    final status commits share the control checkout's Git index.
+    """
+    lock_path = state_dir(repo_root) / "metadata-commit.lock"
+    with portalocker.Lock(str(lock_path), "a", timeout=None):
+        yield
+
+
 class SafeguardLockHeld(RuntimeError):
     """Raised when another lanegate complete/merge invocation is already running
     this ticket's safeguards."""
@@ -121,15 +133,6 @@ def _orchestrator_lock_path(repo_root: Path) -> Path:
     return state_dir(repo_root) / "orchestrator.lock"
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if a process with this PID exists (and we may signal it).
-
-    Delegates to the shared cross-platform probe; on Windows a plain
-    ``os.kill(pid, 0)`` would *terminate* the process being checked.
-    """
-    return pid_alive(pid)
-
-
 def _read_lock_pid(lock_path: Path) -> int | None:
     """Return the PID recorded in the lock file, or None if absent/garbage."""
     try:
@@ -168,7 +171,7 @@ def acquire_orchestrator_lock(repo_root: Path, pid: int | None = None, force: bo
     lock_path = _orchestrator_lock_path(repo_root)
     with _flock_guard(repo_root):
         existing = _read_lock_pid(lock_path)
-        if existing is not None and existing != pid and _pid_alive(existing) and not force:
+        if existing is not None and existing != pid and pid_alive(existing) and not force:
             raise OrchestratorLockError(
                 f"an orchestrator (PID {existing}) is already running for this repo. "
                 f"Use --force to override a wedged lock, or attach read-only with status."
@@ -208,7 +211,7 @@ def orchestrator_lock_status(repo_root: Path) -> dict:
     pid = _read_lock_pid(lock_path)
     if pid is None:
         return {"held": False, "pid": None, "alive": False}
-    alive = _pid_alive(pid)
+    alive = pid_alive(pid)
     return {"held": alive, "pid": pid, "alive": alive}
 
 
@@ -318,7 +321,8 @@ def reread_and_assert_open(ticket_path: Path) -> dict:
 def check_local_not_behind_remote(repo_root: Path, branch: str) -> None:
     """
     Fetch and check whether the local ticket branch is behind its remote tracking branch.
-    Raises RuntimeError if diverged (cross-clone race detected).
+    Raises RuntimeError if diverged or if an existing remote branch cannot be
+    compared with its local branch (cross-clone race detected).
     Silently passes if the remote branch does not exist yet (first claim is safe).
     """
     # Fetch quietly; ignore errors (no remote, no network — not fatal)
@@ -340,12 +344,17 @@ def check_local_not_behind_remote(repo_root: Path, branch: str) -> None:
 
     # Count commits behind
     behind = subprocess.run(
-        ["git", "rev-list", "--count", f"HEAD..origin/{branch}"],
+        ["git", "rev-list", "--count", f"{branch}..origin/{branch}"],
         cwd=repo_root,
         capture_output=True,
         text=True, encoding="utf-8",
     )
-    if behind.returncode == 0 and behind.stdout.strip() != "0":
+    if behind.returncode != 0:
+        raise RuntimeError(
+            f"could not compare local branch {branch} with origin/{branch}; "
+            "refusing to overwrite remote ticket work. Fetch or check out the branch and retry."
+        )
+    if behind.stdout.strip() != "0":
         raise RuntimeError(
             f"local branch is behind origin/{branch} — another clone may have claimed this ticket. "
             f"Run 'git fetch && git pull' and retry."

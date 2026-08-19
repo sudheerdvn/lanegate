@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+from lanegate.timeutil import utc_now_iso as _utc_now_iso
+
 _ACTIVE_STATUS_FILE = "active-orchestrate.json"
 _MAX_AUDIT_FILE_BYTES = 2 * 1024 * 1024
 _MAX_AUDIT_TEXT_BYTES = 512 * 1024
@@ -75,10 +77,6 @@ def _active_status_path(repo_root: Path, session_id: str | None = None) -> Path:
     return status_dir / f"{session_id}.json"
 
 
-def _utc_now_iso() -> str:
-    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _iso_from_epoch(ts: float) -> str:
     """Render a recorded epoch start time in the same shape as _utc_now_iso."""
     return datetime.datetime.fromtimestamp(ts, datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -123,6 +121,42 @@ def _copy_bounded_file(src: Path, dest: Path, *, limit: int = _MAX_AUDIT_FILE_BY
     }
 
 
+def _copy_formatted_jsonl(
+    src: Path, dest: Path, *, limit: int = _MAX_AUDIT_FILE_BYTES
+) -> dict:
+    """Copy a JSONL artifact with each event rendered for human inspection.
+
+    Events remain independent JSON values in their original order; pretty
+    printing happens per source line rather than by collecting the transcript
+    into an array.  Stop at an event boundary when the bounded capture fills
+    up so captured JSON is never cut through the middle of an object.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    truncated = False
+    with open(src, encoding="utf-8") as in_f, open(dest, "w", encoding="utf-8") as out_f:
+        for source_line in in_f:
+            if not source_line.strip():
+                continue
+            formatted = json.dumps(json.loads(source_line), indent=2) + "\n"
+            encoded = formatted.encode("utf-8")
+            if total + len(encoded) > limit:
+                truncated = True
+                break
+            out_f.write(formatted)
+            total += len(encoded)
+        if not truncated and in_f.read(1):
+            truncated = True
+        if truncated:
+            out_f.write("[truncated by LaneGate audit capture]\n")
+    return {
+        "source": str(src),
+        "path": str(dest),
+        "bytes": dest.stat().st_size,
+        "truncated": truncated,
+    }
+
+
 def _safe_rel(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
@@ -155,6 +189,27 @@ def _find_latest_audit_bundle(repo_root: Path, tid: str) -> Path | None:
         return latest
     except (OSError, ValueError):
         return None
+
+
+def has_step_bundle(repo_root: Path, tid: str, step: str) -> bool:
+    """Return whether any audit bundle for *tid* records the requested step."""
+    bundles_dir = repo_root / ".lanegate" / "executor-runs" / tid
+    if not bundles_dir.exists():
+        return False
+
+    try:
+        session_dirs = [d for d in bundles_dir.iterdir() if d.is_dir()]
+    except OSError:
+        return False
+
+    for session_dir in session_dirs:
+        try:
+            status = json.loads((session_dir / "status.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            continue
+        if status.get("step") == step:
+            return True
+    return False
 
 
 def _new_manifest(status: dict, bundle_path: Path) -> dict:
@@ -402,7 +457,7 @@ def _capture_executor_audit_bundle(
         transcript_reason = f"executor {executor!r} has no LaneGate transcript discovery adapter"
 
     if transcript is not None:
-        detail = _copy_bounded_file(transcript, bundle_path / "executor-session.jsonl")
+        detail = _copy_formatted_jsonl(transcript, bundle_path / "executor-session.jsonl")
         _manifest_capture(manifest, "executor-session.jsonl", detail)
     else:
         _manifest_missing(manifest, "executor-session.jsonl", transcript_reason)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"lanegate/tui/internal/client"
+	"lanegate/tui/internal/screens"
 )
 
 // fixturesRootForTest resolves the shared Python/Go fixture corpus at
@@ -194,6 +196,11 @@ type fakeClient struct {
 	runLogs           *client.RunLogsPayload
 	runLogsErr        error
 
+	runSummaryCalls  int
+	lastRunSummaryID string
+	runSummary       *client.RunSummaryPayload
+	runSummaryErr    error
+
 	settingsCalls int
 	settings      *client.SettingsPayload
 	settingsErr   error
@@ -306,7 +313,12 @@ func (f *fakeClient) GetRunHistory(ctx context.Context) (*client.RunHistoryPaylo
 }
 
 func (f *fakeClient) GetRunSummary(ctx context.Context, runID string) (*client.RunSummaryPayload, error) {
-	return &client.RunSummaryPayload{RunID: runID}, nil
+	f.runSummaryCalls++
+	f.lastRunSummaryID = runID
+	if f.runSummary != nil {
+		return f.runSummary, f.runSummaryErr
+	}
+	return &client.RunSummaryPayload{RunID: runID}, f.runSummaryErr
 }
 
 func (f *fakeClient) GetRunLogs(ctx context.Context, runID string, offset, limit int) (*client.RunLogsPayload, error) {
@@ -478,7 +490,7 @@ func TestUpdate_ScreenSwitch_ToBlocked_CallsGetBlocked(t *testing.T) {
 	}
 }
 
-func TestUpdate_AllSixScreensReachableViaNumberKeys(t *testing.T) {
+func TestUpdate_AllSevenScreensReachableViaNumberKeys(t *testing.T) {
 	fc := &fakeClient{
 		board:    &client.BoardPayload{},
 		diff:     &client.DiffPayload{},
@@ -487,8 +499,8 @@ func TestUpdate_AllSixScreensReachableViaNumberKeys(t *testing.T) {
 	}
 	m := readyModel(t, fc)
 
-	want := []screenID{screenBoard, screenTicket, screenBlocked, screenDiff, screenRun, screenSettings}
-	for i, k := range []string{"1", "2", "3", "4", "5", "6"} {
+	want := []screenID{screenBoard, screenTicket, screenBlocked, screenDiff, screenRun, screenHistory, screenSettings}
+	for i, k := range []string{"1", "2", "3", "4", "5", "6", "7"} {
 		updated, _ := m.Update(key(k))
 		m = updated.(*Model)
 		if m.screen != want[i] {
@@ -542,7 +554,7 @@ func TestUpdate_HelpToggleAndEscClose(t *testing.T) {
 		t.Fatal("expected ? to show help")
 	}
 	view := m.View()
-	for _, want := range []string{"Global", "1-6", "q, ctrl+c", "pgup/pgdn"} {
+	for _, want := range []string{"Global", "1-7", "q, ctrl+c", "pgup/pgdn"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("help view missing %q:\n%s", want, view)
 		}
@@ -657,15 +669,15 @@ func TestUpdate_ScreenSwitch_ToSettings_CallsGetSettings(t *testing.T) {
 	}
 	m := readyModel(t, fc)
 
-	updated, cmd := m.Update(key("6"))
+	updated, cmd := m.Update(key("7"))
 	m = updated.(*Model)
 	if m.screen != screenSettings {
-		t.Fatalf("screen after pressing 6 = %v, want screenSettings", m.screen)
+		t.Fatalf("screen after pressing 7 = %v, want screenSettings", m.screen)
 	}
 	msg := cmd()
 	batch, ok := msg.(tea.BatchMsg)
 	if !ok {
-		t.Fatalf("Update(6) cmd() = %T, want tea.BatchMsg (settings + pools)", msg)
+		t.Fatalf("Update(7) cmd() = %T, want tea.BatchMsg (settings + pools)", msg)
 	}
 
 	var sawSettings, sawPools bool
@@ -764,6 +776,159 @@ func TestUpdate_ScreenSwitch_ToRun_LoadsActivityWithoutStartingRawStream(t *test
 	}
 }
 
+// TestUpdate_RunActivityPollLoadsRunSummaryIntoLiveBatchTickets is a
+// regression test: the Activity poll must also fetch the run summary and
+// feed its BatchTickets into RunModel's live outcome table, on the same 2s
+// cadence as the rest of the Run screen's live refresh.
+func TestUpdate_RunActivityPollLoadsRunSummaryIntoLiveBatchTickets(t *testing.T) {
+	fc := &fakeClient{
+		board:     &client.BoardPayload{},
+		run:       &client.RunPayload{RunID: "run-1", Status: "running"},
+		runEvents: &client.RunEventsPayload{Events: []client.ExecutorEvent{{TicketID: "TICK-1", Progress: client.ExecutorProgress{Activity: "planning"}}}},
+	}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("5"))
+	m = updated.(*Model)
+	m, _ = runBatchCmds(t, m, cmd)
+
+	fc.runSummary = &client.RunSummaryPayload{
+		RunID: "run-1",
+		BatchTickets: []client.TicketOutcome{
+			{TicketID: "TICK-1", Executor: "claude-a", Outcome: "success", DurationSeconds: 12.5},
+		},
+	}
+
+	updated, cmd = m.Update(runActivityPollMsg{gen: m.runActivityPollGen})
+	m = updated.(*Model)
+	if cmd == nil {
+		t.Fatal("Activity poll should schedule a refresh")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Activity poll cmd() = %T, want tea.BatchMsg", cmd())
+	}
+	for _, c := range batch[:len(batch)-1] { // Skip the timer reschedule command.
+		updated, _ = m.Update(c())
+		m = updated.(*Model)
+	}
+
+	if fc.runSummaryCalls != 1 || fc.lastRunSummaryID != "run-1" {
+		t.Errorf("GetRunSummary calls/id = %d/%q, want 1/%q", fc.runSummaryCalls, fc.lastRunSummaryID, "run-1")
+	}
+	got := m.run.LiveBatchTickets()
+	if len(got) != 1 || got[0].TicketID != "TICK-1" || got[0].Outcome != "success" {
+		t.Errorf("LiveBatchTickets() = %+v, want one success outcome for TICK-1", got)
+	}
+}
+
+// TestUpdate_RunSummaryLoadedMsg_DropsOutOfOrderResponse guards against a
+// slower, older run-summary request (GetRunSummary enriches every
+// non-success outcome from disk, so its latency varies) completing after a
+// newer one and clobbering the Live Outcomes table with stale per-ticket
+// outcomes.
+func TestUpdate_RunSummaryLoadedMsg_DropsOutOfOrderResponse(t *testing.T) {
+	fc := &fakeClient{board: &client.BoardPayload{}}
+	m := readyModel(t, fc)
+
+	newer := runSummaryLoadedMsg{
+		runID: "run-1",
+		gen:   2,
+		data: &client.RunSummaryPayload{
+			RunID:        "run-1",
+			BatchTickets: []client.TicketOutcome{{TicketID: "TICK-2", Outcome: "success"}},
+		},
+	}
+	older := runSummaryLoadedMsg{
+		runID: "run-1",
+		gen:   1,
+		data: &client.RunSummaryPayload{
+			RunID:        "run-1",
+			BatchTickets: []client.TicketOutcome{{TicketID: "TICK-1", Outcome: "changes_requested"}},
+		},
+	}
+
+	updated, _ := m.Update(newer)
+	m = updated.(*Model)
+	updated, _ = m.Update(older) // arrives late; must not overwrite the newer table
+	m = updated.(*Model)
+
+	got := m.run.LiveBatchTickets()
+	if len(got) != 1 || got[0].TicketID != "TICK-2" {
+		t.Errorf("LiveBatchTickets() = %+v, want the newer gen's TICK-2 to survive the late older response", got)
+	}
+}
+
+func TestUpdate_RunActivityPoll_RetainsSnapshotAfterRefreshError(t *testing.T) {
+	fc := &fakeClient{
+		board:     &client.BoardPayload{},
+		run:       &client.RunPayload{RunID: "run-1", Status: "running"},
+		runEvents: &client.RunEventsPayload{},
+	}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("5"))
+	m = updated.(*Model)
+	m, _ = runBatchCmds(t, m, cmd)
+
+	refreshErr := errors.New("connection reset")
+	updated, _ = m.Update(runLoadedMsg{err: refreshErr, autoRefreshing: true, gen: m.runSnapshotReqGen})
+	m = updated.(*Model)
+	if got := m.run.GetData(); got == nil || got.RunID != "run-1" {
+		t.Fatalf("run snapshot after failed refresh = %+v, want retained run-1", got)
+	}
+	if got := m.statusBar.Error; got != refreshErr.Error() {
+		t.Errorf("refresh error shown in status bar = %q, want %q", got, refreshErr)
+	}
+
+	updated, cmd = m.Update(runActivityPollMsg{gen: m.runActivityPollGen})
+	m = updated.(*Model)
+	if cmd == nil {
+		t.Fatal("Activity poll after a refresh error = nil, want continued polling without panic")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Activity poll cmd() = %T, want tea.BatchMsg", cmd())
+	}
+	if len(batch) != 5 {
+		t.Fatalf("Activity poll batch length = %d, want 5 including the run summary and next timer", len(batch))
+	}
+}
+
+func TestUpdate_RunLoadedMsg_DropsSupersededResponse(t *testing.T) {
+	m := readyModel(t, &fakeClient{board: &client.BoardPayload{}})
+	m.runSnapshotReqGen = 2
+
+	updated, _ := m.Update(runLoadedMsg{gen: 2, data: &client.RunPayload{RunID: "run-new", Status: "running"}})
+	m = updated.(*Model)
+	updated, cmd := m.Update(runLoadedMsg{gen: 1, data: &client.RunPayload{RunID: "run-old", Status: "finished"}})
+	m = updated.(*Model)
+	if cmd != nil {
+		t.Error("superseded run response should not update loading state")
+	}
+	if got := m.run.GetData(); got == nil || got.RunID != "run-new" {
+		t.Errorf("run snapshot after stale response = %+v, want run-new", got)
+	}
+}
+
+// TestUpdate_RunLoadedMsg_StaleResponseClearsLoadingState is a regression
+// test for the bug where a superseded runLoadedMsg was dropped without ever
+// calling finishLoad, leaving m.loading stuck true (frozen on "Loading
+// Run...") if no other in-flight response ever arrives to clear it.
+func TestUpdate_RunLoadedMsg_StaleResponseClearsLoadingState(t *testing.T) {
+	m := readyModel(t, &fakeClient{board: &client.BoardPayload{}})
+	m.screen = screenRun
+	m.loading = true
+	m.runSnapshotReqGen = 2
+
+	updated, cmd := m.Update(runLoadedMsg{gen: 1, data: &client.RunPayload{RunID: "run-old", Status: "finished"}})
+	m = updated.(*Model)
+	if cmd != nil {
+		t.Errorf("stale run response cmd = %v, want nil", cmd)
+	}
+	if m.loading {
+		t.Error("stale runLoadedMsg left m.loading = true, want it cleared")
+	}
+}
+
 func TestUpdate_RunActivityPollRefreshesLiveDataAndStopsInAuditMode(t *testing.T) {
 	fc := &fakeClient{
 		board:     &client.BoardPayload{},
@@ -806,7 +971,54 @@ func TestUpdate_RunActivityPollRefreshesLiveDataAndStopsInAuditMode(t *testing.T
 	}
 }
 
-func TestUpdate_RunActivityPoll_PreservesScrollAndHistorySelection(t *testing.T) {
+// TestUpdate_RunActivityPollMsg_SelfHealsWhenScreenChangesWithoutStop is a
+// regression test: if a screen/audit-mode transition ever leaves
+// m.screen/audit-mode diverged from Run/Activity without going through
+// stopRunActivityPolling first, the runActivityPollMsg handler must clear
+// runActivityPolling itself instead of silently dropping its reschedule
+// chain while leaving the flag stuck true — otherwise ensureRunActivityPolling's
+// guard permanently refuses to ever restart polling.
+func TestUpdate_RunActivityPollMsg_SelfHealsWhenScreenChangesWithoutStop(t *testing.T) {
+	fc := &fakeClient{
+		board:     &client.BoardPayload{},
+		run:       &client.RunPayload{RunID: "run-1", Status: "running"},
+		runEvents: &client.RunEventsPayload{Events: []client.ExecutorEvent{{TicketID: "TICK-1", Progress: client.ExecutorProgress{Activity: "planning"}}}},
+	}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("5"))
+	m = updated.(*Model)
+	m, _ = runBatchCmds(t, m, cmd)
+	if !m.runActivityPolling {
+		t.Fatal("test setup: expected live Activity polling to be armed after entering the Run screen")
+	}
+	gen := m.runActivityPollGen
+
+	// Simulate a transition that diverges m.screen from Run without going
+	// through switchScreen/stopRunActivityPolling, so runActivityPolling is
+	// still true and gen still matches when the pending tick fires.
+	m.screen = screenBoard
+
+	updated, cmd = m.Update(runActivityPollMsg{gen: gen})
+	m = updated.(*Model)
+	if cmd != nil {
+		t.Error("a poll message that declines to reschedule itself should not return a cmd")
+	}
+	if m.runActivityPolling {
+		t.Fatal("runActivityPollMsg must self-heal runActivityPolling to false when it drops its own reschedule chain, not leave it stuck true")
+	}
+
+	// Re-enter the Run screen and drive a runEventsLoadedMsg response;
+	// ensureRunActivityPolling's guard must no longer permanently refuse to
+	// restart the poller.
+	updated, cmd = m.Update(key("5"))
+	m = updated.(*Model)
+	m, _ = runBatchCmds(t, m, cmd)
+	if !m.runActivityPolling {
+		t.Error("live Activity polling should re-arm after switchScreen(screenRun) + runEventsLoadedMsg, proving the poller is not permanently wedged")
+	}
+}
+
+func TestUpdate_RunActivityPoll_PreservesLiveRunScroll(t *testing.T) {
 	events := make([]client.ExecutorEvent, 30)
 	for i := range events {
 		events[i] = client.ExecutorEvent{
@@ -818,17 +1030,11 @@ func TestUpdate_RunActivityPoll_PreservesScrollAndHistorySelection(t *testing.T)
 		board:     &client.BoardPayload{},
 		run:       &client.RunPayload{RunID: "run-1", Status: "running"},
 		runEvents: &client.RunEventsPayload{Events: events},
-		runHistory: &client.RunHistoryPayload{Runs: []client.RunSummaryPayload{
-			{RunID: "run-1"}, {RunID: "run-selected"},
-		}},
 	}
 	m := readyModel(t, fc)
 	updated, cmd := m.Update(key("5"))
 	m = updated.(*Model)
 	m, _ = runBatchCmds(t, m, cmd)
-	if !m.run.MoveSelection(1) || m.run.SelectedRun().RunID != "run-selected" {
-		t.Fatal("test setup failed to select the historical run")
-	}
 	m.scrollActive(3)
 	wantOffset := m.scrollOffsets[screenRun]
 	if wantOffset == 0 {
@@ -839,24 +1045,98 @@ func TestUpdate_RunActivityPoll_PreservesScrollAndHistorySelection(t *testing.T)
 		TicketID: "TICK-2",
 		Progress: client.ExecutorProgress{Phase: "testing", Activity: "testing", Executor: "claude-b"},
 	})}
-	fc.runHistory = &client.RunHistoryPayload{Runs: []client.RunSummaryPayload{
-		{RunID: "run-new"}, {RunID: "run-1"}, {RunID: "run-selected"},
-	}}
 	updated, cmd = m.Update(runActivityPollMsg{gen: m.runActivityPollGen})
 	m = updated.(*Model)
 	batch, ok := cmd().(tea.BatchMsg)
 	if !ok {
 		t.Fatalf("Activity poll cmd() = %T, want tea.BatchMsg", cmd())
 	}
-	for _, c := range batch[:3] { // Skip the timer reschedule command.
+	for _, c := range batch[:2] { // Skip the timer reschedule command.
 		updated, _ = m.Update(c())
 		m = updated.(*Model)
 	}
 	if got := m.scrollOffsets[screenRun]; got != wantOffset {
 		t.Errorf("scroll offset after Activity poll = %d, want %d", got, wantOffset)
 	}
-	if got := m.run.SelectedRun().RunID; got != "run-selected" {
-		t.Errorf("selected history run after Activity poll = %q, want run-selected", got)
+}
+
+func TestUpdate_RunKeysScrollEvenWhenHistoryIsPopulated(t *testing.T) {
+	events := make([]client.ExecutorEvent, 40)
+	for i := range events {
+		events[i] = client.ExecutorEvent{
+			TicketID: "TICK-1",
+			Progress: client.ExecutorProgress{Phase: "implementing", Activity: "planning", Executor: "claude-a"},
+		}
+	}
+	fc := &fakeClient{
+		board:     &client.BoardPayload{},
+		run:       &client.RunPayload{RunID: "run-live", Status: "running"},
+		runEvents: &client.RunEventsPayload{Events: events},
+	}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("5"))
+	m = updated.(*Model)
+	m, _ = runBatchCmds(t, m, cmd)
+	m.run.SetHistory(&client.RunHistoryPayload{Runs: []client.RunSummaryPayload{{RunID: "run-live"}, {RunID: "run-old"}}})
+
+	selected := m.run.SelectedRun().RunID
+	updated, cmd = m.Update(key("j"))
+	m = updated.(*Model)
+	if cmd != nil {
+		t.Error("j on the live Run screen should only scroll")
+	}
+	if got := m.run.SelectedRun().RunID; got != selected {
+		t.Errorf("j changed historical selection to %q, want %q", got, selected)
+	}
+	if got := m.scrollOffsets[screenRun]; got == 0 {
+		t.Error("j did not scroll the live Run screen")
+	}
+}
+
+// TestUpdate_RunHistorySelectionScrollsRowIntoView is a regression test for
+// a bug where moving the Run History selection with j/k jumped the viewport
+// to the "Selected Run:" detail line below the table instead of the table
+// row itself — scrollToSelectedRunHistory used to find the target line by
+// searching rendered text for the raw run id, but the table's STARTED
+// column stopped rendering that raw id (it shows a formatted timestamp),
+// leaving the detail line as the only remaining match. The fix computes the
+// row's line directly instead of searching for it.
+func TestUpdate_RunHistorySelectionScrollsRowIntoView(t *testing.T) {
+	const runCount = 30
+	runs := make([]client.RunSummaryPayload, runCount)
+	for i := range runs {
+		runs[i] = client.RunSummaryPayload{RunID: fmt.Sprintf("run-%02d", i), Reason: "stopped"}
+	}
+	fc := &fakeClient{board: &client.BoardPayload{}, runHistory: &client.RunHistoryPayload{Runs: runs}}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("6"))
+	m = updated.(*Model)
+	if cmd == nil {
+		t.Fatal("switching to the History screen: cmd = nil, want a run-history load")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(*Model)
+
+	height := m.bodyHeight()
+	if height <= 0 {
+		t.Fatal("test terminal too short to exercise scrolling")
+	}
+
+	for step := 1; step < runCount; step++ {
+		updated, _ = m.Update(key("j"))
+		m = updated.(*Model)
+
+		if got := m.run.SelectedIndex(); got != step {
+			t.Fatalf("after %d 'j' presses, selected index = %d, want %d (selection should move one row at a time)", step, got, step)
+		}
+		line, ok := m.run.SelectedRunRenderedLine()
+		if !ok {
+			t.Fatalf("step %d: SelectedRunRenderedLine reported no selection", step)
+		}
+		offset := m.scrollOffsets[screenHistory]
+		if line < offset || line > offset+height-1 {
+			t.Fatalf("step %d: selected row at line %d is outside the visible window [%d, %d) — selection scrolled out of view", step, line, offset, offset+height)
+		}
 	}
 }
 
@@ -1076,9 +1356,10 @@ func TestUpdate_RunHistorySelectionOpensHistoricalActivityOnEnter(t *testing.T) 
 		runEvents: &client.RunEventsPayload{RunID: "run-old", Events: []client.ExecutorEvent{{TicketID: "TICK-OLD", Progress: client.ExecutorProgress{Activity: "completed"}}}},
 	}
 	m := readyModel(t, fc)
-	updated, cmd := m.Update(key("5"))
+	updated, cmd := m.Update(key("6"))
 	m = updated.(*Model)
-	m, _ = runBatchCmds(t, m, cmd)
+	updated, _ = m.Update(cmd())
+	m = updated.(*Model)
 	m.run.SetHistory(&client.RunHistoryPayload{Runs: []client.RunSummaryPayload{{RunID: "run-live"}, {RunID: "run-old"}}})
 
 	updated, cmd = m.Update(key("down"))
@@ -1192,8 +1473,8 @@ func TestUpdate_RunLogMsg_StaleGenerationIsDropped(t *testing.T) {
 }
 
 // TestUpdate_PressH_OnRunScreen_FetchesOlderHistory drives the Run screen's
-// "H" key (TICK-304): once the live tail has at least one event establishing
-// a boundary, pressing H should call GetRunLogPage for the page immediately
+// "H" key: once the live tail has at least one event establishing a
+// boundary, pressing H should call GetRunLogPage for the page immediately
 // preceding that boundary and splice the result into RunModel's history.
 func TestUpdate_PressH_OnRunScreen_FetchesOlderHistory(t *testing.T) {
 	next := 400
@@ -1377,7 +1658,7 @@ func TestUpdate_Esc_ReturnsToPreviousScreen(t *testing.T) {
 	}
 }
 
-// --- Pool executor reorder (TICK-269) ---
+// --- Pool executor reorder ---
 
 // settingsReadyModel switches a ready model to the Settings screen and
 // seeds it with pools directly (bypassing the load round-trip, which is
@@ -1386,7 +1667,7 @@ func TestUpdate_Esc_ReturnsToPreviousScreen(t *testing.T) {
 func settingsReadyModel(t *testing.T, fc *fakeClient, pools []client.Pool) *Model {
 	t.Helper()
 	m := readyModel(t, fc)
-	updated, _ := m.Update(key("6"))
+	updated, _ := m.Update(key("7"))
 	m = updated.(*Model)
 	m.settings.SetPools(pools)
 	return m
@@ -1573,6 +1854,37 @@ func TestUpdate_RefreshKey_ReloadsActiveScreenOnly(t *testing.T) {
 	}
 }
 
+func TestUpdate_BoardMilestoneGroupingTogglePreservesSelection(t *testing.T) {
+	fc := &fakeClient{board: &client.BoardPayload{Tickets: map[string][]client.Ticket{
+		"open": {
+			{ID: "TICK-1", Milestone: "v2", Priority: 1},
+			{ID: "TICK-2", Milestone: "v1", Priority: 2},
+		},
+		"in_progress": {{ID: "TICK-3", Milestone: "v1", Priority: 1}},
+	}}}
+	m := readyModel(t, fc)
+	updated, _ := m.Update(key("down"))
+	m = updated.(*Model)
+	if m.selectedTicketID != "TICK-2" {
+		t.Fatalf("selectedTicketID before grouping = %q, want TICK-2", m.selectedTicketID)
+	}
+
+	updated, cmd := m.Update(key("m"))
+	m = updated.(*Model)
+	if cmd != nil {
+		t.Error("milestone grouping should be a local board operation")
+	}
+	if got := m.board.Grouping(); got != screens.BoardGroupByMilestone {
+		t.Errorf("board grouping = %v, want milestone", got)
+	}
+	if m.selectedTicketID != "TICK-2" || m.board.SelectedTicketID() != "TICK-2" {
+		t.Errorf("selection was not preserved: app=%q board=%q", m.selectedTicketID, m.board.SelectedTicketID())
+	}
+	if got := m.statusBar.Info; got != "Board grouped by milestone." {
+		t.Errorf("status bar info = %q, want grouping confirmation", got)
+	}
+}
+
 func TestUpdate_LoadError_SetsStatusBarErrorAndKeepsRunning(t *testing.T) {
 	fc := &fakeClient{
 		board:     &client.BoardPayload{},
@@ -1631,6 +1943,33 @@ func TestView_ReflectsActiveScreen(t *testing.T) {
 	}
 }
 
+func TestView_ShowsNeedsAttentionCountOnEveryScreen(t *testing.T) {
+	fc := &fakeClient{
+		board: &client.BoardPayload{Tickets: map[string][]client.Ticket{
+			"needs_review": {{ID: "TICK-1", NeedsAttention: true}, {ID: "TICK-2", NeedsAttention: true}},
+			"open":         {{ID: "TICK-3"}},
+		}},
+		ticket:   &client.TicketDetail{ID: "TICK-1"},
+		blocked:  &client.BlockedPayload{},
+		diff:     &client.DiffPayload{},
+		run:      &client.RunPayload{},
+		settings: &client.SettingsPayload{},
+		pools:    &client.PoolsPayload{},
+	}
+	m := readyModel(t, fc)
+	for _, keyName := range []string{"1", "2", "3", "4", "5", "6"} {
+		updated, cmd := m.Update(key(keyName))
+		m = updated.(*Model)
+		if cmd != nil {
+			updated, _ = m.Update(cmd())
+			m = updated.(*Model)
+		}
+		if view := m.View(); !strings.Contains(view, "attention: 2") {
+			t.Errorf("screen %s did not retain attention count:\n%s", keyName, view)
+		}
+	}
+}
+
 func TestView_ShowsLoadingWhileFetchInFlight(t *testing.T) {
 	fc := &fakeClient{board: &client.BoardPayload{}}
 	m := New(fc)
@@ -1666,6 +2005,7 @@ func TestDefaultKeyBindings_Global(t *testing.T) {
 		Screen4:  "4",
 		Screen5:  "5",
 		Screen6:  "6",
+		Screen7:  "7",
 		Back:     "esc",
 	}
 	if kb.Global != want {
@@ -1695,6 +2035,7 @@ func TestDefaultKeyBindings_AllReadOnlyScreensHaveScrollKeys(t *testing.T) {
 		"Blocked":  kb.Blocked,
 		"Diff":     kb.Diff,
 		"Run":      kb.Run,
+		"History":  kb.History,
 		"Settings": kb.Settings,
 	} {
 		if sk.PageUp == "" || sk.PageDown == "" || sk.Home == "" || sk.End == "" {

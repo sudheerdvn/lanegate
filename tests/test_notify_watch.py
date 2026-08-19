@@ -63,7 +63,7 @@ def test_read_pid_returns_none_when_no_file(tmp_path):
 def test_read_pid_returns_none_for_dead_process(tmp_path):
     pid_path = tmp_path / "notify-watch.pid"
     pid_path.write_text("999999\n")
-    with patch("lanegate.notify_watch.pid_alive", return_value=False):
+    with patch("lanegate.watch_common.pid_alive", return_value=False):
         assert _read_pid(pid_path) is None
 
 
@@ -118,12 +118,35 @@ def test_already_running_exits_nonzero(tmp_path):
     assert pid_path.exists()
 
 
+def test_background_spawns_detached_and_returns_without_running_loop(tmp_path, capsys):
+    with (
+        patch("lanegate.lifecycle.spawn_detached", return_value=4242) as mock_spawn,
+        patch("lanegate.notify_watch._run_loop") as mock_loop,
+    ):
+        cmd_notify_watch(_default_cfg(tmp_path), tmp_path, background=True)
+
+    mock_spawn.assert_called_once()
+    args, _kwargs = mock_spawn.call_args
+    assert args[0] == ["lanegate", "notify-watch"]
+    mock_loop.assert_not_called()
+    assert "4242" in capsys.readouterr().out
+
+
+def test_background_exits_nonzero_when_already_running(tmp_path):
+    pid_path = _notify_watch_pid_file(tmp_path)
+    pid_path.write_text(f"{os.getpid()}\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_notify_watch(_default_cfg(tmp_path), tmp_path, background=True)
+    assert exc_info.value.code == 1
+
+
 def test_stale_pid_file_cleaned_up_on_start(tmp_path):
     pid_path = _notify_watch_pid_file(tmp_path)
     pid_path.write_text("999999\n")
 
     with (
-        patch("lanegate.notify_watch.pid_alive", return_value=False),
+        patch("lanegate.watch_common.pid_alive", return_value=False),
         patch("lanegate.notify_watch._run_loop") as mock_loop,
     ):
         cmd_notify_watch(_default_cfg(tmp_path), tmp_path)
@@ -258,6 +281,39 @@ def test_detect_problem_flags_process_died(tmp_path):
         problem = _detect_problem(cfg, tmp_path)
     assert problem is not None
     assert problem[0] == "process-died:TICK-050"
+
+
+def test_detect_problem_flags_pooled_executor_stale_heartbeat(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    session = {
+        "active": True,
+        "ticket_id": "TICK-060",
+        "step": "implement",
+        "last_heartbeat_at": __import__("time").time() - 999,
+    }
+    with (
+        patch("lanegate.notify_watch.orchestrator_lock_status", return_value={"held": True, "alive": True}),
+        patch("lanegate.orchestrate._read_all_active_statuses", return_value=[session]),
+        patch("lanegate.orchestrate._read_active_status", return_value=None),
+    ):
+        problem = _detect_problem(cfg, tmp_path)
+    assert problem is not None
+    signature, message = problem
+    assert signature == "heartbeat-stale:TICK-060"
+    assert "TICK-060" in message
+
+
+def test_detect_problem_flags_pooled_executor_process_died(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    session = {"active": True, "ticket_id": "TICK-061", "step": "implement", "last_heartbeat_at": None}
+    with (
+        patch("lanegate.notify_watch.orchestrator_lock_status", return_value={"held": False, "alive": False}),
+        patch("lanegate.orchestrate._read_all_active_statuses", return_value=[session]),
+        patch("lanegate.orchestrate._read_active_status", return_value=None),
+    ):
+        problem = _detect_problem(cfg, tmp_path)
+    assert problem is not None
+    assert problem[0] == "process-died:TICK-061"
 
 
 def test_detect_problem_flags_halted_with_stuck_tickets(tmp_path):

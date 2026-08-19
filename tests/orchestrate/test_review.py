@@ -6,6 +6,11 @@ Split out of the former monolithic tests/test_orchestrate.py (TICK-316).
 
 from __future__ import annotations
 
+import shutil
+from datetime import UTC, datetime
+
+from lanegate.orchestrate.review import _refresh_ticket_content_from_worktree
+from lanegate.reviewer import ReviewError
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
 
@@ -278,6 +283,239 @@ class TestRunReviewAgentConfigErrorFailClosed:
         mock_cmd_review.assert_not_called()
         mock_mark_needs_review.assert_not_called()
 
+    def _persisted_ticket(self, tmp_path: Path) -> dict:
+        """A ticket with a real backing file, so _escalate_harness_error's
+        needs_review persistence actually runs instead of short-circuiting on
+        the missing _path that the in-memory tickets above deliberately have."""
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir(exist_ok=True)
+        path = _write_ticket(tickets_dir, "TICK-997", "code_complete")
+        return parse_ticket(path)
+
+    def test_ollama_reviewer_escalates_ticket_to_needs_review(self, tmp_path):
+        """Raw ollama has no code-application/review step of its own — it
+        must be rejected before any subprocess review dispatch, and the
+        ticket must actually land in needs_review the same way other
+        fail-closed reviewer misconfigurations leave it."""
+        ticket = self._persisted_ticket(tmp_path)
+        cfg = {
+            "trunk_branch": "main",
+            "reviewer": "ollama",
+            "commit_status_changes": False,
+        }
+
+        with (
+            self._patch_diff(),
+            patch("lanegate.config.load_config", return_value=cfg),
+            patch("lanegate.orchestrate.subprocess.run") as mock_run,
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path)
+
+        assert result is False
+        assert mock_run.call_count == 1  # only get_commit_messages' git log call
+        mock_cmd_review.assert_not_called()
+        assert parse_ticket(ticket["_path"])["status"] == "needs_review"
+
+    def test_named_ollama_instance_reviewer_escalates_to_needs_review(self, tmp_path):
+        """A named executor instance (TICK-088) backed by ollama must hit the
+        same guard. expand_driver() only expands `drivers:` entries, so
+        `reviewer: local-ollama` arrives at the guard as the instance name;
+        resolving it through get_executor_config() is what makes the guard
+        fire instead of dispatching `ollama run ...` and accepting whatever
+        verdict-shaped text comes back."""
+        ticket = self._persisted_ticket(tmp_path)
+        cfg = {
+            "trunk_branch": "main",
+            "reviewer": "local-ollama",
+            "executors": {"local-ollama": {"type": "ollama"}},
+            "commit_status_changes": False,
+        }
+
+        with (
+            self._patch_diff(),
+            patch("lanegate.config.load_config", return_value=cfg),
+            patch("lanegate.orchestrate.subprocess.run") as mock_run,
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path)
+
+        assert result is False
+        assert mock_run.call_count == 1  # only get_commit_messages' git log call
+        mock_cmd_review.assert_not_called()
+        assert parse_ticket(ticket["_path"])["status"] == "needs_review"
+
+    def test_escalate_harness_error_prevents_worktree_frontmatter_overlay(self, tmp_path):
+        """Review escalation reloads control checkout frontmatter and prevents
+        worktree-authored ticket frontmatter from being overlaid and persisted,
+        while clearing prior substantive review verdicts."""
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir(parents=True, exist_ok=True)
+        control_ticket_path = tickets_dir / "TICK-603.md"
+        control_ticket_path.write_text(
+            "---\n"
+            "id: TICK-603\n"
+            "title: Control Checkout Title\n"
+            "status: code_complete\n"
+            "review_verdict: changes_requested\n"
+            "review_summary: Prior substantive rejection summary\n"
+            "touches:\n"
+            "  - lanegate/orchestrate/review.py\n"
+            "---\n"
+            "Control body.\n"
+        )
+        ticket = parse_ticket(control_ticket_path)
+
+        wt_path = tmp_path / "worktree"
+        wt_tickets_dir = wt_path / "tickets"
+        wt_tickets_dir.mkdir(parents=True, exist_ok=True)
+        wt_ticket_path = wt_tickets_dir / "TICK-603.md"
+        wt_ticket_path.write_text(
+            "---\n"
+            "id: TICK-603\n"
+            "title: Modified Worktree Title\n"
+            "status: code_complete\n"
+            "touches:\n"
+            "  - lanegate/orchestrate/review.py\n"
+            "  - lanegate/malicious.py\n"
+            "---\n"
+            "Modified worktree body.\n"
+        )
+
+        cfg = {
+            "trunk_branch": "main",
+            "reviewer": "ollama",
+            "commit_status_changes": False,
+        }
+
+        with (
+            self._patch_diff(),
+            patch("lanegate.config.load_config", return_value=cfg),
+            patch("lanegate.orchestrate.subprocess.run") as mock_run,
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path, worktree_path=wt_path)
+
+        assert result is False
+        mock_cmd_review.assert_not_called()
+
+        persisted = parse_ticket(control_ticket_path)
+        assert persisted["status"] == "needs_review"
+        assert persisted["title"] == "Control Checkout Title"
+        assert persisted["touches"] == ["lanegate/orchestrate/review.py"]
+        assert "review_verdict" not in persisted
+        assert "review_summary" not in persisted
+
+
+
+class TestRefreshTicketContentFromWorktree:
+    """TICK-551: review must not be dispatched against a stale close_criteria.
+
+    Regression for TICK-545: an implementer/auto-fix commit narrowed
+    close_criteria on the ticket's own branch, but review is dispatched with
+    the ticket dict loaded from the control checkout, which never saw that
+    edit until merge. The reviewer had to spend most of its turns
+    reconciling a contradiction between a stale CLOSE CRITERIA field and the
+    actual diff/commits before it could trust the diff.
+    """
+
+    def _control_ticket(self, repo_root: Path) -> dict:
+        tickets_dir = repo_root / "tickets"
+        tickets_dir.mkdir(parents=True, exist_ok=True)
+        path = tickets_dir / "TICK-551.md"
+        path.write_text(
+            "---\nid: TICK-551\nstatus: code_complete\n"
+            "close_criteria: original stale contract\n"
+            "touches: [a.py]\n---\nstale body\n"
+        )
+        return {
+            "id": "TICK-551",
+            "status": "code_complete",
+            "close_criteria": "original stale contract",
+            "touches": ["a.py"],
+            "_body": "stale body",
+            "_path": path,
+        }
+
+    def _write_worktree_copy(self, repo_root: Path, worktree_path: Path, content: str) -> None:
+        wt_tickets_dir = worktree_path / "tickets"
+        wt_tickets_dir.mkdir(parents=True, exist_ok=True)
+        (wt_tickets_dir / "TICK-551.md").write_text(content)
+
+    def test_overlays_close_criteria_touches_and_body_from_worktree(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        ticket = self._control_ticket(repo_root)
+        self._write_worktree_copy(
+            repo_root,
+            worktree_path,
+            "---\nid: TICK-551\nstatus: code_complete\n"
+            "close_criteria: current narrowed contract\n"
+            "touches: [a.py, b.py]\n---\ncurrent body\n",
+        )
+
+        _refresh_ticket_content_from_worktree(ticket, repo_root, worktree_path)
+
+        assert ticket["close_criteria"] == "current narrowed contract"
+        assert ticket["touches"] == ["a.py", "b.py"]
+        assert ticket["_body"] == "current body"
+        # Lifecycle-authoritative fields are untouched by this overlay.
+        assert ticket["status"] == "code_complete"
+
+    def test_noop_when_worktree_missing(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "does-not-exist"
+        ticket = self._control_ticket(repo_root)
+
+        _refresh_ticket_content_from_worktree(ticket, repo_root, worktree_path)
+
+        assert ticket["close_criteria"] == "original stale contract"
+
+    def test_noop_when_worktree_ticket_copy_missing(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        ticket = self._control_ticket(repo_root)
+
+        _refresh_ticket_content_from_worktree(ticket, repo_root, worktree_path)
+
+        assert ticket["close_criteria"] == "original stale contract"
+
+    def test_noop_when_worktree_ticket_copy_unparseable(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        ticket = self._control_ticket(repo_root)
+        self._write_worktree_copy(repo_root, worktree_path, "not a valid ticket file at all")
+
+        _refresh_ticket_content_from_worktree(ticket, repo_root, worktree_path)
+
+        assert ticket["close_criteria"] == "original stale contract"
+
+    def test_run_review_agent_refreshes_ticket_before_building_prompt(self, tmp_path, monkeypatch):
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        ticket = {
+            "id": "TICK-551",
+            "title": "t",
+            "close_criteria": "stale",
+            "_body": "",
+            "worktree": str(tmp_path / "worktree"),
+        }
+        calls = []
+        monkeypatch.setattr(
+            "lanegate.orchestrate.review._refresh_ticket_content_from_worktree",
+            lambda t, root, wt: calls.append((t["id"], root, wt)),
+        )
+        with (
+            patch(
+                "lanegate.reviewer.get_worktree_diff",
+                side_effect=ReviewError("no worktree — stop before any real dispatch"),
+            ),
+        ):
+            run_review_agent(ticket, repo_root)
+
+        assert calls == [("TICK-551", repo_root, Path(tmp_path / "worktree"))]
+
 
 class TestRunReviewAgentDriverDispatch:
     def _make_ticket(self) -> dict:
@@ -295,7 +533,7 @@ class TestRunReviewAgentDriverDispatch:
             "drivers": {
                 "review-fast": {
                     "type": "claude-process",
-                    "model": "review-driver-model",
+                    "model": "claude-review-driver-model",
                     "bin": "custom-review",
                     "flags": ["--driver-flag"],
                     "env": {"REVIEW_TOKEN": "${SOURCE_REVIEW_TOKEN}"},
@@ -334,8 +572,317 @@ class TestRunReviewAgentDriverDispatch:
         assert review_cmd[0] == "custom-review"
         assert "--driver-flag" in review_cmd
         assert "--model" in review_cmd
-        assert review_cmd[review_cmd.index("--model") + 1] == "review-driver-model"
+        assert review_cmd[review_cmd.index("--model") + 1] == "claude-review-driver-model"
         assert review_kwargs["env"]["REVIEW_TOKEN"] == "review-token"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_review_dispatch_uses_validated_worktree_model_but_root_policy(self, tmp_path):
+        from lanegate.config import load_config, load_worktree_config
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".lanegate.yml").write_text(
+            "executor: agy\n"
+            "review_fallback: different_model\n"
+            "models:\n"
+            "  review: gemini-3.1-pro-high\n"
+        )
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+
+        wt_lanegate = worktree_path / "lanegate"
+        wt_lanegate.mkdir()
+        source_lanegate = Path(__file__).parents[2] / "lanegate"
+        shutil.copy2(source_lanegate / "__init__.py", wt_lanegate / "__init__.py")
+        shutil.copy2(source_lanegate / "config.py", wt_lanegate / "config.py")
+        shutil.copy2(source_lanegate / "ticket.py", wt_lanegate / "ticket.py")
+        with (wt_lanegate / "config.py").open("a") as config_file:
+            config_file.write(
+                "\nfrom pathlib import Path\n"
+                "Path('worktree-validator-executed').write_text('unsafe')\n"
+                "_KNOWN_AGY_MODELS.add('custom-worktree-model-99')\n"
+            )
+
+        (worktree_path / ".lanegate.yml").write_text(
+            "executor: agy\n"
+            "review_fallback: same_model\n"
+            "acceptance_contract_mode: advisory\n"
+            "project_guidance:\n"
+            "  files: [UNTRUSTED.md]\n"
+            "models:\n"
+            "  review: custom-worktree-model-99\n"
+        )
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(worktree_path)
+        assert "custom-worktree-model-99" in str(exc_info.value)
+        assert load_worktree_config(worktree_path)["models"]["review"] == "custom-worktree-model-99"
+        assert not (worktree_path / "worktree-validator-executed").exists()
+
+        ticket = self._make_ticket()
+        ticket["implement_session_executor"] = "codex"
+        review_commands = []
+        root_cfg = load_config(repo_root)
+
+        def fake_stream(cmd, **kwargs):
+            review_commands.append(list(cmd))
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.reviewer.build_review_prompt", return_value="trusted prompt") as build_prompt,
+            patch(
+                "lanegate.orchestrate.review.resolve_independent_review_driver",
+                return_value=("agy", "independent"),
+            ) as resolve_reviewer,
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(
+                ticket,
+                repo_root,
+                worktree_path=worktree_path,
+                cfg=root_cfg,
+            )
+
+        assert result is True
+        # The statically validated worktree model preserves self-hosting
+        # compatibility, but policy and prompt inputs stay at the control root.
+        selection_cfg = resolve_reviewer.call_args.args[1]
+        assert selection_cfg["models"]["review"] == "gemini-3.1-pro-high"
+        assert selection_cfg["review_fallback"] == "different_model"
+        assert selection_cfg.get("acceptance_contract_mode") != "advisory"
+        assert review_commands[0][review_commands[0].index("--model") + 1] == "custom-worktree-model-99"
+        assert build_prompt.call_args.kwargs["cfg"] == root_cfg
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_worktree_reviewer_cannot_transplant_model_onto_root_driver(self):
+        from lanegate.orchestrate.review import _review_dispatch_config
+
+        root_cfg = {
+            "executor": "agy",
+            "models": {"review": "gemini-3.1-pro-high"},
+        }
+        worktree_cfg = {
+            "executor": "agy",
+            "reviewer": "codex",
+            "models": {"review": "gpt-5.6-sol"},
+        }
+
+        dispatch_cfg = _review_dispatch_config(root_cfg, worktree_cfg, "agy", "agy")
+
+        assert dispatch_cfg["models"]["review"] == "gemini-3.1-pro-high"
+        assert dispatch_cfg.get("reviewer") is None
+
+    def test_worktree_naming_alias_type_cannot_bind_a_named_driver_alias(self):
+        """Finding [2]: a `steps.review.driver` alias (e.g. `trusted-codex`)
+        expands to a bare type (`codex`) for compatibility checks, but the
+        worktree must name the *alias itself*, not merely that type, to
+        receive the model overlay -- or any worktree naming a same-typed
+        `reviewer: codex` could ride through an unrelated aliased route."""
+        from lanegate.orchestrate.review import _review_dispatch_config
+
+        control_cfg = {
+            "executor": "claude-impl",
+            "drivers": {"trusted-codex": {"type": "codex"}},
+            "models": {"review": "control-model"},
+        }
+
+        # Naming only the resolved type, not the alias, must not bind.
+        worktree_cfg_bare_type = {
+            "reviewer": "codex",
+            "models": {"review": "worktree-bare-type-model"},
+        }
+        dispatch_cfg = _review_dispatch_config(
+            control_cfg, worktree_cfg_bare_type, "trusted-codex", "codex"
+        )
+        assert dispatch_cfg["models"]["review"] == "control-model"
+
+        # Naming the exact alias through the real modern step route, with a
+        # matching declared type, does bind.
+        worktree_cfg_named_alias = {
+            "steps": {"review": {"driver": "trusted-codex"}},
+            "drivers": {"trusted-codex": {"type": "codex"}},
+            "models": {"review": "worktree-alias-model"},
+        }
+        dispatch_cfg = _review_dispatch_config(
+            control_cfg, worktree_cfg_named_alias, "trusted-codex", "codex"
+        )
+        assert dispatch_cfg["models"]["review"] == "worktree-alias-model"
+
+    def test_worktree_model_overlay_binds_to_selected_mixed_pool_executor(self, tmp_path):
+        """An Agy-only worktree model cannot be sent to Codex when a trusted
+        mixed pool selects the Codex sibling for independent review."""
+        ticket = self._make_ticket()
+        ticket["implement_session_executor"] = "agy-impl"
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / ".lanegate.yml").write_text("# validated separately\n")
+        control_cfg = {
+            "executor": "agy",
+            "models": {"review": "gpt-5.6-sol"},
+            "executors": {
+                "agy-impl": {"type": "agy"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["agy-impl", "codex-review"]}},
+            "default_pool": "default",
+            "review_fallback": "different_model",
+        }
+        worktree_cfg = {
+            "executor": "agy",
+            "models": {"review": "gemini-3.1-pro-high"},
+            "executors": {
+                "agy-impl": {"type": "agy"},
+                "codex-review": {"type": "codex"},
+            },
+        }
+        dispatched = []
+
+        def fake_stream(cmd, **kwargs):
+            dispatched.append(list(cmd))
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.config.load_worktree_config", return_value=worktree_cfg),
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(
+                ticket, repo_root, worktree_path=worktree_path, cfg=control_cfg
+            ) is True
+
+        assert dispatched[0][0] == "codex"
+        assert dispatched[0][dispatched[0].index("--model") + 1] == "gpt-5.6-sol"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_worktree_codex_model_cannot_reach_trusted_claude_review_route(self, tmp_path):
+        """A worktree-declared Codex model must never dispatch on a trusted
+        Claude review route, even when it relabels the same instance name."""
+        ticket = self._make_ticket()
+        ticket["implement_session_executor"] = "claude-impl"
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / ".lanegate.yml").write_text("# validated separately\n")
+        control_cfg = {
+            "executor": "claude-impl",
+            "models": {"review": "claude-opus-5"},
+            "executors": {
+                "claude-impl": {"type": "claude-process"},
+                "codex-review": {"type": "claude-process"},
+            },
+            "pools": {"default": {"executors": ["claude-impl", "codex-review"]}},
+            "default_pool": "default",
+            "review_fallback": "different_model",
+        }
+        worktree_cfg = {
+            "executor": "claude-impl",
+            "models": {"review": "gpt-5.6-sol"},
+            "executors": {
+                "claude-impl": {"type": "claude-process"},
+                "codex-review": {"type": "codex", "models": {"review": "gpt-5.6-sol"}},
+            },
+        }
+        dispatched = []
+
+        def fake_stream(cmd, **kwargs):
+            dispatched.append(list(cmd))
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.config.load_worktree_config", return_value=worktree_cfg),
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(
+                ticket, repo_root, worktree_path=worktree_path, cfg=control_cfg
+            ) is True
+
+        assert dispatched[0][0] == "claude"
+        assert dispatched[0][dispatched[0].index("--model") + 1] == "claude-opus-5"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_worktree_claude_model_cannot_reach_trusted_codex_review_route(self, tmp_path):
+        """The reverse of the above: a worktree-declared Claude model must
+        never dispatch on a trusted Codex review route."""
+        ticket = self._make_ticket()
+        ticket["implement_session_executor"] = "codex-impl"
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / ".lanegate.yml").write_text("# validated separately\n")
+        control_cfg = {
+            "executor": "codex-impl",
+            "models": {"review": "gpt-5.6-sol"},
+            "executors": {
+                "codex-impl": {"type": "codex"},
+                "claude-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["codex-impl", "claude-review"]}},
+            "default_pool": "default",
+            "review_fallback": "different_model",
+        }
+        worktree_cfg = {
+            "executor": "codex-impl",
+            "models": {"review": "claude-opus-5"},
+            "executors": {
+                "codex-impl": {"type": "codex"},
+                "claude-review": {"type": "claude-process", "models": {"review": "claude-opus-5"}},
+            },
+        }
+        dispatched = []
+
+        def fake_stream(cmd, **kwargs):
+            dispatched.append(list(cmd))
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.config.load_worktree_config", return_value=worktree_cfg),
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(
+                ticket, repo_root, worktree_path=worktree_path, cfg=control_cfg
+            ) is True
+
+        assert dispatched[0][0] == "codex"
+        assert dispatched[0][dispatched[0].index("--model") + 1] == "gpt-5.6-sol"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_review_dispatch_without_worktree_config_uses_root_config_and_custom_path(self, tmp_path):
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".lanegate.yml").write_text(
+            "worktrees_dir: custom-worktrees\n"
+            "executor: agy\n"
+            "models:\n"
+            "  review: gemini-3.1-pro-high\n"
+        )
+        worktree_path = repo_root / "custom-worktrees" / "tick-998"
+        worktree_path.mkdir(parents=True)
+        review_commands = []
+
+        def fake_stream(cmd, **kwargs):
+            review_commands.append(list(cmd))
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(self._make_ticket(), repo_root)
+
+        assert result is True
+        assert review_commands[0][review_commands[0].index("--model") + 1] == "gemini-3.1-pro-high"
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
 
     def test_review_retries_rate_limited_pool_instance_on_healthy_sibling(self, tmp_path):
@@ -386,6 +933,152 @@ class TestRunReviewAgentDriverDispatch:
         assert result is True
         assert dispatched == ["claude-review-1", "claude-review-2"]
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_sibling_retry_does_not_carry_worktree_model_overlay_across_executor_types(
+        self, tmp_path
+    ):
+        """Finding [1]: a rate-limited Agy route failing over to a Codex pool
+        sibling must recompute the worktree model overlay for the new
+        driver, not reuse the Agy-scoped overlay built for the first pick."""
+        ticket = self._make_ticket()
+        ticket["implement_session_executor"] = "claude-impl"
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        worktree_path = tmp_path / "worktree"
+        worktree_path.mkdir()
+        (worktree_path / ".lanegate.yml").write_text("# validated separately\n")
+        control_cfg = {
+            "executor": "claude-impl",
+            "models": {"review": "codex-control-default-model"},
+            "executors": {
+                "claude-impl": {"type": "claude-process"},
+                "agy-review": {"type": "agy"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {
+                "default": {"executors": ["claude-impl", "agy-review", "codex-review"]}
+            },
+            "default_pool": "default",
+            "review_fallback": "different_model",
+        }
+        # Bound only to agy-review by name and type -- must not leak onto
+        # codex-review once the pool fails over past its rate limit.
+        worktree_cfg = {
+            "reviewer": "agy-review",
+            "executors": {"agy-review": {"type": "agy"}},
+            "models": {"review": "claude-worktree-agy-model"},
+        }
+        dispatched = []
+
+        def fake_stream(cmd, **kwargs):
+            dispatched.append(list(cmd))
+            if cmd[0] == "agy":
+                return 1, "", "rate limit exceeded", None
+            return 0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None
+
+        with (
+            patch("lanegate.config.load_worktree_config", return_value=worktree_cfg),
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(
+                ticket, repo_root, worktree_path=worktree_path, cfg=control_cfg
+            ) is True
+
+        assert [cmd[0] for cmd in dispatched] == ["agy", "codex"]
+        # First attempt legitimately used the bound worktree overlay...
+        first_cmd = dispatched[0]
+        assert first_cmd[first_cmd.index("--model") + 1] == "claude-worktree-agy-model"
+        # ...but the failed-over Codex sibling must fall back to the trusted
+        # control-checkout default, never the stale Agy-scoped model.
+        second_cmd = dispatched[1]
+        assert second_cmd[second_cmd.index("--model") + 1] == "codex-control-default-model"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_initial_review_skips_known_cooling_reviewer(self, tmp_path):
+        """A recorded Claude A cooldown routes the very first review to B."""
+        from lanegate.executor import write_cooldown
+
+        ticket = self._make_ticket()
+        ticket["executor"] = "claude-a"
+        cfg = {
+            "ticket_prefix": "TICK", "tickets_dir": "tickets", "executor": "claude-a",
+            "executors": {
+                "claude-a": {"type": "claude-process"},
+                "claude-b": {"type": "claude-process"},
+            },
+            "pools": {"default": {"executors": ["claude-a", "claude-b"]}},
+            "default_pool": "default",
+        }
+        write_cooldown(tmp_path, "claude-a", "weekly quota", retry_after=3600)
+        dispatched = []
+
+        def build(executor, prompt, cfg_, **kwargs):
+            dispatched.append(executor)
+            return [executor]
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "log"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"verdict": "approved", "notes": "ok"}), stderr=""
+            )
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+        assert dispatched == ["claude-b"]
+
+    def test_rate_limited_review_hibernates_without_verdict_or_findings(self, tmp_path):
+        """No healthy sibling means review-pending, never a false rejection."""
+        from lanegate.ticket import parse_ticket
+
+        tickets = tmp_path / "tickets"
+        tickets.mkdir()
+        path = tickets / "TICK-429.md"
+        path.write_text(
+            "---\nid: TICK-429\ntitle: Rate limited\nstatus: code_complete\ntouches: [foo.py]\n---\nBody.\n"
+        )
+        ticket = parse_ticket(path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        cfg = {
+            "ticket_prefix": "TICK", "tickets_dir": "tickets", "worktrees_dir": "worktrees",
+            "executor": "claude-a", "commit_status_changes": False,
+            "executors": {"claude-a": {"type": "claude-process"}},
+            "pools": {"default": {"executors": ["claude-a"]}}, "default_pool": "default",
+        }
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "log"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="",
+                stderr="HTTP 429: weekly limit resets Aug 7, 6am (America/Los_Angeles)",
+            )
+
+        fake_now = datetime(2026, 8, 7, 0, 0, 0, tzinfo=UTC)
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run),
+            patch("lanegate.executor._utc_now", return_value=fake_now),
+        ):
+            assert run_review_agent(ticket, tmp_path, worktree_path=worktree, cfg=cfg) is False
+
+        refreshed = parse_ticket(path)
+        assert refreshed["status"] == "hibernated"
+        assert refreshed["review_pending"] is True
+        assert not refreshed.get("review_verdict")
+        assert not refreshed.get("review_findings")
+        cooldown = json.loads((tmp_path / ".lanegate" / "executors" / "claude-a.cooldown").read_text())
+        assert cooldown["until"].startswith("2026-08-07T13:00:00")
 
     def test_review_unwraps_json_envelope_for_named_claude_instance(self, tmp_path):
         """A named executor instance (e.g. "claude-a") of type claude-process
@@ -585,6 +1278,222 @@ class TestReviewIndependenceLadder:
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
         assert mock_cmd_review.call_args.kwargs["review_independence"] == "independent"
 
+    def test_routed_review_model_pin_wins_over_rereview_escalation(self, tmp_path):
+        """TICK-554: an explicit route pin remains authoritative on re-review."""
+        ticket = self._make_ticket()
+        ticket.update(
+            executor="codex-impl",
+            review_model_pin="gpt-5.6-sol",
+            review_verdict="changes_requested",
+        )
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "codex-impl",
+            "executors": {
+                "codex-impl": {"type": "codex"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["codex-impl", "codex-review"]}},
+            "default_pool": "default",
+            "models": {"review_escalation": "gpt-5.6-terra"},
+        }
+        dispatched_models: list[str | None] = []
+
+        def fake_build(executor, prompt, cfg_, **kwargs):
+            dispatched_models.append(kwargs.get("model"))
+            return [executor]
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        assert dispatched_models == ["gpt-5.6-sol"]
+
+    def test_routed_review_model_pin_mismatched_to_ollama_aider_provider_fails_closed(
+        self, tmp_path
+    ):
+        """A stale/leaked claude-* review_model_pin routed onto an
+        Ollama-provider aider reviewer must fail closed (needs_review) rather
+        than silently dispatching a model that executor can't use -- the
+        review-time counterpart of the pool-dispatch implement leak this
+        ticket fixes. Provider lives on the `drivers:` entry here, not on an
+        `executors:` instance, exercising the same fallback pool.py's
+        resolve_dispatch() needed."""
+        ticket = self._make_ticket()
+        ticket.update(
+            executor="codex-impl",
+            reviewer="aider-review",
+            review_model_pin="claude-sonnet-5",
+        )
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "codex-impl",
+            "executors": {"codex-impl": {"type": "codex"}},
+            "drivers": {"aider-review": {"type": "aider", "provider": "ollama"}},
+        }
+        dispatched_models: list[str | None] = []
+
+        def fake_build(executor, prompt, cfg_, **kwargs):
+            dispatched_models.append(kwargs.get("model"))
+            return [executor]
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is False
+
+        assert dispatched_models == []
+
+    def test_recorded_implementer_cannot_be_hidden_by_later_executor_pin(self, tmp_path):
+        """Review exclusion uses who implemented, never a later route edit."""
+        ticket = self._make_ticket()
+        ticket.update(
+            executor="codex-review",
+            implement_session_executor="claude-impl",
+        )
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-impl",
+            "executors": {
+                "claude-impl": {"type": "claude-process"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["claude-impl", "codex-review"]}},
+            "default_pool": "default",
+            "review_fallback": "needs_review",
+        }
+        dispatched: list[str] = []
+
+        def fake_build(executor, prompt, cfg_, **kwargs):
+            dispatched.append(executor)
+            return [executor]
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        assert dispatched == ["codex-review"]
+        assert mock_cmd_review.call_args.kwargs["review_independence"] == "independent"
+
+    def test_incompatible_routed_pin_never_launches_on_pool_selected_reviewer(self, tmp_path):
+        """A pool retry/selection cannot send a Claude pin to Codex."""
+        ticket = self._make_ticket()
+        ticket.update(
+            executor="claude-impl",
+            review_model_pin="claude-sonnet-5",
+        )
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-impl",
+            "executors": {
+                "claude-impl": {"type": "claude-process"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["claude-impl", "codex-review"]}},
+            "default_pool": "default",
+            "review_fallback": "needs_review",
+        }
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review._stream_subprocess") as stream,
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is False
+
+        stream.assert_not_called()
+
+    def test_review_attribution_does_not_suppress_rereview_escalation(self, tmp_path):
+        """TICK-554: a previous review's model is not an operator pin."""
+        ticket = self._make_ticket()
+        ticket.update(
+            executor="codex-impl",
+            review_model="gpt-5.6-terra",
+            review_verdict="changes_requested",
+        )
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "codex-impl",
+            "executors": {
+                "codex-impl": {"type": "codex"},
+                "codex-review": {"type": "codex"},
+            },
+            "pools": {"default": {"executors": ["codex-impl", "codex-review"]}},
+            "default_pool": "default",
+            "models": {"review": "gpt-5.6-terra", "review_escalation": "gpt-5.6-sol"},
+        }
+        dispatched_models: list[str | None] = []
+
+        def fake_build(executor, prompt, cfg_, **kwargs):
+            dispatched_models.append(kwargs.get("model"))
+            return [executor]
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        assert dispatched_models == ["gpt-5.6-sol"]
+
+    def test_pool_name_override_reaches_review_dispatch(self, tmp_path):
+        """An explicit pool_name (as orchestrate --pool passes) must govern
+        review dispatch, not just implement -- ticket carries no pool of its
+        own, default_pool has claude-a/claude-b, but pool_name="codex-only"
+        must still win and select codex, never falling back to default_pool."""
+        ticket = self._make_ticket()
+        ticket["executor"] = "claude-a"
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-a",
+            "executors": {
+                "claude-a": {"type": "claude-process"},
+                "claude-b": {"type": "claude-process"},
+                "codex": {"type": "codex"},
+            },
+            "pools": {
+                "default": {"executors": ["claude-a", "claude-b"]},
+                "codex-only": {"executors": ["codex"]},
+            },
+            "default_pool": "default",
+        }
+        dispatched: list[str] = []
+
+        def fake_build(executor, prompt, cfg_, **kwargs):
+            dispatched.append(executor)
+            return [executor]
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path, cfg=cfg, pool_name="codex-only")
+
+        assert result is True
+        assert dispatched == ["codex"]
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
     def test_degrades_to_different_model_when_no_alternative_instance_exists(self, tmp_path):
         """Rung 2 (different-model): a single-account config has no sibling
         instance to hand review to, but a distinct review model is
@@ -592,12 +1501,14 @@ class TestReviewIndependenceLadder:
         used and labeled rather than falling straight to self-review."""
         ticket = self._make_ticket()
         ticket["executor"] = "claude-a"
+        ticket["review_model_pin"] = "claude-opus-5"
         cfg = {
             "ticket_prefix": "TICK",
             "tickets_dir": "tickets",
             "executor": "claude-a",
             "executors": {"claude-a": {"type": "claude-process"}},
             "models": {"implement": "model-implement", "review": "model-review"},
+            "review_fallback": "different_model",
         }
 
         with (
@@ -614,7 +1525,7 @@ class TestReviewIndependenceLadder:
         assert result is True
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
         assert mock_cmd_review.call_args.kwargs["review_independence"] == "different-model"
-        assert mock_cmd_review.call_args.kwargs["review_model"] == "model-review"
+        assert mock_cmd_review.call_args.kwargs["review_model"] == "claude-opus-5"
 
     def test_degrades_to_self_review_and_warns_when_truly_no_alternative(self, tmp_path, capsys):
         """Rung 3 (self): single account, no pool, no distinct review model --
@@ -627,6 +1538,7 @@ class TestReviewIndependenceLadder:
             "tickets_dir": "tickets",
             "executor": "claude-a",
             "executors": {"claude-a": {"type": "claude-process"}},
+            "review_fallback": "same_model",
         }
 
         with (
@@ -646,6 +1558,20 @@ class TestReviewIndependenceLadder:
         captured = capsys.readouterr()
         assert "no independent reviewer available" in captured.err
         assert "claude-a" in captured.err
+
+    def test_needs_review_fallback_does_not_select_self(self, tmp_path):
+        from lanegate.orchestrate.review import resolve_independent_review_driver
+
+        ticket = self._make_ticket()
+        ticket["executor"] = "claude-a"
+        cfg = {
+            "ticket_prefix": "TICK", "tickets_dir": "tickets", "executor": "claude-a",
+            "executors": {"claude-a": {"type": "claude-process"}},
+            "review_fallback": "needs_review",
+        }
+        assert resolve_independent_review_driver(
+            ticket, cfg, tmp_path, implementer="claude-a"
+        ) == (None, "needs_review")
 
     def test_single_member_pool_degrades_same_as_no_pools_configured(self, tmp_path, capsys):
         """A `pools` key with exactly one executor -- the shape most real users
@@ -718,6 +1644,235 @@ class TestReviewIndependenceLadder:
         captured = capsys.readouterr()
         assert "reviewer pinned to 'claude-a'" in captured.err
         assert "same executor that implemented" in captured.err
+
+    @pytest.mark.parametrize("pinned", [False, True])
+    def test_manual_implementation_yields_undetermined_independence(self, tmp_path, capsys, pinned):
+        ticket = self._make_ticket()
+        ticket["implement_mode"] = "manual"
+        if pinned:
+            ticket["reviewer"] = "claude-b"
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-a",
+            "executors": {
+                "claude-a": {"type": "claude-process"},
+                "claude-b": {"type": "claude-process"},
+            },
+            "pools": {"default": {"executors": ["claude-a", "claude-b"]}},
+            "default_pool": "default",
+        }
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch(
+                "lanegate.orchestrate.review.build_executor_cmd",
+                side_effect=self._fake_build_executor_cmd,
+            ),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=self._fake_run),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is True
+        assert mock_cmd_review.call_args.kwargs["review_independence"] == "undetermined"
+        assert "implemented manually with no recorded implementer identity" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# TICK-517: reviewer-cooldown retry/hibernation vs. permanent needs_review
+# ---------------------------------------------------------------------------
+
+
+class TestReviewerCooldownRetry:
+    def _persisted_ticket(self, tmp_path: Path) -> dict:
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir(exist_ok=True)
+        path = _write_ticket(tickets_dir, "TICK-517", "code_complete")
+        return parse_ticket(path)
+
+    def _pool_cfg(self) -> dict:
+        return {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-a",
+            "commit_status_changes": False,
+            "executors": {
+                "claude-a": {"type": "claude-process"},
+                "claude-b": {"type": "claude-process"},
+            },
+            "pools": {"default": {"executors": ["claude-a", "claude-b"]}},
+            "default_pool": "default",
+        }
+
+    def test_reviewer_cooldown_hibernates_with_retry_metadata(self, tmp_path):
+        """All pool reviewers cooling down must hibernate with a recorded
+        reason, next-retry-time, and attempt count -- distinct from a real
+        subprocess rate limit (no dispatch is ever attempted here)."""
+        from lanegate.executor import write_cooldown
+
+        ticket = self._persisted_ticket(tmp_path)
+        ticket["executor"] = "claude-a"
+        cfg = self._pool_cfg()
+        write_cooldown(tmp_path, "claude-a", "weekly quota", retry_after=1800)
+        write_cooldown(tmp_path, "claude-b", "weekly quota", retry_after=3600)
+        earliest_until = json.loads(
+            (tmp_path / ".lanegate" / "executors" / "claude-a.cooldown").read_text()
+        )["until"]
+
+        result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is False
+        refreshed = parse_ticket(ticket["_path"])
+        assert refreshed["status"] == "hibernated"
+        assert refreshed["review_pending"] is True
+        assert "temporarily unavailable" in refreshed["review_pending_reason"]
+        # Deliberately distinct from the real rate-limit marker so
+        # resume-watch's rate-limit recovery never picks this up.
+        assert "rate limit or quota interruption" not in refreshed["review_pending_reason"]
+        assert refreshed["review_retry_attempt"] == 1
+        assert refreshed["review_retry_after"] == earliest_until
+
+    def test_earliest_reviewer_retry_compares_parsed_datetimes_not_strings(self, tmp_path):
+        """`until` timestamps can carry a non-UTC offset -- comparing the raw
+        strings picks the wrong candidate whenever the lexicographically
+        smaller offset digit corresponds to a later moment in time (TICK-517)."""
+        from lanegate.executor import write_cooldown
+        from lanegate.orchestrate.review import _earliest_reviewer_retry
+
+        # 05:00-07:00 is 12:00 UTC; 06:00+00:00 is 06:00 UTC -- the second
+        # is chronologically earlier despite starting with a larger digit.
+        # Both must be far enough in the future that read_cooldown doesn't
+        # treat them as already-expired and discard the file.
+        write_cooldown(tmp_path, "claude-a", "weekly quota", retry_after="2027-08-12T05:00:00-07:00")
+        write_cooldown(tmp_path, "claude-b", "weekly quota", retry_after="2027-08-12T06:00:00+00:00")
+        cfg = self._pool_cfg()
+        ticket = self._persisted_ticket(tmp_path)
+
+        earliest = _earliest_reviewer_retry(tmp_path, cfg, ticket, "default")
+
+        assert earliest == "2027-08-12T06:00:00+00:00"
+
+    def test_earliest_reviewer_retry_includes_implementer_outside_pool(self, tmp_path):
+        """A per-ticket `executor:` pin need not be a member of the routed
+        pool, but it is still the fallback candidate
+        resolve_independent_review_driver checks -- its cooldown must be
+        consulted too, not just the pool's own executors (TICK-517)."""
+        from lanegate.executor import write_cooldown
+        from lanegate.orchestrate.review import _earliest_reviewer_retry
+
+        cfg = self._pool_cfg()
+        ticket = self._persisted_ticket(tmp_path)
+        ticket["executor"] = "claude-c"  # not a member of the "default" pool
+        write_cooldown(tmp_path, "claude-c", "weekly quota", retry_after=1800)
+
+        earliest = _earliest_reviewer_retry(tmp_path, cfg, ticket, "default")
+
+        expected_until = json.loads(
+            (tmp_path / ".lanegate" / "executors" / "claude-c.cooldown").read_text()
+        )["until"]
+        assert earliest == expected_until
+
+    def test_earliest_reviewer_retry_defaults_when_no_until_resolves(self, tmp_path):
+        """If every candidate's cooldown state lacks a resolvable `until`,
+        returning None reads as "nothing to wait for" and makes the ticket
+        immediately re-eligible -- burning the whole retry budget in one
+        scan instead of actually waiting. Must fall back to a concrete
+        future retry time (TICK-517)."""
+        import datetime
+
+        from lanegate.executor import _cooldown_path
+        from lanegate.orchestrate.review import _earliest_reviewer_retry
+
+        cfg = self._pool_cfg()
+        ticket = self._persisted_ticket(tmp_path)
+        # A cooldown file with no "until" (e.g. a non-retryable error record).
+        path = _cooldown_path(tmp_path, "claude-a")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"until": None, "reason": "non-retryable"}))
+
+        before = datetime.datetime.now(datetime.timezone.utc)
+        earliest = _earliest_reviewer_retry(tmp_path, cfg, ticket, "default")
+
+        assert earliest is not None
+        earliest_dt = datetime.datetime.fromisoformat(earliest)
+        assert earliest_dt > before
+
+    def test_pinned_reviewer_cooldown_hibernates_with_retry_metadata(self, tmp_path):
+        """A pinned per-ticket reviewer (ticket['reviewer']) that is cooling
+        down must get the same retry-metadata treatment as the pool-resolved
+        case, not silently fall through to the old rate-limited hibernation."""
+        from lanegate.executor import write_cooldown
+
+        ticket = self._persisted_ticket(tmp_path)
+        ticket["reviewer"] = "claude-b"
+        cfg = self._pool_cfg()
+        write_cooldown(tmp_path, "claude-b", "weekly quota", retry_after=900)
+        expected_until = json.loads(
+            (tmp_path / ".lanegate" / "executors" / "claude-b.cooldown").read_text()
+        )["until"]
+
+        result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is False
+        refreshed = parse_ticket(ticket["_path"])
+        assert refreshed["status"] == "hibernated"
+        assert refreshed["review_pending"] is True
+        assert "temporarily unavailable" in refreshed["review_pending_reason"]
+        assert refreshed["review_retry_attempt"] == 1
+        assert refreshed["review_retry_after"] == expected_until
+
+    def test_reviewer_cooldown_repeated_failure_escalates_to_needs_review(self, tmp_path):
+        """Once review_retry_attempt has already exhausted the retry budget,
+        another cooldown must fail closed to needs_review via
+        _escalate_no_reviewer rather than hibernate forever."""
+        from lanegate.executor import write_cooldown
+        from lanegate.orchestrate.review import _MAX_REVIEWER_UNAVAILABLE_RETRIES
+        from lanegate.ticket import classify_needs_review_cause, write_ticket
+
+        ticket = self._persisted_ticket(tmp_path)
+        ticket["executor"] = "claude-a"
+        ticket["review_retry_attempt"] = _MAX_REVIEWER_UNAVAILABLE_RETRIES
+        write_ticket(ticket)
+        ticket = parse_ticket(ticket["_path"])
+        cfg = self._pool_cfg()
+        write_cooldown(tmp_path, "claude-a", "weekly quota", retry_after=1800)
+        write_cooldown(tmp_path, "claude-b", "weekly quota", retry_after=3600)
+
+        result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is False
+        refreshed = parse_ticket(ticket["_path"])
+        assert refreshed["status"] == "needs_review"
+        assert not refreshed.get("review_pending")
+        assert classify_needs_review_cause(refreshed) == "no_independent_reviewer"
+        assert "retry budget exhausted" in (refreshed.get("_body") or "")
+
+    def test_no_independent_reviewer_config_stays_needs_review(self, tmp_path):
+        """A permanent no-alternative-reviewer configuration (review_fallback:
+        needs_review) must escalate straight to needs_review with no retry
+        metadata recorded -- there is nothing to wait out."""
+        ticket = self._persisted_ticket(tmp_path)
+        ticket["executor"] = "claude-a"
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-a",
+            "commit_status_changes": False,
+            "executors": {"claude-a": {"type": "claude-process"}},
+            "review_fallback": "needs_review",
+        }
+
+        result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is False
+        refreshed = parse_ticket(ticket["_path"])
+        assert refreshed["status"] == "needs_review"
+        assert not refreshed.get("review_pending")
+        assert not refreshed.get("review_retry_after")
+        from lanegate.ticket import classify_needs_review_cause
+
+        assert classify_needs_review_cause(refreshed) == "no_independent_reviewer"
 
 
 # ---------------------------------------------------------------------------
@@ -870,16 +2025,23 @@ class TestCombinedModeBoardClearingLoop:
         from lanegate.ticket import parse_ticket
 
         t = parse_ticket(tickets_dir / "TICK-001.md")
-        # Must still be code_complete/changes_requested — not silently
-        # advanced past review, and not hibernated/failed either.
-        assert t["status"] == "code_complete"
+        # A bounded auto-fix failure is an explicit human gate: do not leave
+        # a code_complete lock that blocks overlapping open tickets or gets
+        # retried forever.
+        assert t["status"] == "needs_review"
         assert t["review_verdict"] == "changes_requested"
 
     def test_combined_mode_executor_no_verdict_pauses_with_error(self, tmp_path, capsys):
         """F7 fix: when the combined-mode executor runs `lanegate complete` but NOT
         `lanegate review --verdict`, the ticket ends up in code_complete with no
         verdict. The orchestrator must detect this unhandled state, pause, and
-        report an error — not silently mark as done and wedge the board."""
+        report an error — not silently mark as done and wedge the board.
+
+        TICK-508: leaving the ticket at code_complete here (rather than forcing
+        needs_review) was itself a fail-open bug — a later orphan sweep or
+        risk-scan failure could route a code_complete ticket back onto the
+        auto-merge path without ever repeating review. The ticket must land on
+        needs_review, not remain in code_complete."""
         cfg = _default_cfg(tmp_path)
         cfg["reviewer"] = cfg["executor"]
         tickets_dir = tmp_path / "tickets"
@@ -927,9 +2089,10 @@ class TestCombinedModeBoardClearingLoop:
         assert "status=code_complete" in captured.err
         assert "verdict=None" in captured.err
 
-        # Ticket must remain in code_complete, not advanced to merged
+        # Ticket must land on needs_review (not advanced to merged, and not
+        # left stranded at code_complete for an orphan sweep to pick up).
         t = parse_ticket(tickets_dir / "TICK-001.md")
-        assert t["status"] == "code_complete"
+        assert t["status"] == "needs_review"
 
     def test_combined_mode_outside_touches_pauses_if_already_in_review(
         self, tmp_path, capsys
@@ -1292,7 +2455,7 @@ class TestReviewRunDirectory:
             "ticket_prefix": "TICK",
             "tickets_dir": "tickets",
             "executor": "claude-process",
-            "models": {"review": "review-model"},
+            "models": {"review": "codex-review-model"},
             "steps": {
                 "implement": {"driver": "claude-process"},
                 "review": {"driver": "codex"},
@@ -1353,12 +2516,52 @@ class TestReviewRunDirectory:
         assert status["step"] == "review"
         assert status["mode"] == "split"
         assert status["exit_code"] == 0
-        assert status["resolved_model"] == "review-model"
+        assert status["resolved_model"] == "codex-review-model"
         assert "elapsed_seconds" in status
 
         recorded = json.loads((bundle / "verdict.json").read_text())
         assert recorded["verdict"] == verdict
-        assert recorded["model"] == "review-model"
+        assert recorded["model"] == "codex-review-model"
+
+    def test_review_records_nonzero_step_costs(self, tmp_path, monkeypatch):
+        """TICK-408: a real review dispatch must log a step_costs row with
+        nonzero tokens instead of silently skipping cost recording -- the
+        observed bug was 543 logged review dispatches with only 13 carrying
+        nonzero tokens."""
+        verdict_text = json.dumps({"verdict": "approved", "notes": "ok"})
+        codex_jsonl = "\n".join(
+            [
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": verdict_text}}
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 8000,
+                            "cached_input_tokens": 500,
+                            "output_tokens": 120,
+                            "reasoning_output_tokens": 0,
+                        },
+                    }
+                ),
+            ]
+        )
+
+        recorded = []
+        monkeypatch.setattr(
+            "lanegate.context_log.record_step_cost",
+            lambda *args, **kwargs: recorded.append(args[-1]),
+        )
+        approved, _ = self._run(tmp_path, monkeypatch, codex_jsonl)
+
+        assert approved is True
+        assert len(recorded) == 1
+        parsed = recorded[0]
+        assert parsed["input_tokens"] == 8000 - 500
+        assert parsed["output_tokens"] == 120
+        assert parsed["cost_usd"] is not None
+        assert parsed["cost_usd"] > 0
 
     def test_review_records_split_mode_when_reviewer_differs_from_implementer(
         self, tmp_path, monkeypatch
@@ -1437,6 +2640,12 @@ class TestReviewRunDirectory:
         rejection eligible for auto-fix or merge."""
         cfg = _default_cfg(tmp_path)
         ticket_path = _write_ticket(tmp_path / "tickets", "TICK-343", "code_complete")
+        ticket_path.write_text(
+            ticket_path.read_text().replace(
+                "status: code_complete\n",
+                "status: code_complete\nreview_verdict: changes_requested\nreview_summary: Prior rejection summary\n",
+            )
+        )
         ticket = parse_ticket(ticket_path)
         worktree = tmp_path / "wt"
         worktree.mkdir()
@@ -1454,7 +2663,8 @@ class TestReviewRunDirectory:
 
         refreshed = parse_ticket(ticket_path)
         assert refreshed["status"] == "needs_review"
-        assert refreshed.get("review_verdict") != "changes_requested"
+        assert "review_verdict" not in refreshed
+        assert "review_summary" not in refreshed
         assert "Reviewer harness error" in refreshed["_body"]
         mock_cmd_review.assert_not_called()
 
@@ -1504,6 +2714,7 @@ class TestReviewRunDirectory:
         )
         cfg = self._cfg()
         cfg["executor"] = "codex"
+        cfg["models"] = {"review": "claude-review-model"}
         cfg["steps"] = {
             "implement": {"driver": "codex"},
             "review": {"driver": "claude-process"},
@@ -1762,3 +2973,172 @@ class TestErroredRunCannotApprove:
 
         assert result is True
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+
+class TestInvokeCmdReviewSystemExitHandling:
+    """_invoke_cmd_review absorbs the SystemExit cmd_review raises on a normal
+    changes_requested verdict, but must not absorb the same SystemExit when
+    it instead means cmd_review's own code_complete status guard rejected
+    the call outright -- that case never wrote a verdict, and silently
+    passing made a lost review indistinguishable from a real rejection
+    (found live: TICK-392/393/395/396/398/400 all lost their reviewer
+    findings this way in the same run)."""
+
+    def test_changes_requested_system_exit_is_absorbed(self, tmp_path):
+        from lanegate.orchestrate.review import _invoke_cmd_review
+
+        def fake_cmd_review(*args, **kwargs):
+            raise SystemExit(1)
+
+        _invoke_cmd_review(fake_cmd_review, "TICK-001", {}, tmp_path, verdict="changes_requested")
+
+    def test_unexpected_system_exit_for_non_changes_requested_verdict_raises(self, tmp_path):
+        """Simulates cmd_review's code_complete guard firing: it always exits
+        via sys.exit(1) same as a real changes_requested verdict, but the
+        caller here asked for a different verdict (e.g. approved), so this
+        exit cannot be the expected one -- it must surface, not vanish."""
+        from lanegate.orchestrate.review import _invoke_cmd_review
+
+        def fake_cmd_review(*args, **kwargs):
+            raise SystemExit(1)
+
+        with pytest.raises(RuntimeError, match="approved"):
+            _invoke_cmd_review(fake_cmd_review, "TICK-001", {}, tmp_path, verdict="approved")
+
+    def test_unexpected_system_exit_with_no_verdict_kwarg_raises(self, tmp_path):
+        from lanegate.orchestrate.review import _invoke_cmd_review
+
+        def fake_cmd_review(*args, **kwargs):
+            raise SystemExit(1)
+
+        with pytest.raises(RuntimeError):
+            _invoke_cmd_review(fake_cmd_review, "TICK-001", {}, tmp_path, review_driver="human")
+
+    def test_suppresses_direct_action_tracking_for_wrapped_review_command(self, tmp_path):
+        """TICK-510: cmd_review is decorated with lifecycle._track_direct_action,
+        which fabricates a standalone action-*.events.jsonl entry unless
+        direct-action tracking is suppressed. Every loop/review-agent verdict
+        write reaches cmd_review through this helper, so the suppression must
+        live here rather than at each of that helper's many call sites."""
+        from lanegate.lifecycle import _track_direct_action
+        from lanegate.orchestrate.review import _invoke_cmd_review
+
+        def fake_cmd_review(*args, **kwargs):
+            raise SystemExit(1)
+
+        tracked_fake_review = _track_direct_action("review")(fake_cmd_review)
+
+        _invoke_cmd_review(
+            tracked_fake_review, "TICK-001", {}, tmp_path, verdict="changes_requested"
+        )
+
+        logs_dir = tmp_path / ".lanegate" / "logs"
+        assert not logs_dir.exists() or list(logs_dir.glob("action-*.events.jsonl")) == []
+
+    def test_type_error_fallback_still_absorbs_changes_requested_exit(self, tmp_path):
+        """Old-signature test mocks (no review_driver/model/independence
+        kwargs) fall back to a clean call; that path's own SystemExit
+        absorption must keep the same verdict-aware behavior."""
+        from lanegate.orchestrate.review import _invoke_cmd_review
+
+        calls = []
+
+        def fake_cmd_review(tid, cfg, repo_root, *, verdict=None, **kwargs):
+            calls.append(kwargs)
+            if kwargs:
+                raise TypeError("old signature does not accept review_driver")
+            raise SystemExit(1)
+
+        _invoke_cmd_review(
+            fake_cmd_review, "TICK-001", {}, tmp_path,
+            verdict="changes_requested", review_driver="agy",
+        )
+        # First call carries the unsupported kwarg and raises TypeError;
+        # the retry strips it and succeeds (raising the expected SystemExit).
+        assert calls == [{"review_driver": "agy"}, {}]
+
+    def test_type_error_retry_stays_suppressed_and_records_no_action(self, tmp_path):
+        """TICK-510: the TypeError compatibility retry is a second nested call
+        into the same decorated cmd_review -- it must stay inside the same
+        suppression as the primary call, not just the first attempt."""
+        from lanegate.lifecycle import _track_direct_action
+        from lanegate.orchestrate.review import _invoke_cmd_review
+        from lanegate.orchestrate.run_report import direct_action_tracking_suppressed
+
+        calls = []
+
+        def fake_cmd_review(tid, cfg, repo_root, *, verdict=None, **kwargs):
+            assert direct_action_tracking_suppressed()
+            calls.append(kwargs)
+            if kwargs:
+                raise TypeError("old signature does not accept review_driver")
+            raise SystemExit(1)
+
+        tracked_fake_review = _track_direct_action("review")(fake_cmd_review)
+
+        _invoke_cmd_review(
+            tracked_fake_review, "TICK-001", {}, tmp_path,
+            verdict="changes_requested", review_driver="agy",
+        )
+        assert calls == [{"review_driver": "agy"}, {}]
+
+        logs_dir = tmp_path / ".lanegate" / "logs"
+        assert not logs_dir.exists() or list(logs_dir.glob("action-*.events.jsonl")) == []
+
+
+def test_control_plane_file_requires_independent_review(tmp_path):
+    """Control-plane files (lanegate/review.py, lanegate/analyze.py, lanegate/safeguards.py) require independent model review."""
+    from lanegate.orchestrate.review import resolve_independent_review_driver
+
+    ticket_cp = {
+        "id": "TICK-610",
+        "touches": ["lanegate/orchestrate/review.py"],
+        "executor": "codex",
+    }
+    cfg_same_fallback = {
+        "executor": "codex",
+        "review_fallback": "same_model",
+        "control_plane_files": ["lanegate/orchestrate/review.py"],
+    }
+
+    # Same model fallback is rejected for control-plane files
+    driver, ind = resolve_independent_review_driver(
+        ticket_cp, cfg_same_fallback, tmp_path, implementer="codex"
+    )
+    assert driver is None
+    assert ind == "needs_review"
+
+    # Non-control-plane file permits same_model fallback if configured
+    ticket_reg = {
+        "id": "TICK-610",
+        "touches": ["src/app.py"],
+        "executor": "codex",
+    }
+    driver_reg, ind_reg = resolve_independent_review_driver(
+        ticket_reg, cfg_same_fallback, tmp_path, implementer="codex"
+    )
+    assert driver_reg == "codex"
+    assert ind_reg == "self"
+
+
+def test_control_plane_file_escalates_when_review_independence_undetermined(tmp_path):
+    """Control-plane files escalate to needs_review when review independence is undetermined (e.g. manual implementer)."""
+    from unittest.mock import MagicMock, patch
+    from lanegate.orchestrate.review import run_review_agent
+
+    ticket_manual = {
+        "id": "TICK-610",
+        "touches": ["lanegate/orchestrate/review.py"],
+        "implement_mode": "manual",
+    }
+    cfg = {
+        "control_plane_files": ["lanegate/orchestrate/review.py"],
+    }
+    with patch("lanegate.orchestrate.review._escalate_no_reviewer") as mock_esc, \
+         patch("lanegate.orchestrate.resolve_pool_executor", return_value="codex"):
+        mock_esc.return_value = {"status": "needs_review"}
+        res = run_review_agent(ticket_manual, tmp_path, cfg=cfg)
+        assert mock_esc.called
+        assert "cannot be determined" in mock_esc.call_args.kwargs.get("reason", "")
+
+

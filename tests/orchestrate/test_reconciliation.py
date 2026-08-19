@@ -192,32 +192,12 @@ class TestStaleExecutorReconciliation:
 # ---------------------------------------------------------------------------
 
 
-def test_collect_prior_notes(tmp_path):
+def test_collect_prior_notes_no_recovery_returns_empty(tmp_path):
+    """No .lanegate/recovery/<tid>.md and a non-hibernated/needs_review status
+    means _collect_prior_notes has nothing to surface (TICK-481: the old
+    per-file .lanegate/notes/ branch was dead -- write and read sides never
+    agreed on a directory -- and has been removed)."""
     from lanegate.orchestrate import _collect_prior_notes
-
-    notes_dir = tmp_path / ".lanegate" / "notes"
-    notes_dir.mkdir(parents=True)
-
-    (notes_dir / "lanegate_analyze.py.md").write_text("## Curated Note\n\nThis is a curated note for analyze.")
-
-    ticket = {
-        "id": "TICK-001",
-        "status": "open",
-        "touches": ["lanegate/analyze.py", "lanegate/lifecycle.py"],
-    }
-
-    result = _collect_prior_notes(ticket, tmp_path)
-
-    assert "Prior Agent Notes" in result
-    assert "Curated Note" in result
-    assert "curated note for analyze" in result
-
-
-def test_collect_prior_notes_skips_missing_note_files(tmp_path):
-    from lanegate.orchestrate import _collect_prior_notes
-
-    notes_dir = tmp_path / ".lanegate" / "notes"
-    notes_dir.mkdir(parents=True)
 
     ticket = {
         "id": "TICK-002",
@@ -228,6 +208,43 @@ def test_collect_prior_notes_skips_missing_note_files(tmp_path):
     result = _collect_prior_notes(ticket, tmp_path)
 
     assert result == ""
+
+
+def test_collect_prior_notes_ignores_shared_notes(tmp_path):
+    """Shared notes are injected boundedly via get_bounded_shared_notes in analyze/executor,
+    so _collect_prior_notes ignores .lanegate/notes/ to prevent duplicate unbudgeted injection."""
+    from lanegate.orchestrate import _collect_prior_notes
+
+    notes_dir = tmp_path / ".lanegate" / "notes"
+    notes_dir.mkdir(parents=True)
+    (notes_dir / "global.md").write_text("global note")
+    (notes_dir / "lanegate_worktree.py.md").write_text("file note")
+    ticket = {"id": "TICK-002", "status": "open", "touches": ["lanegate/worktree.py"]}
+
+    result = _collect_prior_notes(ticket, tmp_path)
+
+    assert result == ""
+
+
+def test_durable_notes_are_shared_by_control_and_stage_worktrees(tmp_path):
+    """Implementation, review, and fix paths all resolve to the canonical notes store."""
+    control_notes = tmp_path / ".lanegate" / "notes"
+    control_notes.mkdir(parents=True)
+    worktree_notes = {}
+    for stage in ("implementation", "review", "fix"):
+        notes_path = tmp_path / "worktrees" / stage / ".lanegate" / "notes"
+        notes_path.parent.mkdir(parents=True)
+        notes_path.symlink_to(control_notes, target_is_directory=True)
+        worktree_notes[stage] = notes_path
+
+    (worktree_notes["implementation"] / "src_widget.py.md").write_text("Keep writes atomic.\n")
+    (worktree_notes["review"] / "global.md").write_text("Use the canonical notes store.\n")
+    (worktree_notes["fix"] / "src_widget.py.md").write_text("Keep writes atomic; retain retries.\n")
+
+    assert (control_notes / "src_widget.py.md").read_text() == "Keep writes atomic; retain retries.\n"
+    assert (worktree_notes["review"] / "src_widget.py.md").read_text() == "Keep writes atomic; retain retries.\n"
+    assert (control_notes / "global.md").read_text() == "Use the canonical notes store.\n"
+    assert (worktree_notes["fix"] / "global.md").read_text() == "Use the canonical notes store.\n"
 
 
 def test_collect_prior_notes_includes_recovery_for_hibernated(tmp_path):
@@ -343,7 +360,7 @@ def test_find_latest_audit_bundle_locates_most_recent_session(tmp_path):
     assert latest.name in ("TICK-123-1000-1001-implement", "TICK-123-2000-1002-implement", "TICK-123-3000-1003-implement")
 
 
-def test_normalize_active_status_reads_per_session_files(tmp_path):
+def test_normalize_active_status_reads_per_session_files(tmp_path, monkeypatch):
     """Verify --status command aggregates all active executor statuses.
 
     With concurrent executors, we need to read from per-session files instead of
@@ -366,6 +383,7 @@ def test_normalize_active_status_reads_per_session_files(tmp_path):
         "started_at": 1234567890,
     }
     _write_active_status(tmp_path, status, session_id=session_id)
+    monkeypatch.setattr("lanegate.pidutil.pid_alive", lambda pid: pid == 1001)
 
     # Normalize should read from per-session file
     normalized = _normalize_active_status(tmp_path)
@@ -373,6 +391,107 @@ def test_normalize_active_status_reads_per_session_files(tmp_path):
     assert normalized.get("active") is True
     assert normalized.get("ticket_id") == "TICK-100"
     assert normalized.get("executor_pid") == 1001
+
+
+def test_normalize_active_status_stays_live_between_dispatches(tmp_path, monkeypatch):
+    from lanegate.orchestrate import _normalize_active_status, _write_active_status
+
+    _write_active_status(
+        tmp_path,
+        {
+            "ticket_id": "TICK-101",
+            "executor_session": "TICK-101-finished",
+            "executor_pid": 1002,
+            "state": "finished",
+            "started_at": 1234567890,
+            "log_path": ".lanegate/logs/orchestrate-test-run.log",
+        },
+        session_id="TICK-101-finished",
+    )
+    monkeypatch.setattr(
+        "lanegate.orchestrate.status.orchestrator_lock_status",
+        lambda repo_root: {"held": True, "pid": 4242, "alive": True},
+    )
+    monkeypatch.setattr(
+        "lanegate.orchestrate.status._current_run_session_ts",
+        lambda repo_root: "test-run",
+    )
+
+    normalized = _normalize_active_status(tmp_path)
+
+    assert normalized["active"] is True
+    assert normalized["state"] == "between-dispatches"
+    assert normalized["orchestrator_lock_state"] == "live"
+    assert normalized["ticket_id"] == "TICK-101"
+
+
+def test_normalize_active_status_aggregates_live_parallel_sessions(tmp_path, monkeypatch):
+    from lanegate.orchestrate import _active_status_path, _normalize_active_status, _write_active_status
+
+    running_session = "TICK-102-running"
+    finished_session = "TICK-103-finished"
+    _write_active_status(
+        tmp_path,
+        {
+            "ticket_id": "TICK-102",
+            "executor_session": running_session,
+            "executor_pid": 1003,
+            "state": "running",
+            "started_at": 1234567890,
+        },
+        session_id=running_session,
+    )
+    _write_active_status(
+        tmp_path,
+        {
+            "ticket_id": "TICK-103",
+            "executor_session": finished_session,
+            "executor_pid": 1004,
+            "state": "finished",
+            "started_at": 1234567890,
+        },
+        session_id=finished_session,
+    )
+    finished_path = _active_status_path(tmp_path, session_id=finished_session)
+    finished = json.loads(finished_path.read_text())
+    finished["updated_at"] = "9999-12-31T23:59:59Z"
+    finished_path.write_text(json.dumps(finished))
+    monkeypatch.setattr("lanegate.pidutil.pid_alive", lambda pid: pid == 1003)
+    monkeypatch.setattr(
+        "lanegate.orchestrate.status.orchestrator_lock_status",
+        lambda repo_root: {"held": False, "pid": None, "alive": False},
+    )
+
+    normalized = _normalize_active_status(tmp_path)
+
+    assert normalized["active"] is True
+    assert normalized["state"] == "running"
+    assert normalized["ticket_id"] == "TICK-102"
+
+
+def test_normalize_active_status_stale_lock_is_idle(tmp_path, monkeypatch):
+    from lanegate.orchestrate import _normalize_active_status, _write_active_status
+
+    _write_active_status(
+        tmp_path,
+        {
+            "ticket_id": "TICK-104",
+            "executor_session": "TICK-104-finished",
+            "executor_pid": 1005,
+            "state": "finished",
+            "started_at": 1234567890,
+        },
+        session_id="TICK-104-finished",
+    )
+    monkeypatch.setattr(
+        "lanegate.orchestrate.status.orchestrator_lock_status",
+        lambda repo_root: {"held": False, "pid": 4243, "alive": False},
+    )
+
+    normalized = _normalize_active_status(tmp_path)
+
+    assert normalized["active"] is False
+    assert normalized["orchestrator_lock_state"] == "stale"
 
 
 def test_stream_subprocess_timeout_kills_process(tmp_path):
@@ -386,6 +505,27 @@ def test_stream_subprocess_timeout_kills_process(tmp_path):
         [sys.executable, "-c", "import time; time.sleep(10)"],
         str(tmp_path),
         timeout=0.2,
+    )
+    elapsed = time.time() - start
+
+    assert rc == 124
+    assert kill_reason is None
+    assert "timed out after 0.2s" in err
+    assert elapsed < 3.0, f"Process should be killed promptly, took {elapsed:.2f}s"
+
+
+def test_stream_subprocess_timeout_still_applies_with_budget_probe(tmp_path):
+    """A polling budget probe must not bypass the ordinary process timeout."""
+    import sys
+    import time
+    from lanegate.orchestrate import _stream_subprocess
+
+    start = time.time()
+    rc, _out, err, kill_reason = _stream_subprocess(
+        [sys.executable, "-c", "import time; time.sleep(10)"],
+        str(tmp_path),
+        timeout=0.2,
+        budget_probe=lambda: None,
     )
     elapsed = time.time() - start
 
@@ -885,7 +1025,7 @@ class TestDispatchedTicketWithoutTerminalOutcome:
         assert row["final_outcome"] == "interrupted"
         assert row["final_outcome"] != "skipped"
         assert "lanegate ps" in row["final_reason"]
-        assert "lanegate orchestrate --tickets TICK-501" in row["final_reason"]
+        assert "lanegate run --tickets TICK-501" in row["final_reason"]
         assert row["duration_seconds"] is not None
         assert row["duration_seconds"] >= 0
 
@@ -1009,11 +1149,24 @@ class TestLiveLaneGateProcesses:
         state = tmp_path / ".lanegate"
         state.mkdir(parents=True, exist_ok=True)
         (state / "TICK-001.pid").write_text(f"{os.getpid()}\n")
+        (state / "TICK-001.orchestrated").touch()
         # No orchestrator.lock file at all -> orchestrator_lock_status().alive is False
 
         procs = _collect_live_lanegate_processes(cfg, tmp_path)
         ticket_proc = next(p for p in procs if p["kind"] == "ticket-executor")
         assert ticket_proc["orphaned"] is True
+
+    def test_standalone_process_not_marked_orphaned_without_orchestrator_lock(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        _write_ticket(tmp_path / "tickets", "TICK-001", "in_progress", touches=["a.py"])
+        state = tmp_path / ".lanegate"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "TICK-001.pid").write_text(f"{os.getpid()}\n")
+        # Direct single-ticket dispatch: no .orchestrated marker and no orchestrator.lock
+
+        procs = _collect_live_lanegate_processes(cfg, tmp_path)
+        ticket_proc = next(p for p in procs if p["kind"] == "ticket-executor")
+        assert ticket_proc["orphaned"] is False
 
     def test_dead_marker_pid_is_not_reported_as_orphaned(self, tmp_path):
         cfg = _default_cfg(tmp_path)
@@ -1120,6 +1273,7 @@ class TestReapOrphanedExecutorProcesses:
         child = subprocess.Popen(["sleep", "30"])
         (state / "TICK-281.pid").write_text(f"{child.pid}\n")
         (state / "TICK-281.session").write_text("123456.0\n")
+        (state / "TICK-281.orchestrated").touch()
         # No orchestrator.lock file at all -> orchestrator_lock_status().alive
         # is False, i.e. the driver that dispatched this child is dead.
 
@@ -1152,12 +1306,37 @@ class TestReapOrphanedExecutorProcesses:
 
         assert not (state / "TICK-281.pid").exists()
         assert not (state / "TICK-281.session").exists()
+        assert not (state / "TICK-281.orchestrated").exists()
 
         events = _load_run_events(tmp_path, "2026-07-29T00-00-00")
         reaped_events = [e for e in events if e["event"] == "orphan_reaped"]
         assert len(reaped_events) == 1
         assert reaped_events[0]["ticket_id"] == "TICK-281"
         assert reaped_events[0]["pid"] == child.pid
+
+    def test_standalone_process_not_reaped_without_orchestrator_lock(self, tmp_path):
+        """A standalone single-ticket process running without an orchestrator lock
+        (no .orchestrated marker) is not marked as orphaned and not reaped."""
+        cfg = _default_cfg(tmp_path)
+        _write_ticket(tmp_path / "tickets", "TICK-283", "in_progress", touches=["a.py"])
+        state = tmp_path / ".lanegate"
+        state.mkdir(parents=True, exist_ok=True)
+
+        child = subprocess.Popen(["sleep", "30"])
+        (state / "TICK-283.pid").write_text(f"{child.pid}\n")
+        (state / "TICK-283.session").write_text("123456.0\n")
+
+        try:
+            reaped = _reap_orphaned_executor_processes(cfg, tmp_path)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+        assert reaped == []
+        updated = parse_ticket(tmp_path / "tickets" / "TICK-283.md")
+        assert updated["status"] == "in_progress"
+        assert (state / "TICK-283.pid").exists()
 
     def test_leaves_supervised_ticket_untouched(self, tmp_path):
         """A ticket-executor covered by a live orchestrator lock is not

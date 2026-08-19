@@ -21,6 +21,7 @@ BOUNDED_MCP_TOOLS = [
     "recent_logs",
     "continuation_context",
     "start",
+    "run",
     "orchestrate",
     "complete",
     "review",
@@ -74,7 +75,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def install_mcp_configs(project_root: Path) -> list[dict[str, Any]]:
     """Write Codex and generic MCP config snippets for agent-native LaneGate tools."""
     snippet = mcp_config_snippet()
-    artifacts = [
+    artifacts: list[dict[str, Any]] = [
         {
             "agent": "codex",
             "kind": "mcp_config",

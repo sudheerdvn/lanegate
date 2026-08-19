@@ -344,7 +344,7 @@ func (c *HTTPClient) GetRunLogs(ctx context.Context, runID string, offset, limit
 	return &payload, nil
 }
 
-// GetRunEvents fetches TICK-307 safe structured executor-progress events for
+// GetRunEvents fetches safe structured executor-progress events for
 // runID from GET /api/runs/{id}/events.
 func (c *HTTPClient) GetRunEvents(ctx context.Context, runID string) (*RunEventsPayload, error) {
 	if runID == "" {

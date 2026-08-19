@@ -87,3 +87,12 @@ def real_lanegate_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RealL
     _git(repo, "commit", "-m", "initial repo")
 
     return RealLaneGateRepo(root=repo, cfg=load_config(repo))
+
+
+@pytest.fixture(autouse=True)
+def isolate_context_log_db(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    db_dir = tmp_path_factory.mktemp("context_log_db")
+    db_path = db_dir / "test_analytics.db"
+    monkeypatch.setenv("LANEGATE_CONTEXT_LOG_DB", str(db_path))
+    return db_path
+

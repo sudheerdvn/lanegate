@@ -1,6 +1,6 @@
 """
 resume_watch.py — session-independent background daemon that waits out a rate
-limit and resumes `lanegate orchestrate` automatically.
+limit and resumes `lanegate run` automatically.
 
 Spawned by orchestrate.py's spawn_resume_watch_daemon() when a run halts on a
 rate limit and on_rate_limit=resume. Mirrors watch.py's detached-daemon
@@ -18,17 +18,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from lanegate import APP_NAME
 from lanegate.config import _DEFAULT_RESUME_CEILING_S
+from lanegate.executor import _parse_reset_time as _parse_executor_reset_time
 from lanegate.notify import send_ntfy
 
 # These four decide whether a hibernation is *waitable* (a rate limit that will
@@ -44,105 +43,28 @@ from lanegate.orchestrate.loop import (
     _active_rate_limit_hibernation as _active_rate_limit_hibernation,
     _has_non_rate_limit_hard_error as _has_non_rate_limit_hard_error,
 )
-from lanegate.pidutil import pid_alive
 from lanegate.ticket import load_all_tickets
+from lanegate.pidutil import terminate_pid
+from lanegate.watch_common import read_pid as _read_pid, write_log as _write_log
+from lanegate.concurrency import orchestrator_lock_status
 
-
-# ---------------------------------------------------------------------------
-# Reset-time parsing (TICK-257)
-# ---------------------------------------------------------------------------
-#
-# Confirmed against a real captured-output.txt (TICK-157 executor-run
-# artifact, persisted by TICK-256's audit-bundle change): the `claude` CLI
-# emits "You've hit your session limit · resets 11:40am (America/Los_Angeles)"
-# — a bare clock time with an IANA zone name in parens, not UTC and not the
-# machine's local zone. These patterns cover that confirmed shape plus the
-# other needle family in orchestrate._is_rate_limit ("try again at ..."), and
-# an absolute ISO-8601 timestamp in case a future/other executor emits one.
-# Anything that doesn't match falls through to None, which callers treat as
-# "use the exponential-backoff fallback" — an unrecognized format must never
-# raise.
-_RESET_CONTEXT_RE = re.compile(
-    r"(?:try again at|resets(?:\s+at)?)\s*[:\-]?\s*(.{0,60})", re.IGNORECASE
-)
-_RESET_ISO_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
-)
-_RESET_CLOCK_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\b", re.IGNORECASE)
-# IANA zone name in parens, as seen in the real capture above. Unknown/absent
-# -> the clock time is treated as already being in `now`'s zone (UTC).
-_RESET_TZ_RE = re.compile(r"\(([A-Za-z_]+(?:/[A-Za-z_]+){1,2})\)")
 
 # Default buffer added on top of a parsed reset time, so the retry doesn't
 # race the clock if the parsed instant is slightly off. Overridable via
 # rate_limit_resume.reset_buffer_s in .lanegate.yml.
 _DEFAULT_RESET_BUFFER_S = 90.0
 
+# Short fixed poll interval used only while the orchestrator lock is held by
+# a live process, so a lock conflict never burns backoff/give-up budget.
+# Overridable via rate_limit_resume.lock_poll_interval_s in .lanegate.yml.
+_DEFAULT_LOCK_POLL_INTERVAL_S = 30.0
+
 
 def _parse_reset_time(
     text: str, now: datetime | None = None, *, allow_rollover: bool = True
 ) -> datetime | None:
-    """Best-effort parse of a rate-limit reset time out of raw executor text.
-
-    Returns an aware UTC datetime, or None if no recognizable reset-time hint
-    is present — the caller falls back to exponential backoff in that case.
-
-    *allow_rollover* controls what a bare clock time already in the past means.
-    For a freshly emitted hint it means tomorrow ("resets 11:40am" printed at
-    3pm), which is the default. For a hint re-read out of a ticket body on a
-    later loop iteration it means the opposite — the window has already
-    cleared, retry now — so `_run_loop` passes False after the first wait.
-    """
-    if not text:
-        return None
-    if now is None:
-        now = datetime.now(UTC)
-
-    context_match = _RESET_CONTEXT_RE.search(text)
-    if not context_match:
-        return None
-    snippet = context_match.group(1)
-
-    iso_match = _RESET_ISO_RE.search(snippet)
-    if iso_match:
-        raw = iso_match.group(1).replace(" ", "T")
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            parsed = None
-        if parsed is not None:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=UTC)
-            return parsed
-
-    clock_match = _RESET_CLOCK_RE.search(snippet)
-    if clock_match:
-        hour = int(clock_match.group(1))
-        minute = int(clock_match.group(2) or 0)
-        if not (1 <= hour <= 12 and 0 <= minute <= 59):
-            return None
-        if hour == 12:
-            hour = 0
-        if clock_match.group(3).lower() == "p":
-            hour += 12
-
-        tz = UTC
-        tz_match = _RESET_TZ_RE.search(snippet)
-        if tz_match:
-            try:
-                tz = ZoneInfo(tz_match.group(1))
-            except ZoneInfoNotFoundError:
-                tz = UTC
-
-        now_in_tz = now.astimezone(tz)
-        candidate = now_in_tz.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate <= now_in_tz and allow_rollover:
-            candidate += timedelta(days=1)
-        return candidate.astimezone(UTC)
-
-    return None
+    """Delegate reset parsing to the shared executor implementation."""
+    return _parse_executor_reset_time(text, now=now, allow_rollover=allow_rollover)
 
 
 def _reset_wait_seconds(
@@ -202,12 +124,6 @@ def _resume_watch_history_file(repo_root: Path) -> Path:
     state_dir = repo_root / f".{APP_NAME}"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir / "resume-watch-history.jsonl"
-
-
-def _write_log(log_path: Path, line: str) -> None:
-    """Append one already-terminated line to the resume-watch log."""
-    with open(log_path, "a") as f:
-        f.write(line)
 
 
 def _append_history(repo_root: Path, event: str, **fields) -> None:
@@ -313,22 +229,6 @@ def read_history_since(repo_root: Path, since_iso: str) -> list[dict]:
     return [e for e in entries if str(e.get("ts", "")) >= since_iso]
 
 
-def _read_pid(pid_path: Path) -> int | None:
-    """
-    Return the PID from the pid file, or None if missing, unreadable, or stale
-    (i.e. the process is no longer running).
-    """
-    try:
-        raw = pid_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        pid = int(raw)
-    except (ValueError, TypeError):
-        return None
-    if pid_alive(pid):
-        return pid
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +250,7 @@ def _hibernated_for_rate_limit(cfg: dict, repo_root: Path) -> list[dict]:
         t
         for t in tickets
         if t.get("status") == "hibernated"
-        and _active_rate_limit_hibernation(t.get("_body") or "")
+        and _active_rate_limit_hibernation(t)
     ]
 
 
@@ -440,6 +340,12 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     """
     Internal polling loop. Called by cmd_resume_watch when running as a daemon.
     Logs to .lanegate/resume-watch.log.
+
+    Shares its name with watch._run_loop and notify_watch._run_loop
+    (TICK-366 duplicate-drift sweep). Each daemon polls a different
+    condition with a different body — this one waits out a rate limit with
+    backoff — so the shared name is intentional and no consolidation is
+    needed.
     """
     log_path = _resume_watch_log_file(repo_root)
 
@@ -464,6 +370,9 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     # .lanegate.yml shallowly, so a user setting only `initial_backoff_s:` would
     # otherwise drop `ceiling_s` and silently get poll-forever back.
     ceiling = resume_cfg.get("ceiling_s", _DEFAULT_RESUME_CEILING_S)
+    lock_poll_interval = float(
+        resume_cfg.get("lock_poll_interval_s", _DEFAULT_LOCK_POLL_INTERVAL_S)
+    )
     elapsed = 0.0
 
     hibernated = _hibernated_for_rate_limit(cfg, repo_root)
@@ -479,14 +388,24 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     current = hibernated
     first_pass = True
     while True:
+        lock_status = orchestrator_lock_status(repo_root)
+        if lock_status["held"]:
+            log(
+                f"[resume-watch] orchestrator lock held by PID {lock_status['pid']} — "
+                f"polling again in {lock_poll_interval:.0f}s without advancing "
+                "elapsed/backoff/ceiling"
+            )
+            time.sleep(lock_poll_interval)
+            continue
+
         if ceiling is not None and elapsed >= ceiling:
             log(
                 f"[resume-watch] gave up after {elapsed:.0f}s (ceiling_s={ceiling:.0f}) — "
-                "manual resume needed: lanegate orchestrate"
+                "manual resume needed: lanegate run"
             )
             push(
                 f"gave up auto-resuming {', '.join(ids)} after {elapsed:.0f}s — "
-                "manual resume needed: lanegate orchestrate"
+                "manual resume needed: lanegate run"
             )
             _append_history(repo_root, "gave_up", ticket_ids=ids, elapsed_s=elapsed)
             break
@@ -517,20 +436,26 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
         orchestrate_args, dropped_args = _read_orchestrate_args(repo_root)
         if dropped_args:
             log(f"[resume-watch] ignored unrecognized stored args: {', '.join(dropped_args)}")
-        cmd = [APP_NAME, "orchestrate"] + orchestrate_args
+        cmd = [APP_NAME, "run"] + orchestrate_args
         log(f"[resume-watch] retrying: {' '.join(cmd)}")
         _append_history(repo_root, "retrying", ticket_ids=ids, elapsed_s=elapsed, backoff_s=backoff)
+        retry_env = {
+            **os.environ,
+            "LANEGATE_RUN_TRIGGER": "resume-watch",
+            "LANEGATE_RUN_TRIGGER_REASON": f"rate limit on {', '.join(ids)}",
+        }
         try:
             result = subprocess.run(
                 cmd,
                 cwd=repo_root,
                 capture_output=True,
                 text=True, encoding="utf-8",
+                env=retry_env,
             )
             tail = "\n".join((result.stdout + result.stderr).splitlines()[-20:])
             log(f"[resume-watch] orchestrate exited {result.returncode}\n{tail}")
         except OSError as exc:
-            log(f"[resume-watch] failed to invoke lanegate orchestrate: {exc}")
+            log(f"[resume-watch] failed to invoke lanegate run: {exc}")
 
         still_limited = _hibernated_for_rate_limit(cfg, repo_root)
         if not still_limited:
@@ -559,16 +484,34 @@ def cmd_resume_watch(
     status: bool = False,
     stop: bool = False,
     history: bool = False,
+    background: bool = False,
 ) -> None:
     """
     Main entry point for `lanegate resume-watch`.
 
-      lanegate resume-watch            — run the poll loop
-      lanegate resume-watch --status   — report running state
-      lanegate resume-watch --stop     — kill the running watcher
-      lanegate resume-watch --history  — print recent resume attempts and outcomes
+      lanegate resume-watch              — run the poll loop
+      lanegate resume-watch --background — spawn the poll loop detached, survives
+                                            this terminal closing, then exit
+      lanegate resume-watch --status     — report running state
+      lanegate resume-watch --stop       — kill the running watcher
+      lanegate resume-watch --history    — print recent resume attempts and outcomes
     """
     pid_path = _resume_watch_pid_file(repo_root)
+
+    if background and not (status or stop or history):
+        from lanegate.lifecycle import spawn_detached
+
+        existing_pid = _read_pid(pid_path)
+        if existing_pid is not None:
+            print(
+                f"[resume-watch] already running (PID {existing_pid}). Use --stop to kill it first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        log_path = _resume_watch_log_file(repo_root)
+        spawned_pid = spawn_detached([APP_NAME, "resume-watch"], log_path)
+        print(f"[resume-watch] spawned detached (PID {spawned_pid}), survives this terminal closing")
+        return
 
     # ── --history ─────────────────────────────────────────────────────────────
     if history:
@@ -606,12 +549,10 @@ def cmd_resume_watch(
             if pid_path.exists():
                 pid_path.unlink(missing_ok=True)
             return
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError) as exc:
-            print(f"[resume-watch] could not kill PID {pid}: {exc}", file=sys.stderr)
+        if not terminate_pid(pid):
+            print(f"[resume-watch] could not terminate PID {pid}: process not found or inaccessible", file=sys.stderr)
         else:
-            print(f"[resume-watch] sent SIGTERM to PID {pid}")
+            print(f"[resume-watch] terminated PID {pid}")
             pid_path.unlink(missing_ok=True)
         return
 

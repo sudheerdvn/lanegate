@@ -13,11 +13,16 @@ Public API:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import statistics
 import subprocess
+import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 
 def _utcnow() -> str:
@@ -31,6 +36,9 @@ from lanegate import APP_NAME
 
 
 def _get_default_db_path() -> Path:
+    override = os.environ.get("LANEGATE_CONTEXT_LOG_DB") or os.environ.get("LANEGATE_ANALYTICS_DB")
+    if override:
+        return Path(override)
     return Path.home() / ".local" / "share" / APP_NAME / "analytics.db"
 
 
@@ -114,7 +122,7 @@ def _init_db(db_path: Path) -> None:
             session_id            TEXT
         )
     """)
-    # session_id is newer than the rest of step_costs (TICK-310, session
+    # session_id is newer than the rest of step_costs (session
     # chaining) -- upgrade DBs created before it existed.
     try:
         conn.execute("ALTER TABLE step_costs ADD COLUMN session_id TEXT")
@@ -125,6 +133,39 @@ def _init_db(db_path: Path) -> None:
         conn.execute("ALTER TABLE analytics ADD COLUMN touched_files TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    conn.commit()
+    conn.close()
+
+
+def cleanup_test_pollution(db_path: Path | None = None, project: str | None = None) -> None:
+    """Purge test fixture rows (TICK-997, TICK-998) from analytics and step_costs tables.
+
+    The literal ticket_id match is the only test-only signal here -- an earlier
+    version also matched any row with all cost/duration columns at zero/NULL,
+    but that also matches genuine production rows (e.g. a merge-time analytics
+    row whose wall_time_ms is 0 before _get_branch_wall_time_ms backfills it,
+    or an agy dispatch row whose envelope carried no usage/duration), so it's
+    dropped rather than conjoined. When `project` is given, deletes are scoped
+    to that project so a TICK-997/998 in one project can't wipe another's rows.
+    """
+    if db_path is None:
+        db_path = _get_default_db_path()
+    if not db_path.exists():
+        return
+    _init_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    if project is not None:
+        conn.execute(
+            "DELETE FROM step_costs WHERE project = ? AND ticket_id IN ('TICK-997', 'TICK-998')",
+            (project,),
+        )
+        conn.execute(
+            "DELETE FROM analytics WHERE project = ? AND ticket_id IN ('TICK-997', 'TICK-998')",
+            (project,),
+        )
+    else:
+        conn.execute("DELETE FROM step_costs WHERE ticket_id IN ('TICK-997', 'TICK-998')")
+        conn.execute("DELETE FROM analytics WHERE ticket_id IN ('TICK-997', 'TICK-998')")
     conn.commit()
     conn.close()
 
@@ -172,7 +213,7 @@ def _upsert_row(db_path: Path, project: str, row: dict) -> None:
         (
             project,
             row.get("ticket_id", ""),
-            row.get("executor", ""),
+            row.get("executor") or "claude",
             row.get("model", ""),
             row.get("subagent_tokens"),
             row.get("summary_tokens", 0),
@@ -315,7 +356,7 @@ def cmd_log_backfill(
         db_path = _get_default_db_path()
     project = _get_project_id(repo_root)
 
-    updates = {"timestamp": _utcnow()}
+    updates: dict[str, Any] = {"timestamp": _utcnow()}
     if subagent_tokens is not None:
         updates["subagent_tokens"] = subagent_tokens
     if summary_tokens is not None:
@@ -352,7 +393,14 @@ def log_step_cost(
 ) -> None:
     """Append one real per-step cost record (analyze/implement/review/fix).
 
-    session_id (TICK-310) scopes resume_session_gate()'s age/size ceiling
+    ``input_tokens`` is expected to already be *uncached* input, matching
+    Claude's native usage.input_tokens semantics -- every registered
+    executor.py parser normalizes to this before calling record_step_cost(),
+    so this column stays comparable/averageable across executors instead of
+    mixing Claude's uncached-only figures with another executor's cumulative
+    cache-inclusive ones.
+
+    session_id scopes resume_session_gate()'s age/size ceiling
     checks to one chained session rather than a ticket's whole history.
     """
     _init_db(db_path)
@@ -391,10 +439,11 @@ def record_step_cost(
     ticket_id: str,
     step: str,
     executor: str,
-    model: str,
+    model: str | None,
     parsed: dict | None,
     *,
     db_path: Path | None = None,
+    dispatch_start_time: float | None = None,
 ) -> None:
     """Best-effort log_step_cost() call from a parse_structured_result() dict.
 
@@ -402,6 +451,14 @@ def record_step_cost(
     in executor.py's _STRUCTURED_RESULT_PARSERS (Claude, Codex, and whatever
     is added later) -- this function only knows about the normalized dict
     shape, not which CLI produced it.
+
+    dispatch_start_time, when given, clamps a self-reported duration_ms to
+    the dispatch's own measured wall-clock elapsed time if the former is
+    larger. Confirmed live in a fresh-install agy smoke test: agy's
+    duration_seconds reflects the whole resumed --conversation session
+    (prior turns included), not just this invocation's turn, so it can
+    report a duration nearly double the actual subprocess call it came
+    from -- inflating this step's cost-tracked duration.
 
     No-ops silently when parsed is None (an executor type with no registered
     parser, or a reply that didn't match the expected shape) or if writing to the
@@ -413,19 +470,23 @@ def record_step_cost(
         if db_path is None:
             db_path = _get_default_db_path()
         project = _get_project_id(repo_root)
+        duration_ms = parsed.get("duration_ms") or 0
+        if dispatch_start_time is not None and duration_ms:
+            measured_ms = max(0, round((time.time() - dispatch_start_time) * 1000))
+            duration_ms = min(duration_ms, measured_ms)
         log_step_cost(
             db_path,
             project,
             ticket_id,
             step,
             executor=executor,
-            model=model,
+            model=model or "",
             input_tokens=parsed.get("input_tokens"),
             output_tokens=parsed.get("output_tokens"),
             cache_creation_tokens=parsed.get("cache_creation_tokens"),
             cache_read_tokens=parsed.get("cache_read_tokens"),
             cost_usd=parsed.get("cost_usd"),
-            duration_ms=parsed.get("duration_ms") or 0,
+            duration_ms=duration_ms,
             num_turns=parsed.get("num_turns"),
             session_id=parsed.get("session_id"),
         )
@@ -455,10 +516,48 @@ def _load_step_costs_from_db(db_path: Path, project: str | None = None) -> list[
     return [dict(r) for r in rows]
 
 
+def get_ticket_executor(db_path: Path, project: str, ticket_id: str) -> str | None:
+    """Return the real executor that implemented ``ticket_id``, from step_costs.
+
+    Restricted to 'implement'/'fix' rows -- the only steps a ticket's own
+    executor pin covers (see resolve_driver in orchestrate/pool.py: review
+    and drift_check are deliberately dispatched to a *different*, independent
+    executor instance, so falling back to "the most recent row of any step"
+    would attribute a ticket to its reviewer rather than its implementer).
+    Returns None when step_costs has no implement/fix row for this ticket
+    (e.g. merged before step_costs existed, or implemented via aider/ollama,
+    neither of which has a registered structured-result parser to log from).
+    """
+    if not db_path.exists():
+        return None
+    # step_costs is newer than the rest of this schema (see
+    # _load_step_costs_from_db) -- a DB that predates it has no such table,
+    # and this must not raise: it runs first in cmd_merge's best-effort
+    # analytics block, ahead of the log_agent_run() call that would
+    # otherwise create/migrate the table.
+    _init_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT executor FROM step_costs
+            WHERE project = ? AND ticket_id = ? AND executor != ''
+                AND step IN ('implement', 'fix')
+            ORDER BY (step = 'implement') DESC, timestamp DESC
+            LIMIT 1
+            """,
+            (project, ticket_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["executor"] if row else None
+
+
 def resume_session_gate(
     cfg: dict, db_path: Path, project: str, session_id: str
 ) -> tuple[bool, str]:
-    """Decide whether resuming `session_id` is still safe/worth it (TICK-310).
+    """Decide whether resuming `session_id` is still safe/worth it.
 
     The ~9x cache-cost saving `--resume` gets only holds while the server's
     prompt cache is still warm; past that, a resumed call re-pays cache-write
@@ -584,6 +683,153 @@ def _print_step_cost_panel(entries: list[dict]) -> None:
         )
     total_str = f"${stats['total_cost_usd']:.4f}" if stats["total_cost_usd"] is not None else "—"
     print(f"\nTotal real cost logged: {total_str} across {stats['total_dispatches']} dispatches")
+    print()
+
+
+def compute_payload_composition_stats(
+    tickets: list[dict] | None = None,
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
+) -> dict:
+    """Aggregate per-step prompt payload component metrics across tickets.
+
+    Calculates mean/median/max bytes, token estimates, % of prompt, and
+    selection reasons for each component in analyze, implement, review, and
+    fix steps.
+    """
+    root = repo_root if repo_root is not None else Path.cwd()
+    tickets_to_process = tickets
+    if tickets_to_process is None:
+        try:
+            from lanegate.ticket import load_all_tickets
+
+            tickets_dir = root / ".lanegate" / "tickets"
+            if tickets_dir.exists():
+                prefix = (cfg or {}).get("ticket_prefix", "TICK")
+                tickets_to_process, _ = load_all_tickets(tickets_dir, prefix)
+        except Exception:
+            tickets_to_process = []
+
+    if not tickets_to_process:
+        tickets_to_process = [
+            {
+                "id": "TICK-000",
+                "title": "Sample ticket",
+                "touches": [],
+                "close_criteria": "",
+                "_body": "",
+            }
+        ]
+
+    from lanegate.analyze import describe_analyze_payload
+    from lanegate.executor import describe_implement_payload
+    from lanegate.reviewer import describe_fix_payload, describe_review_payload
+
+    step_funcs = {
+        "analyze": lambda t: describe_analyze_payload(t, root, cfg),
+        "implement": lambda t: describe_implement_payload(t, root, cfg),
+        "review": lambda t: describe_review_payload(
+            t, commit_messages="", project_root=root, cfg=cfg
+        ),
+        "fix": lambda t: describe_fix_payload(t, diff="", findings="", project_root=root, cfg=cfg),
+    }
+
+    result = {}
+    for step_name, describe_fn in step_funcs.items():
+        payloads_by_ticket = []
+        for t in tickets_to_process:
+            try:
+                comps = describe_fn(t)
+                payloads_by_ticket.append(comps)
+            except Exception:
+                pass
+
+        if not payloads_by_ticket:
+            continue
+
+        ticket_totals = [sum(c.get("bytes", 0) for c in payload) for payload in payloads_by_ticket]
+        total_bytes_mean = round(sum(ticket_totals) / len(ticket_totals)) if ticket_totals else 0
+
+        labels_order = []
+        comp_data: dict[str, list[dict]] = defaultdict(list)
+        for payload in payloads_by_ticket:
+            for c in payload:
+                lbl = c["label"]
+                if lbl not in comp_data:
+                    labels_order.append(lbl)
+                comp_data[lbl].append(c)
+
+        comp_metrics = []
+        num_tickets = len(payloads_by_ticket)
+        for lbl in labels_order:
+            instances = comp_data[lbl]
+            bytes_list = [c.get("bytes", 0) for c in instances] + [0] * (num_tickets - len(instances))
+            tokens_list = [c.get("tokens_est", 0) for c in instances] + [0] * (
+                num_tickets - len(instances)
+            )
+
+            mean_b = round(sum(bytes_list) / len(bytes_list)) if bytes_list else 0
+            med_b = round(statistics.median(bytes_list)) if bytes_list else 0
+            max_b = max(bytes_list) if bytes_list else 0
+            mean_tok = round(sum(tokens_list) / len(tokens_list)) if tokens_list else 0
+            pct = round((mean_b / total_bytes_mean) * 100, 1) if total_bytes_mean > 0 else 0.0
+
+            reason = instances[0].get("reason", "") if instances else ""
+
+            comp_metrics.append(
+                {
+                    "label": lbl,
+                    "mean_bytes": mean_b,
+                    "median_bytes": med_b,
+                    "max_bytes": max_b,
+                    "tokens_est": mean_tok,
+                    "pct_of_prompt": pct,
+                    "reason": reason,
+                }
+            )
+
+        result[step_name] = {
+            "total_bytes_mean": total_bytes_mean,
+            "components": comp_metrics,
+        }
+
+    return {"steps": result}
+
+
+def _print_payload_composition_table(
+    tickets: list[dict] | None = None,
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
+) -> None:
+    """Print the per-step Prompt Payload Composition table."""
+    stats = compute_payload_composition_stats(tickets=tickets, repo_root=repo_root, cfg=cfg)
+    steps = stats.get("steps", {})
+    if not steps:
+        return
+
+    print("\n=== Prompt Payload Composition ===")
+    for step_name, step_data in steps.items():
+        comps = step_data.get("components", [])
+        if not comps:
+            continue
+        print(f"\nStep: {step_name} (mean prompt size: {step_data.get('total_bytes_mean', 0):,} B)")
+        W_LABEL, W_MEAN, W_MED, W_MAX, W_TOK, W_PCT, W_REASON = 28, 8, 8, 8, 8, 9, 22
+        header = (
+            f"  {'Component':<{W_LABEL}}  {'Mean B':>{W_MEAN}}  {'Med B':>{W_MED}}  "
+            f"{'Max B':>{W_MAX}}  {'Est Tok':>{W_TOK}}  {'% Prompt':>{W_PCT}}  {'Reason':<{W_REASON}}"
+        )
+        print(header)
+        sep = (
+            f"  {'-' * W_LABEL}  {'-' * W_MEAN}  {'-' * W_MED}  {'-' * W_MAX}  "
+            f"{'-' * W_TOK}  {'-' * W_PCT}  {'-' * W_REASON}"
+        )
+        print(sep)
+        for c in comps:
+            pct_str = f"{c['pct_of_prompt']:.1f}%"
+            print(
+                f"  {c['label']:<{W_LABEL}}  {c['mean_bytes']:>{W_MEAN},}  {c['median_bytes']:>{W_MED},}  "
+                f"{c['max_bytes']:>{W_MAX},}  {c['tokens_est']:>{W_TOK},}  {pct_str:>{W_PCT}}  {c['reason']:<{W_REASON}}"
+            )
     print()
 
 
@@ -718,12 +964,49 @@ def log_agent_run(
 # ---------------------------------------------------------------------------
 
 
-def compute_stats(entries: list[dict]) -> dict:
+def _ols_trend(values: list[float], window: int = 10, min_n: int = 5) -> str | None:
+    """Classify a rolling window of values as FLAT/RISING/FALLING via OLS slope,
+    or None when there isn't enough data yet. Shared by the (deferred)
+    subagent-token trend and the real step-cost trend so both read the same
+    >10%-of-mean-per-step threshold.
+    """
+    vals = values[-window:]
+    n = len(vals)
+    if n < min_n:
+        return None
+    mean = sum(vals) / n
+    # OLS slope: β = (n·Σxy - Σx·Σy) / (n·Σx² - (Σx)²)
+    xs = list(range(n))
+    sx = sum(xs)
+    sy = sum(vals)
+    sxy = sum(x * y for x, y in zip(xs, vals))
+    sxx = sum(x * x for x in xs)
+    denom = n * sxx - sx * sx
+    slope = (n * sxy - sx * sy) / denom if denom else 0.0
+    slope_pct = slope / mean if mean else 0.0
+    if slope_pct > 0.10:
+        return "RISING"
+    if slope_pct < -0.10:
+        return "FALLING"
+    return "FLAT"
+
+
+def compute_stats(entries: list[dict], step_cost_entries: list[dict] | None = None) -> dict:
     """Pure function: compute all analytics from a list of log entries.
 
     Returns a structured dict with totals, per-ticket data, parallelism,
     cost trend, quality, and a plain-English verdict. Printers and JSON
     output both consume this dict so the math lives in exactly one place.
+
+    ``step_cost_entries`` (rows from the ``step_costs`` table -- real $ and
+    token counts reported by the executor CLI) is optional. When given and
+    non-empty, the per-ticket ``tickets`` rows and the bottom-line ``verdict``
+    are grounded in that real data instead of the ``subagent_tokens``/
+    ``summary_tokens`` channel below, which today is only ever written with
+    ``subagent_tokens=None`` by the merge-time fallback log call and so never
+    reflects real per-ticket cost. ``totals``/``cost_trend``
+    still describe that legacy channel -- deciding whether to wire it up for
+    real or retire it is tracked separately.
     """
     work_vals = [_get_subagent_tokens(e) for e in entries]
     main_vals = [int(e.get("summary_tokens", 0)) for e in entries]
@@ -784,30 +1067,10 @@ def compute_stats(entries: list[dict]) -> dict:
         if v is not None
     ]
     trend_points = all_trend_points[-_TREND_WINDOW:]
-    n = len(trend_points)
-    rising = False
-    if n >= _TREND_MIN:
-        vals = [p["work_tokens"] for p in trend_points]
-        mean = sum(vals) / n
-        # OLS slope: β = (n·Σxy - Σx·Σy) / (n·Σx² - (Σx)²)
-        xs = list(range(n))
-        sx = sum(xs)
-        sy = sum(vals)
-        sxy = sum(x * y for x, y in zip(xs, vals))
-        sxx = sum(x * x for x in xs)
-        denom = n * sxx - sx * sx
-        slope = (n * sxy - sx * sy) / denom if denom else 0.0
-        # Normalise: slope as fraction of mean per ticket step
-        slope_pct = slope / mean if mean else 0.0
-        if slope_pct > 0.10:
-            trend_verdict = "RISING"
-            rising = True
-        elif slope_pct < -0.10:
-            trend_verdict = "FALLING"
-        else:
-            trend_verdict = "FLAT"
-    else:
-        trend_verdict = None  # not enough data yet
+    trend_verdict = _ols_trend(
+        [p["work_tokens"] for p in trend_points], window=_TREND_WINDOW, min_n=_TREND_MIN
+    )
+    rising = trend_verdict == "RISING"
 
     # Quality
     tested = [e.get("tests_passed") for e in entries if e.get("tests_passed") is not None]
@@ -821,22 +1084,90 @@ def compute_stats(entries: list[dict]) -> dict:
         total_tested = 0
         pass_rate = None
 
-    # Overall verdict
-    ratio_val = (total_work / total_main) if (has_work and total_main and total_work) else 0
-    if ratio_val < 2 or (rising and pass_rate is not None and pass_rate < 1.0):
-        verdict_label = "NOT WORTH IT"
-    elif ratio_val < 10:
-        verdict_label = "BREAK-EVEN"
-    else:
-        verdict_label = "PAYING OFF"
+    # Real per-ticket rollup + verdict, from step_costs (real $ and tokens
+    # reported by the executor CLI). Grounds the bottom-line verdict in data
+    # that's actually populated, instead of the subagent_tokens/summary_tokens
+    # channel below which today is never written with real values outside a
+    # manual `lanegate log` backfill.
+    real_tickets: list[dict] = []
+    real_verdict: dict | None = None
+    if step_cost_entries:
+        by_ticket: dict[str, list[dict]] = defaultdict(list)
+        order: list[str] = []
+        for r in step_cost_entries:
+            tid = r.get("ticket_id", "?")
+            if tid not in by_ticket:
+                order.append(tid)
+            by_ticket[tid].append(r)
 
-    parts: list[str] = []
-    if ratio_val:
-        parts.append(f"{ratio_val:.0f}x compression")
-    if trend_verdict is not None:
-        parts.append("rising cost trend" if rising else "flat cost trend")
-    if pass_rate is not None:
-        parts.append(f"{round(pass_rate * 100)}% test pass rate")
+        for tid in order:
+            rows = by_ticket[tid]
+            total_tokens = sum(
+                (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in rows
+            )
+            costs = [r["cost_usd"] for r in rows if r.get("cost_usd") is not None]
+            real_tickets.append(
+                {
+                    "ticket_id": tid,
+                    "total_tokens": total_tokens,
+                    "total_cost_usd": round(sum(costs), 4) if costs else None,
+                    "dispatches": len(rows),
+                }
+            )
+
+        real_cost_trend = _ols_trend(
+            [t["total_cost_usd"] for t in real_tickets if t["total_cost_usd"] is not None]
+        )
+        all_costs = [r["cost_usd"] for r in step_cost_entries if r.get("cost_usd") is not None]
+        total_real_cost = round(sum(all_costs), 4) if all_costs else None
+        avg_cost_per_ticket = (
+            round(total_real_cost / len(real_tickets), 4)
+            if total_real_cost is not None and real_tickets
+            else None
+        )
+
+        real_parts: list[str] = []
+        if total_real_cost is not None:
+            real_parts.append(f"${total_real_cost:.2f} real cost across {len(real_tickets)} tickets")
+        if avg_cost_per_ticket is not None:
+            real_parts.append(f"${avg_cost_per_ticket:.2f} avg/ticket")
+        if real_cost_trend is not None:
+            real_parts.append(f"{real_cost_trend.lower()} cost trend")
+        if pass_rate is not None:
+            real_parts.append(f"{round(pass_rate * 100)}% test pass rate")
+
+        real_verdict = {
+            "grounded": True,
+            "total_cost_usd": total_real_cost,
+            "avg_cost_per_ticket_usd": avg_cost_per_ticket,
+            "cost_trend": real_cost_trend,
+            "detail": ", ".join(real_parts),
+        }
+
+    if real_verdict is not None:
+        ticket_rows = real_tickets
+        verdict = real_verdict
+    else:
+        # Legacy fallback for callers without step_costs data (e.g. the
+        # plain-JSONL cmd_context_stats path) -- unchanged.
+        ratio_val = (total_work / total_main) if (has_work and total_main and total_work) else 0
+        if ratio_val < 2 or (rising and pass_rate is not None and pass_rate < 1.0):
+            verdict_label = "NOT WORTH IT"
+        elif ratio_val < 10:
+            verdict_label = "BREAK-EVEN"
+        else:
+            verdict_label = "PAYING OFF"
+
+        parts: list[str] = []
+        if ratio_val:
+            parts.append(f"{ratio_val:.0f}x compression")
+        if trend_verdict is not None:
+            parts.append("rising cost trend" if rising else "flat cost trend")
+        if pass_rate is not None:
+            parts.append(f"{round(pass_rate * 100)}% test pass rate")
+
+        ticket_rows = tickets
+        verdict = {"grounded": False, "label": verdict_label, "detail": ", ".join(parts)}
 
     return {
         "has_entries": True,
@@ -846,7 +1177,7 @@ def compute_stats(entries: list[dict]) -> dict:
             "compression_ratio": comp_ratio,
             "kept_out": kept_out,
         },
-        "tickets": tickets,
+        "tickets": ticket_rows,
         "parallelism": parallelism,
         "cost_trend": {
             "points": trend_points,
@@ -858,10 +1189,7 @@ def compute_stats(entries: list[dict]) -> dict:
             "pass_rate": pass_rate,
             "drift_warnings": total_drift,
         },
-        "verdict": {
-            "label": verdict_label,
-            "detail": ", ".join(parts),
-        },
+        "verdict": verdict,
     }
 
 
@@ -869,9 +1197,12 @@ def stats_json(
     entries: list[dict],
     sessions: list[dict] | None = None,
     step_costs: list[dict] | None = None,
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
 ) -> str:
-    """Return compute_stats(entries) plus sessions/step_costs data as a JSON string."""
-    data = compute_stats(entries)
+    """Return compute_stats(entries) plus sessions/step_costs/payload_composition data as a JSON string."""
+    data = compute_stats(entries, step_cost_entries=step_costs)
+    data["payload_composition"] = compute_payload_composition_stats(repo_root=repo_root, cfg=cfg)
     if step_costs:
         data["step_costs"] = compute_step_cost_stats(step_costs)
     if sessions:
@@ -930,7 +1261,12 @@ def _load_entries(paths: list[Path]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def cmd_context_stats(log_path: Path, full: bool = False, compare: bool = False) -> None:
+def cmd_context_stats(
+    log_path: Path,
+    full: bool = False,
+    compare: bool = False,
+    step_costs: list[dict] | None = None,
+) -> None:
     """Print a table summarising context cost across all logged agent runs."""
     entries = _load_entries([log_path])
 
@@ -939,13 +1275,13 @@ def cmd_context_stats(log_path: Path, full: bool = False, compare: bool = False)
         return
 
     if compare:
-        _print_compare(entries)
+        _print_compare(entries, step_costs=step_costs)
         return
 
-    _print_basic_table(entries)
+    _print_basic_table(entries, step_costs=step_costs)
 
     if full:
-        _print_full_panels(entries)
+        _print_full_panels(entries, step_costs=step_costs)
 
 
 # ---------------------------------------------------------------------------
@@ -960,8 +1296,58 @@ def _get_subagent_tokens(e: dict) -> int | None:
     return int(v)
 
 
-def _print_basic_table(entries: list[dict]) -> None:
-    stats = compute_stats(entries)
+def _print_real_ticket_table(tickets: list[dict]) -> None:
+    """Print the real per-ticket token/cost table sourced from step_costs."""
+    W_TICKET = 10
+    W_TOK = 14
+    W_COST = 12
+    W_N = 11
+
+    header = (
+        f"{'Ticket':<{W_TICKET}}  {'Tokens':>{W_TOK}}  {'Cost':>{W_COST}}  {'Dispatches':>{W_N}}"
+    )
+    sep = f"{'-' * W_TICKET}  {'-' * W_TOK}  {'-' * W_COST}  {'-' * W_N}"
+
+    print("=== Context Cost Stats (from step_costs) ===\n")
+    print(header)
+    print(sep)
+
+    total_tok = 0
+    total_cost = 0.0
+    any_cost = False
+    for t in tickets:
+        tok = t["total_tokens"]
+        cost = t["total_cost_usd"]
+        cost_str = f"${cost:.4f}" if cost is not None else "—"
+        total_tok += tok
+        if cost is not None:
+            total_cost += cost
+            any_cost = True
+        print(
+            f"{t['ticket_id']:<{W_TICKET}}  {tok:>{W_TOK},}  {cost_str:>{W_COST}}  "
+            f"{t['dispatches']:>{W_N}}"
+        )
+
+    print(sep)
+    total_cost_str = f"${total_cost:.4f}" if any_cost else "—"
+    print(f"{'TOTAL':<{W_TICKET}}  {total_tok:>{W_TOK},}  {total_cost_str:>{W_COST}}  {'':>{W_N}}")
+
+
+def _print_basic_table(
+    entries: list[dict],
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
+    step_costs: list[dict] | None = None,
+) -> None:
+    stats = compute_stats(entries, step_cost_entries=step_costs)
+
+    if step_costs:
+        _print_real_ticket_table(stats["tickets"])
+        _print_payload_composition_table(repo_root=repo_root, cfg=cfg)
+        return
+
+    # Legacy fallback: no step_costs data available (e.g. plain-JSONL
+    # cmd_context_stats path) -- subagent_tokens/summary_tokens channel.
     W_TICKET = 10
     W_WORK = 11
     W_MAIN = 16
@@ -1006,10 +1392,70 @@ def _print_basic_table(entries: list[dict]) -> None:
         f"{total_main:>{W_MAIN},}  "
         f"{total_comp_str:>{W_COMP}}"
     )
+    _print_payload_composition_table(repo_root=repo_root, cfg=cfg)
 
 
-def _print_all_projects_table(entries: list[dict]) -> None:
+def _print_all_projects_table(
+    entries: list[dict],
+    repo_root: Path | None = None,
+    cfg: dict | None = None,
+    step_costs: list[dict] | None = None,
+) -> None:
     """Print a basic analytics table including a Project column."""
+    if step_costs:
+        W_PROJECT = 20
+        W_TICKET = 10
+        W_TOK = 14
+        W_COST = 12
+        W_N = 11
+
+        by_key: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        order: list[tuple[str, str]] = []
+        for r in step_costs:
+            key = (r.get("project", "?"), r.get("ticket_id", "?"))
+            if key not in by_key:
+                order.append(key)
+            by_key[key].append(r)
+
+        header = (
+            f"{'Project':<{W_PROJECT}}  {'Ticket':<{W_TICKET}}  "
+            f"{'Tokens':>{W_TOK}}  {'Cost':>{W_COST}}  {'Dispatches':>{W_N}}"
+        )
+        sep = f"{'-' * W_PROJECT}  {'-' * W_TICKET}  {'-' * W_TOK}  {'-' * W_COST}  {'-' * W_N}"
+
+        print("=== Context Cost Stats (all projects, from step_costs) ===\n")
+        print(header)
+        print(sep)
+
+        total_tok = 0
+        total_cost = 0.0
+        any_cost = False
+        for project, ticket_id in order:
+            rows = by_key[(project, ticket_id)]
+            tok = sum((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in rows)
+            costs = [r["cost_usd"] for r in rows if r.get("cost_usd") is not None]
+            cost = round(sum(costs), 4) if costs else None
+            cost_str = f"${cost:.4f}" if cost is not None else "—"
+            total_tok += tok
+            if cost is not None:
+                total_cost += cost
+                any_cost = True
+            print(
+                f"{project[:W_PROJECT]:<{W_PROJECT}}  {ticket_id:<{W_TICKET}}  "
+                f"{tok:>{W_TOK},}  {cost_str:>{W_COST}}  {len(rows):>{W_N}}"
+            )
+
+        print(sep)
+        total_cost_str = f"${total_cost:.4f}" if any_cost else "—"
+        print(
+            f"{'TOTAL':<{W_PROJECT}}  {'':<{W_TICKET}}  "
+            f"{total_tok:>{W_TOK},}  {total_cost_str:>{W_COST}}  {'':>{W_N}}"
+        )
+        _print_payload_composition_table(repo_root=repo_root, cfg=cfg)
+        return
+
+    # Legacy fallback: no step_costs data available -- subagent_tokens/
+    # summary_tokens channel.
     W_PROJECT = 20
     W_TICKET = 10
     W_WORK = 11
@@ -1062,13 +1508,14 @@ def _print_all_projects_table(entries: list[dict]) -> None:
         f"{total_main:>{W_MAIN},}  "
         f"{total_comp_str:>{W_COMP}}"
     )
+    _print_payload_composition_table(repo_root=repo_root, cfg=cfg)
 
 
 def _print_full_panels(
     entries: list[dict], sessions: list[dict] | None = None, step_costs: list[dict] | None = None
 ) -> None:
     """Print the extended --full panels."""
-    stats = compute_stats(entries)
+    stats = compute_stats(entries, step_cost_entries=step_costs)
     totals = stats["totals"]
     print()
 
@@ -1158,18 +1605,73 @@ def _print_full_panels(
             print(f"{'TOTAL':<{W}} {total_sess:>10,} tok across {len(sessions)} sessions")
         print()
 
-    # --- Plain-English Verdict ---
+    # --- Bottom line ---
     verdict = stats["verdict"]
     detail = verdict["detail"]
-    print(f"Verdict: Delegation is {verdict['label']}" + (f" — {detail}." if detail else "."))
+    if verdict.get("grounded"):
+        # Real step_costs data -- factual summary, not a fabricated
+        # worth-it/not-worth-it judgment (there's no manual-baseline cost to
+        # compare real spend against).
+        print(f"Real cost: {detail}." if detail else "Real cost: not enough step_costs data yet.")
+    else:
+        print(f"Verdict: Delegation is {verdict['label']}" + (f" — {detail}." if detail else "."))
 
 
-def _print_compare(entries: list[dict]) -> None:
-    """Group entries by executor+model and show side-by-side comparison."""
+def _real_executor_by_ticket(step_costs: list[dict]) -> dict[tuple[str, str], str]:
+    """Return {(project, ticket_id): executor}, preferring each ticket's
+    'implement' step row over its 'fix' row, and the most recent row when
+    there are several of the same kind.
+
+    Restricted to implement/fix rows -- review and drift_check are
+    deliberately dispatched to a *different*, independent executor instance
+    (see resolve_driver in orchestrate/pool.py), so including them here
+    would attribute a ticket to its reviewer rather than its implementer.
+
+    Keyed on (project, ticket_id) rather than ticket_id alone: ticket ids
+    are per-project sequential (TICK-001, TICK-002, ...) and collide across
+    projects by construction -- see _print_all_projects_table, which keys
+    step_costs the same way for the same reason.
+
+    The ``analytics`` table's own executor column is a single per-ticket
+    guess written at merge time (``ticket.get("executor") or
+    cfg.get("executor", ...)``) that reflects the project's static default
+    driver, not which executor/pool instance actually ran the ticket's
+    steps. ``step_costs`` records the real executor per dispatch,
+    so it is authoritative here.
+    """
+    best: dict[tuple[str, str], tuple[bool, str, str]] = {}
+    for row in step_costs:
+        tid = row.get("ticket_id")
+        executor = row.get("executor")
+        step = row.get("step")
+        if not tid or not executor or step not in ("implement", "fix"):
+            continue
+        key = (row.get("project", "?"), tid)
+        is_implement = step == "implement"
+        timestamp = row.get("timestamp") or ""
+        candidate = (is_implement, timestamp, executor)
+        current = best.get(key)
+        if current is None or candidate[:2] > current[:2]:
+            best[key] = candidate
+    return {key: executor for key, (_, _, executor) in best.items()}
+
+
+def _print_compare(entries: list[dict], step_costs: list[dict] | None = None) -> None:
+    """Group entries by executor+model and show side-by-side comparison.
+
+    When ``step_costs`` is given, each entry's executor is resolved from the
+    ticket's real per-dispatch history there instead of the ``analytics``
+    table's own (often wrong) per-ticket guess -- see
+    ``_real_executor_by_ticket``.
+    """
+    real_executor = _real_executor_by_ticket(step_costs) if step_costs else {}
+
     # Build groups
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for e in entries:
-        key = (e.get("executor", "claude"), e.get("model", ""))
+        key = (e.get("project", "?"), e.get("ticket_id") or "")
+        executor = real_executor.get(key) or e.get("executor") or "claude"
+        key = (executor, e.get("model", ""))
         groups[key].append(e)
 
     print("=== Executor Comparison ===\n")
@@ -1182,6 +1684,8 @@ def _print_compare(entries: list[dict]) -> None:
     W_MODEL = 20
     W_TIX = 7
     W_WORK = 12
+    W_COST = 10
+    W_TOK = 12
     W_WALL = 11
     W_PASS = 9
 
@@ -1190,6 +1694,8 @@ def _print_compare(entries: list[dict]) -> None:
         f"{'model':<{W_MODEL}}  "
         f"{'tickets':>{W_TIX}}  "
         f"{'avg work tok':>{W_WORK}}  "
+        f"{'cost':>{W_COST}}  "
+        f"{'tokens':>{W_TOK}}  "
         f"{'avg wall ms':>{W_WALL}}  "
         f"{'pass rate':>{W_PASS}}"
     )
@@ -1198,6 +1704,8 @@ def _print_compare(entries: list[dict]) -> None:
         f"{'-' * W_MODEL}  "
         f"{'-' * W_TIX}  "
         f"{'-' * W_WORK}  "
+        f"{'-' * W_COST}  "
+        f"{'-' * W_TOK}  "
         f"{'-' * W_WALL}  "
         f"{'-' * W_PASS}"
     )
@@ -1215,6 +1723,31 @@ def _print_compare(entries: list[dict]) -> None:
         else:
             avg_work_str = f"{'—':>{W_WORK}}"
 
+        if step_costs:
+            grp_keys = {(e.get("project", "?"), e.get("ticket_id")) for e in grp}
+            grp_step_costs = [
+                r
+                for r in step_costs
+                if (r.get("project", "?"), r.get("ticket_id")) in grp_keys
+                and (r.get("executor") == executor or not r.get("executor"))
+                and (not model or r.get("model") == model or not r.get("model"))
+            ]
+            costs = [r["cost_usd"] for r in grp_step_costs if r.get("cost_usd") is not None]
+            cost_sum = sum(costs) if costs else None
+            cost_str = f"${cost_sum:.4f}" if cost_sum is not None else "—"
+
+            tok_sum = sum(
+                (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0) for r in grp_step_costs
+            )
+            has_tok = any(
+                r.get("input_tokens") is not None or r.get("output_tokens") is not None
+                for r in grp_step_costs
+            )
+            tokens_str = f"{tok_sum:,}" if has_tok else "—"
+        else:
+            cost_str = "—"
+            tokens_str = "—"
+
         wall_vals = [int(e.get("wall_time_ms", 0)) for e in grp]
         avg_wall = round(sum(wall_vals) / n) if n else 0
         avg_wall_str = f"{avg_wall:>{W_WALL},}"
@@ -1231,6 +1764,90 @@ def _print_compare(entries: list[dict]) -> None:
             f"{model:<{W_MODEL}}  "
             f"{n:>{W_TIX}}  "
             f"{avg_work_str}  "
+            f"{cost_str:>{W_COST}}  "
+            f"{tokens_str:>{W_TOK}}  "
             f"{avg_wall_str}  "
             f"{pass_str:>{W_PASS}}"
         )
+
+
+# step_costs.timestamp is always stored UTC -- grouping by the raw string
+# shifts a day's dispatches by 7-8h for a Pacific-time operator, so this
+# converts before bucketing rather than truncating the raw timestamp.
+_LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def _local_day(timestamp: str) -> str:
+    """Return the operator-local (America/Los_Angeles) calendar day for a
+    UTC ``step_costs`` timestamp, or "?" if it can't be parsed."""
+    try:
+        ts = timestamp.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(_LOCAL_TZ).strftime("%Y-%m-%d")
+    except ValueError:
+        return "?"
+
+
+def _print_by_day(step_costs: list[dict]) -> None:
+    """Real dispatch cost grouped by operator-local calendar day.
+
+    Complements the rolling last-10-tickets OLS trend shown elsewhere: that
+    trend can read FLAT while day-over-day totals are clearly climbing,
+    since it's ordered by ticket, not by calendar day, and cost can rise
+    from more/costlier dispatches on the same days without any single
+    ticket's cost trending up over the last 10.
+    """
+    print("=== Real Cost by Day (America/Los_Angeles) ===\n")
+
+    if not step_costs:
+        print("No step-cost data logged yet.")
+        return
+
+    days: dict[str, list[dict]] = defaultdict(list)
+    for r in step_costs:
+        days[_local_day(str(r.get("timestamp") or ""))].append(r)
+
+    W_DAY = 12
+    W_DISP = 11
+    W_TIX = 9
+    W_COST = 12
+    W_AVG = 14
+
+    header = (
+        f"{'day':<{W_DAY}}  "
+        f"{'dispatches':>{W_DISP}}  "
+        f"{'tickets':>{W_TIX}}  "
+        f"{'cost':>{W_COST}}  "
+        f"{'avg/dispatch':>{W_AVG}}"
+    )
+    sep = (
+        f"{'-' * W_DAY}  {'-' * W_DISP}  {'-' * W_TIX}  {'-' * W_COST}  {'-' * W_AVG}"
+    )
+    print(header)
+    print(sep)
+
+    total_cost = 0.0
+    total_n = 0
+    for day in sorted(days):
+        if day == "?":
+            continue
+        rows = days[day]
+        costs = [r["cost_usd"] for r in rows if r.get("cost_usd") is not None]
+        day_cost = sum(costs)
+        n = len(rows)
+        n_tickets = len({r.get("ticket_id") for r in rows})
+        avg = day_cost / len(costs) if costs else 0.0
+        print(
+            f"{day:<{W_DAY}}  "
+            f"{n:>{W_DISP}}  "
+            f"{n_tickets:>{W_TIX}}  "
+            f"${day_cost:>{W_COST - 1},.2f}  "
+            f"${avg:>{W_AVG - 1},.4f}"
+        )
+        total_cost += day_cost
+        total_n += n
+
+    print(sep)
+    print(f"{'TOTAL':<{W_DAY}}  {total_n:>{W_DISP}}  {'':>{W_TIX}}  ${total_cost:>{W_COST - 1},.2f}")

@@ -1,9 +1,7 @@
-No active orchestration run.
-
 Run History
-RUN ID     REASON   OUTCOMES                                     
-─────────  ───────  ─────────────────────────────────────────────
-run-mixed  STOPPED  1 success · 1 failure · 1 changes_requested  
+STARTED                  TYPE  REASON   OUTCOMES                                       TICKETS             
+───────────────────────  ────  ───────  ─────────────────────────────────────────────  ────────────────────
+2026-07-30 03:00:00 PDT  LANE  STOPPED  1 success · 1 failure · 1 changes_requested    TICK-1,TICK-2,TICK-3
 
 Selected Run: run-mixed
 Terminal Reason: stopped

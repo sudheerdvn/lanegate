@@ -1,7 +1,9 @@
 {
   "run_id": "run-20260728T101500Z-abc12345",
   "events": [
-    {"id": "1", "type": "log", "timestamp": "2026-07-28T10:15:02Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "raw executor protocol line one"},
-    {"id": "2", "type": "log", "timestamp": "2026-07-28T10:15:03Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "raw executor protocol line two"}
+    {"id": "1", "type": "log", "timestamp": "2026-07-28T10:15:02Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "raw executor protocol line one", "level": "info", "style": "dim", "kind": "executor"},
+    {"id": "2", "type": "log", "timestamp": "2026-07-28T10:15:03Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "raw executor protocol line two", "level": "info", "kind": "executor"},
+    {"id": "3", "type": "log", "timestamp": "2026-07-28T10:15:04Z", "run_id": "run-20260728T101500Z-abc12345", "ticket_id": "TICK-150", "message": "raw executor protocol line three ERROR: step failed", "level": "error", "style": "bold red", "kind": "executor"}
   ]
 }
+

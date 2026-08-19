@@ -308,6 +308,25 @@ class TestGetVersion:
             ["gitleaks", "version"], capture_output=True, text=True, encoding="utf-8", timeout=3
         )
 
+    def test_accepts_custom_timeout(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "semgrep 1.2.3\n"
+        mock_result.stderr = ""
+        with patch("subprocess.run", return_value=mock_result) as run:
+            result = _get_version("semgrep", ("--version",), 10.0)
+        assert result == "(semgrep 1.2.3)"
+        run.assert_called_once_with(
+            ["semgrep", "--version"], capture_output=True, text=True, encoding="utf-8", timeout=10.0
+        )
+
+    def test_semgrep_tool_entry_uses_a_longer_timeout(self):
+        """semgrep's Python startup is slower than the other doctor-checked
+        binaries -- the shared 3s default intermittently reported a spurious
+        version-check failure for an install that was actually fine."""
+        semgrep = next(t for t in _TOOLS if t.name == "semgrep")
+        assert semgrep.version_timeout > 3.0
+
     def test_truncates_long_version_strings(self):
         long_line = "x" * 100
         mock_result = MagicMock()
@@ -535,6 +554,220 @@ class TestReviewerCombinedModeCollapse:
         assert "reviewer resolves identically" not in out
 
 
+class TestTopLevelExecutorPoolMismatch:
+    def test_doctor_warns_when_top_level_executor_not_in_pools(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "aider",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "pools": {"claude-a": {}, "claude-b": {}},
+            "default_pool": "claude-a",
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" in out
+        assert "executor: aider" in out
+        assert "claude-a" in out
+        assert "claude-b" in out
+
+    def test_doctor_no_warning_when_top_level_executor_matches_executors_key(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "claude-a",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "pools": {"claude-a": {}, "claude-b": {}},
+            "default_pool": "claude-a",
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" not in out
+
+    def test_doctor_no_warning_when_no_pools_configured(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "aider",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" not in out
+
+    def test_doctor_warns_when_top_level_reviewer_not_in_pools(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "claude-a",
+            "reviewer": "agy",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "pools": {"claude-a": {}, "claude-b": {}},
+            "default_pool": "claude-a",
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" in out
+        assert "reviewer: agy" in out
+        assert "claude-a" in out
+        assert "claude-b" in out
+
+    def test_doctor_no_warning_when_top_level_reviewer_matches_pools_key(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "claude-a",
+            "reviewer": "claude-b",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "pools": {"claude-a": {}, "claude-b": {}},
+            "default_pool": "claude-a",
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" not in out
+
+    def test_doctor_warns_when_pools_configured_and_executors_key_is_null(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "aider",
+            "executors": None,
+            "pools": {"claude-a": {}},
+            "default_pool": "claude-a",
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" in out
+        assert "executor: aider" in out
+
+    def test_doctor_no_warning_when_no_pools_configured_reviewer(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "aider",
+            "reviewer": "agy",
+            "executors": {"claude-a": {}, "claude-b": {}},
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" not in out
+
+
+class TestModelPinWarning:
+    def test_doctor_warns_model_without_executor_pin(self, tmp_path, capsys):
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir()
+        (tickets_dir / "TICK-500.md").write_text(
+            "---\nid: TICK-500\ntitle: test\nstatus: open\nmodel: claude-sonnet-5\n---\n"
+        )
+        cfg = {
+            "tickets_dir": "tickets",
+            "ticket_prefix": "TICK",
+            "executor": "codex",
+            "safeguards": {},
+        }
+        all_binaries = [tool.binary for tool in _TOOLS]
+
+        with (
+            patch("lanegate.doctor.find_repo_root", return_value=tmp_path),
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+
+        output = capsys.readouterr().out
+        assert "set model: without an executor: pin" in output
+        assert "TICK-500" in output
+        assert "missing pin: executor" in output
+
+    def test_doctor_no_warning_when_model_and_executor_pinned(self, tmp_path, capsys):
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir()
+        (tickets_dir / "TICK-500.md").write_text(
+            "---\nid: TICK-500\ntitle: test\nstatus: open\nmodel: claude-sonnet-5\n"
+            "executor: claude\n---\n"
+        )
+        cfg = {
+            "tickets_dir": "tickets",
+            "ticket_prefix": "TICK",
+            "executor": "codex",
+            "safeguards": {},
+        }
+        all_binaries = [tool.binary for tool in _TOOLS]
+
+        with (
+            patch("lanegate.doctor.find_repo_root", return_value=tmp_path),
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+
+        output = capsys.readouterr().out
+        assert "set model: without an executor: pin" not in output
+
+    def test_doctor_no_warning_when_no_model_set(self, tmp_path, capsys):
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir()
+        (tickets_dir / "TICK-500.md").write_text(
+            "---\nid: TICK-500\ntitle: test\nstatus: open\n---\n"
+        )
+        cfg = {
+            "tickets_dir": "tickets",
+            "ticket_prefix": "TICK",
+            "executor": "codex",
+            "safeguards": {},
+        }
+        all_binaries = [tool.binary for tool in _TOOLS]
+
+        with (
+            patch("lanegate.doctor.find_repo_root", return_value=tmp_path),
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+
+        output = capsys.readouterr().out
+        assert "set model: without a matching executor:/reviewer: pin" not in output
+
+
 # ---------------------------------------------------------------------------
 # TICK-364: headless permission config — bypass flag, --allowedTools/
 # --disallowedTools, and a non-interactive --permission-mode are all valid;
@@ -607,3 +840,73 @@ class TestDoctorHeadlessPermissionWarning:
     def test_still_warns_with_interactive_permission_mode(self, capsys):
         out = self._run(self._cfg(["--permission-mode", "manual"]), capsys)
         assert "Claude executor requires headless flags for orchestrate" in out
+
+
+def test_doctor_warns_on_deprecated_architecture_doc(tmp_path, capsys):
+    cfg = {"architecture_doc": "docs/ARCHITECTURE.md"}
+    with patch("lanegate.doctor.find_repo_root", return_value=tmp_path):
+        cmd_doctor(cfg=cfg)
+    out = capsys.readouterr().out
+    assert "WARNING: 'architecture_doc' in .lanegate.yml is deprecated" in out
+
+
+def test_doctor_warns_on_unconfigured_implicit_arch_doc(tmp_path, capsys):
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "ARCHITECTURE.md").write_text("# Architecture\n")
+    cfg = {}
+    with patch("lanegate.doctor.find_repo_root", return_value=tmp_path):
+        cmd_doctor(cfg=cfg)
+    out = capsys.readouterr().out
+    assert "WARNING: docs/ARCHITECTURE.md exists on disk but reference_docs is not configured" in out
+
+
+def test_doctor_warns_missing_treesitter_grammars_for_languages_used_in_repo(tmp_path, capsys):
+    """Grammars are opt-in extras now, so doctor must only warn about the
+    language(s) the repo actually contains -- not all 12 unconditionally,
+    which would be noise on every install regardless of project language."""
+    all_binaries = [t.binary for t in _TOOLS]
+    (tmp_path / "service.go").write_text("package main\n")
+
+    def mock_import_module(name):
+        if name.startswith("tree_sitter_"):
+            raise ImportError(f"No module named '{name}'")
+        return MagicMock()
+
+    with (
+        patch("lanegate.doctor.find_repo_root", return_value=tmp_path),
+        patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+        patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+        patch("importlib.import_module", side_effect=mock_import_module),
+    ):
+        cmd_doctor()
+
+    out = capsys.readouterr().out
+    assert "WARNING: missing tree-sitter grammar(s) for languages used in this repo" in out
+    assert "tree_sitter_go" in out
+    assert "pip install 'lanegate[go]'" in out
+    # No Rust files in this repo -- must not warn about a language that isn't present.
+    assert "tree_sitter_rust" not in out
+
+
+def test_doctor_does_not_warn_about_unused_language_grammars(tmp_path, capsys):
+    """A pure-Python repo with no .go/.rs/etc. files must not warn about any
+    tree-sitter grammar, even when none are installed."""
+    all_binaries = [t.binary for t in _TOOLS]
+    (tmp_path / "main.py").write_text("print('hi')\n")
+
+    def mock_import_module(name):
+        if name.startswith("tree_sitter_"):
+            raise ImportError(f"No module named '{name}'")
+        return MagicMock()
+
+    with (
+        patch("lanegate.doctor.find_repo_root", return_value=tmp_path),
+        patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+        patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+        patch("importlib.import_module", side_effect=mock_import_module),
+    ):
+        cmd_doctor()
+
+    out = capsys.readouterr().out
+    assert "missing tree-sitter grammar" not in out

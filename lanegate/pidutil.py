@@ -1,4 +1,4 @@
-"""Cross-platform process-liveness probe.
+"""Cross-platform process management helpers.
 
 Why this module exists
 ----------------------
@@ -82,3 +82,49 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def terminate_pid(pid: int) -> bool:
+    """Send a graceful termination request to a process.
+
+    On POSIX sends SIGTERM; on Windows calls ``os.kill(pid, signal.SIGTERM)``
+    which maps to ``TerminateProcess`` (no graceful-shutdown path exists for
+    arbitrary PIDs on Windows, but the effect — the process stops — is the
+    same). Returns True if the request was sent, False if the process was
+    already gone or not accessible.
+    """
+    import signal as _signal
+
+    try:
+        os.kill(pid, _signal.SIGTERM)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def force_kill_pid(pid: int) -> None:
+    """Unconditionally kill a process, suppressing common benign errors.
+
+    On POSIX sends SIGKILL. On Windows ``signal.SIGKILL`` does not exist;
+    uses ``taskkill /PID <pid> /F`` instead, which is the same pattern the
+    rest of the codebase uses for forced process-tree teardown.
+    """
+    if sys.platform == "win32":
+        import subprocess as _sp
+
+        try:
+            _sp.run(
+                ["taskkill", "/PID", str(pid), "/F"],
+                stdout=_sp.DEVNULL,
+                stderr=_sp.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+    else:
+        import signal as _signal
+
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass

@@ -13,14 +13,20 @@ venv/
 !.lanegate/tickets/
 !.lanegate/tickets/*
 .lanegate/executor-runs/
-!.lanegate/notes/
-.lanegate/notes/*
-!.lanegate/notes/.gitkeep
 worktrees/
 *-context-log.jsonl
+
+# graphify generated output (regenerate with /graphify)
+graphify-out/
+
+# aider local state
+.aider.*
 
 # Go TUI compiled binary (go build -o lanegate-tui ./tui/cmd/lanegate-tui, run from repo root)
 /lanegate-tui
 
 # Claude Code local overrides (personal, never shared)
 .claude/settings.local.json
+
+# Local MCP client configuration (machine/user-specific)
+.mcp.json

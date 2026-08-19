@@ -38,19 +38,24 @@
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATION LAYER                           │
+│                       RUN LAYER                                  │
 │  Batch runner that works through queued tickets                  │
 │                                                                  │
-│  orchestrate ──► next --json ──► executor pool + review gate     │
+│  run ──► next --json ──► executor pool + review gate             │
 │  compact terminal progress + full logs under .lanegate/logs         │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+Direct lifecycle commands (`start`, `complete`, `review`, `merge`, and `fix`) also
+receive a stable `action-<timestamp>` reference immediately. Their structured
+events live in `.lanegate/logs/action-*.events.jsonl`; `lanegate ps` and the
+TUI/API run history list these actions alongside board-clearing runs.
 
 ---
 
 ## 2. V1.5 Interface Boundaries
 
-LaneGate remains the local-first orchestration control plane, not a code-writing worker. The Python core owns tickets, locks, lifecycle transitions, orchestration decisions, prompts, executor routing, review gates, analytics, memory, MCP, and the CLI. The local API (`lanegate api`, built in TICK-146 against the TICK-107 design) exposes a subset of those core operations as structured JSON/SSE: board, tickets, diff, and orchestration-run start/stop/status/logs. It exists for a still-unbuilt UI add-on, and that UI must not scrape terminal tables or prose CLI output. Per-ticket lifecycle endpoints and a few read endpoints from the original design remain unimplemented. See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the built-vs-design gap. A Rust runner remains optional, and it's only justified for security-sensitive process supervision or sandbox enforcement, not as a default rewrite of the Python control plane.
+LaneGate remains the local-first orchestration control plane, not a code-writing worker. The Python core owns tickets, locks, lifecycle transitions, orchestration decisions, prompts, executor routing, review gates, analytics, memory, MCP, and the CLI. The local API (`lanegate api`, built against local API design) exposes a subset of those core operations as structured JSON/SSE: board, tickets, diff, and orchestration-run start/stop/status/logs. It exists for a still-unbuilt UI add-on, and that UI must not scrape terminal tables or prose CLI output. Per-ticket lifecycle endpoints and a few read endpoints from the original design remain unimplemented. See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the built-vs-design gap. A Rust runner remains optional, and it's only justified for security-sensitive process supervision or sandbox enforcement, not as a default rewrite of the Python control plane.
 
 See [V1.5 Interface Boundaries](v2-interface-boundaries.md) for the full layer decision and the rule that older V2 implementation tickets must declare their target layer before work begins.
 
@@ -73,7 +78,7 @@ The same boundary applies to spec-driven development tools: LaneGate can consume
 | `complete` | **Code** | Drift check (`git diff` vs touches) + status advance. |
 | `review` | **Code or LLM** | CLI records a review verdict. `orchestrate` can invoke a separate review executor in split mode, or require the combined executor to call `lanegate review --verdict ...`. |
 | conflict resolution | **LLM / human** | Only triggered when drift breaks the no-conflict invariant. Lock exists so this rarely happens. |
-| `merge` | **Code** | `git merge --no-ff`. On conflict: `git merge --abort` + stay in `in_review`. |
+| `merge` | **Code** | `git merge --no-ff`. On conflict: `git merge --abort` + stay in `in_review` (unchanged for genuine source conflicts). A conflict limited to LaneGate-owned ticket metadata (frontmatter/history under `tickets_dir`, `.md` only) can instead be auto-reconciled with `lanegate merge <id> --reconcile`, which preserves trunk's lifecycle-authoritative fields and unions history/audit sections, then completes the merge commit. A ticket branch already an ancestor of trunk (interrupted-merge recovery) skips the second `git merge` entirely and goes straight to post-merge safeguard re-run + finalization. |
 | `promote` / `flag` | **Code** | git ops, JSON flag files. |
 
 ---
@@ -83,12 +88,12 @@ The same boundary applies to spec-driven development tools: LaneGate can consume
 ```
 lanegate/
 ├── cli.py          — argument parsing; routes to modules below
-├── config.py       — load_config() → plain dict from .lanegate.yml
-├── ticket.py       — parse/write/validate ticket markdown+frontmatter
+├── config.py       — load_config() → plain dict from .lanegate.yml; resolve_model()'s step/executor/ticket-pin resolution order; validate_model_for_executor() checks a resolved model string against the dispatching executor's type and (for `aider`) its declared `provider`, e.g. rejecting a claude-*/gemini-* model against an `aider` executor configured with `provider: ollama`
+├── ticket.py       — parse/write/validate ticket markdown+frontmatter; `collect_cross_ticket_change_notes` scans merged/done tickets for overlapping file touches and returns bounded prior change_notes for injection into analyze/implement prompts.
 ├── board.py        — cmd_board, cmd_next (set/graph logic)
-├── lifecycle/      — cmd_start, complete, review, merge, validate, done. TICK-255/TICK-280: split from a single ~1900-line lifecycle.py into `__init__.py` (cmd_* entry points), `hibernate.py` (hibernation notes, PR push, executor/recovery markers), and `touches.py` (touched-files/scope-drift compliance check).
+├── lifecycle/      — cmd_start, complete, review, merge, validate, done; direct actions print/persist stable `action-<timestamp>` tracking references. Split from a single ~1900-line lifecycle.py into `__init__.py` (cmd_* entry points), `hibernate.py` (hibernation notes, PR push, executor/recovery markers), and `touches.py` (touched-files/scope-drift compliance check).
 ├── create.py       — cmd_create (allocate id, write draft, git commit)
-├── analyze.py      — cmd_analyze (executor subprocess → touches/close_criteria). TICK-291: also augments touches with companion docs implied by close_criteria (`companion_docs_from_criteria`, e.g. README/ARCHITECTURE.md mentions — TICK-253 failure mode) and drops pre-existing touches entries whose directory no longer exists, i.e. renamed/moved/promoted by a since-merged ticket (`validate_touched_paths` — TICK-269 failure mode).
+├── analyze.py      — cmd_analyze (executor subprocess → touches/close_criteria). Also augments touches with companion docs implied by close_criteria (`companion_docs_from_criteria`, e.g. README/ARCHITECTURE.md mentions) and drops pre-existing touches entries whose directory no longer exists, i.e. renamed/moved/promoted by a since-merged ticket (`validate_touched_paths`).
 ├── claim_file.py   — cmd_claim_file (dynamic touch expansion, TOCTOU-safe)
 ├── concurrency.py  — locked_touches, reread_and_assert_open, cross-clone check
 ├── worktree.py     — create/remove git worktrees
@@ -96,16 +101,16 @@ lanegate/
 ├── promote.py      — cmd_promote (delivery axis)
 ├── flags.py        — feature flag JSON files
 ├── ghsync.py       — GitHub issue mirror
-├── orchestrate/    — package (TICK-255/271..279 split the former single ~5800-line orchestrate.py into these modules):
-│   ├── loop.py        — board-clearing loop and its supporting helpers (dispatch, retry/hibernate handling)
-│   ├── pool.py         — executor pool selection/invocation: driver resolution, prompt dispatch, worktree commit helpers
+├── orchestrate/    — package (split the former single ~5800-line orchestrate.py into these modules):
+│   ├── loop.py        — board-clearing loop and its supporting helpers (dispatch, retry/hibernate handling). `_collect_prior_notes` carries hibernation recovery only; canonical shared notes are injected once and bounded by the analyze/implementation prompt builders.
+│   ├── pool.py         — executor pool selection/invocation: driver resolution, prompt dispatch, worktree commit helpers. `resolve_dispatch` validates the resolved model against the dispatched executor's own type/`provider` (`validate_model_for_executor`), so a pool-substituted executor that inherits a top-level `models:` block authored for a different executor raises a loud `ConfigError` instead of silently dispatching a cross-vendor model string
 │   ├── guards.py       — safety gates run against a ticket or worktree diff, incl. prompt-injection scanning
 │   ├── autofix.py      — auto-fix and drift-check subagents plus combined-mode helpers
 │   ├── review.py       — review subagent and review-related daemon helpers
 │   ├── batch.py        — board batch selection and continuation-queue rendering helpers
-│   ├── audit.py        — TICK-148 post-run executor audit bundle capture (transcript + task outputs, manifest, bounded sizes) and tee logging
-│   ├── run_report.py   — TICK-244 durable per-run event log (`.lanegate/logs/orchestrate-<ts>.events.jsonl`) powering `lanegate run-report` and `lanegate ps` (live/orphaned lanegate-spawned process listing)
-│   ├── run_summary.py  — structured, executor-neutral run-summary model shared across reporting surfaces
+│   ├── audit.py        — post-run executor audit bundle capture (transcript + task outputs, manifest, bounded sizes) and tee logging
+│   ├── run_report.py   — durable orchestration and direct-action event logs (`orchestrate-<ts>` / `action-<ts>.events.jsonl`) powering `lanegate run-report` and `lanegate ps`
+│   ├── run_summary.py  — structured, executor-neutral run-summary model shared across CLI, API, and TUI history (including direct actions)
 │   └── status.py       — active-run status bookkeeping and reporting
 ├── executor.py     — executor command construction + implementation prompts
 ├── deploy.py       — secure hook execution for promotion steps
@@ -115,7 +120,7 @@ lanegate/
 ├── safeguards.py   — pre-complete and pre-merge quality gates
 ├── context_log.py  — SQLite analytics and session-cost logging
 ├── watch.py        — PR review watcher/auto-merge helper
-├── resume_watch.py — session-independent daemon that waits out a rate limit and resumes `lanegate orchestrate`; pushes ntfy notifications on hibernation/give-up/resume and records a JSONL history (`read_history_since` lets `lanegate run-report` correlate entries to the run that hibernated)
+├── resume_watch.py — session-independent daemon that waits out a rate limit and resumes `lanegate run`; pushes ntfy notifications on hibernation/give-up/resume and records a JSONL history (`read_history_since` lets `lanegate run-report` correlate entries to the run that hibernated)
 ├── notify_watch.py — session-independent daemon: phone push (ntfy.sh) when orchestrate looks stuck (dead process, stale heartbeat, or tickets halted with nothing running)
 ├── notify.py       — shared ntfy.sh push helper used by notify_watch.py and resume_watch.py
 ├── pidutil.py      — cross-platform, non-destructive process-liveness probe (Windows-safe `pid_alive`)
@@ -123,10 +128,10 @@ lanegate/
 ├── stats.py        — ticket duration reporting
 ├── mcp.py          — FastMCP server (MCP surface for non-shell agents)
 ├── agent_tools.py  — writes Claude slash commands + Codex/generic MCP snippets (`install-agent-tools`)
-├── api.py          — TICK-146 loopback-only (127.0.0.1) HTTP API: board/tickets/diff/orchestration-run JSON + SSE log streaming
+├── api.py          — loopback-only (127.0.0.1) HTTP API: board/tickets/diff/orchestration-run JSON + SSE log streaming
 └── tui.py          — Python-owned launcher for the Go TUI boundary (mostly read-only; the settings screen can PUT a reordered pool executor list)
 
-tui/                — top-level Go module (`tui/cmd/lanegate-tui`), not inside the lanegate/ package; board, ticket detail, blocked queue, diff, orchestration-run, and settings screens over the lanegate api JSON/SSE contracts (TICK-118 spike, since grown past a single board-payload prototype)
+tui/                — top-level Go module (`tui/cmd/lanegate-tui`), not inside the lanegate/ package; board, ticket detail, blocked queue, diff, orchestration-run, and settings screens over the lanegate api JSON/SSE contracts (since grown past a single board-payload prototype)
 ```
 
 ---
@@ -143,6 +148,8 @@ LaneGate embeds no agent. The `executor` field in `.lanegate.yml` selects the pa
 | manual human handoff | Manual | CLI | Sequential or as-available outside `orchestrate` |
 
 Both concurrent strategies are **equally context-bounded**: each ticket gets a fresh agent seeing only its spec + `touches`. The file-level lock reduces overlapping edits, but it is not semantic dependency analysis. The `claude`/subagent approach wins on unified auth boundary and no process management. `process-per-ticket` wins on full agent-agnosticism.
+
+When `default_pool`/`pools` and per-ticket `executor_route` are configured, they take precedence over the top-level `executor`/`reviewer` keys for actual dispatch routing: `resolve_pool_executor` (`orchestrate/loop.py`) checks the ticket's own `executor`/`reviewer` pin first, then falls back to pool selection. The top-level `executor`/`reviewer` keys then only serve as the fallback default for unpinned tickets and as an input to the `resolve_max_parallel_detail` concurrency-cap calculation in `config.py`. `lanegate doctor` surfaces the case where a top-level `executor`/`reviewer` value doesn't name any real `executors[]` key or pool.
 
 Compact orchestrate runs keep terminal progress high-level while writing full executor output to `.lanegate/logs`.
 
@@ -168,6 +175,37 @@ Three guards enforce the lock:
 Dynamic expansion: `claim-file <file> <ticket>` lets an agent extend touches mid-session if the file is free, and hard-stops on conflict.
 
 TOCTOU safety: `start` re-reads the ticket from disk inside the lock window before writing the new status. Two racing processes cannot both win.
+
+**Scope: single git checkout, single machine.** It also does not prevent two separate git
+clones on two machines from claiming the same ticket. `check_local_not_behind_remote` runs
+on every `start` to reduce this window, but does not close it entirely — see
+[Known Limitations](../README.md#known-limitations).
+
+**What this does NOT prevent:** semantic conflicts. If one ticket changes an exported API
+and another ticket changes a caller in a different file, both tickets may be touch-disjoint
+and still incompatible. LaneGate relies on safeguards, static checks, and review to catch
+integration problems before they land.
+
+If two tickets both install/upgrade dependencies, they touch the same lockfile even when
+their other files are disjoint — declare the lockfile alongside the manifest in `touches`
+for any ticket that changes dependencies, so the lock actually serializes them. The pair
+depends on the ecosystem: `package.json` + `package-lock.json`/`pnpm-lock.yaml`/`yarn.lock`
+(JS/TS), `pyproject.toml` + `poetry.lock`/`uv.lock` (Python), `Cargo.toml` + `Cargo.lock`
+(Rust), `Gemfile` + `Gemfile.lock` (Ruby), `go.mod` + `go.sum` (Go), `composer.json` +
+`composer.lock` (PHP), `*.csproj` + `packages.lock.json` (.NET), `build.gradle(.kts)` +
+`gradle.lockfile` or a shared `libs.versions.toml` version catalog (Java/Kotlin/Android).
+Maven has no separate lockfile — declare `pom.xml` itself (and any parent/BOM pom in a
+multi-module build).
+
+Five concurrency bugs fixed versus the original orchestrator:
+
+| Bug | Fix |
+|---|---|
+| Lock released at `code_complete` | Lock held until `merged` |
+| TOCTOU on `start` | Re-read ticket from disk immediately before write |
+| Merge worktree leaked | Capture worktree path before nulling the field |
+| Case mismatch on macOS | Worktree dirs always lowercased |
+| Substring dedup in gh-sync | Exact `[TICK-N]` prefix match |
 
 ---
 
@@ -202,9 +240,9 @@ Schema validation (`validate_ticket(meta) → [errors]`) enforces required keys,
 
 ---
 
-## 8. Orchestration Loop
+## 8. Run Loop
 
-Implemented by `lanegate orchestrate`.
+Implemented by `lanegate run`; `lanegate orchestrate` is its compatibility alias.
 
 ```
 loop:
@@ -229,4 +267,4 @@ Review policy (governs human touchpoints only):
 | `human_review: per_ticket` with `reviewer: human` | Stop after each ticket for a human verdict |
 | `human_review: none` (Python/CLI default when neither `--human-review` nor `default_human_review` is set) | No human gate |
 | `default_human_review` (`.lanegate.yml`) | Project-wide fallback for `human_review`, used only when `--human-review` isn't passed explicitly on the CLI. An explicit CLI flag (including `none`) always overrides it. See [config-reference.md](config-reference.md#default_human_review). |
-| `autonomy` (TICK-348) | On `changes_requested`, fix → drift-check → re-review **always runs**, regardless of `autonomy`. `autonomy` no longer gates whether the fix happens, only what happens to its result. `autonomy: full` proceeds straight to merge on re-review approval (unattended, unchanged from before). `autonomy: supervised` (default) and `autonomy: manual` both land the ticket at `in_review` awaiting an explicit human verdict instead of auto-merging. A drift-check failure (the fix diverges from the ticket's intent), or an exhausted `max_auto_fix_attempts` budget, still escalates to a human in every mode: this gate is never bypassed. `lanegate fix TICK-NNN` runs this same cycle out-of-band, e.g. after a human ran `lanegate review` directly. |
+| `autonomy` | On `changes_requested`, fix → drift-check → re-review **always runs**, regardless of `autonomy`. `autonomy` no longer gates whether the fix happens, only what happens to its result. `autonomy: full` proceeds straight to merge on re-review approval (unattended, unchanged from before). `autonomy: supervised` (default) and `autonomy: manual` both land the ticket at `in_review` awaiting an explicit human verdict instead of auto-merging. A drift-check failure (the fix diverges from the ticket's intent), or an exhausted `max_auto_fix_attempts` budget, still escalates to a human in every mode: this gate is never bypassed. `lanegate fix TICK-NNN` runs this same cycle out-of-band, e.g. after a human ran `lanegate review` directly. |

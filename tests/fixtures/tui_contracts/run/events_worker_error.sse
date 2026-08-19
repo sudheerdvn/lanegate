@@ -1,12 +1,13 @@
 id: 1
 event: log
-data: {"id": "1", "type": "log", "timestamp": "2026-07-28T11:00:01Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "[orchestrate] starting TICK-160", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
+data: {"id": "1", "type": "log", "timestamp": "2026-07-28T11:00:01Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "[orchestrate] starting TICK-160", "level": "info", "kind": "orchestrator", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
 
 id: 2
 event: log
-data: {"id": "2", "type": "log", "timestamp": "2026-07-28T11:00:45Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "[orchestrate] ERROR: executor exited with code 1 (rate limited)", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
+data: {"id": "2", "type": "log", "timestamp": "2026-07-28T11:00:45Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "[orchestrate] ERROR: executor exited with code 1 (rate limited)", "level": "error", "style": "red", "kind": "orchestrator", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
 
 id: 3
 event: log_status
-data: {"id": "3", "type": "log_status", "timestamp": "2026-07-28T11:00:46Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "worker stopped: hibernated pending rate-limit resume", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
+data: {"id": "3", "type": "log_status", "timestamp": "2026-07-28T11:00:46Z", "run_id": "run-20260728T110000Z-fail0001", "ticket_id": "TICK-160", "message": "worker stopped: hibernated pending rate-limit resume", "style": "yellow", "data": {"path": ".lanegate/logs/orchestrate-20260728T110000Z.log"}}
+
 

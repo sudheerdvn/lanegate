@@ -30,7 +30,7 @@ type Client interface {
 	GetSettings(ctx context.Context) (*SettingsPayload, error)
 
 	// GetPools fetches pools.<name>.executors lists (in preference order)
-	// plus persisted rotation/dispatch state (TICK-269).
+	// plus persisted rotation/dispatch state.
 	GetPools(ctx context.Context) (*PoolsPayload, error)
 
 	// UpdatePoolExecutors persists a reordered executors list for one pool
@@ -60,7 +60,7 @@ type Client interface {
 	// Audit Log mode.
 	GetRunLogs(ctx context.Context, runID string, offset, limit int) (*RunLogsPayload, error)
 
-	// GetRunEvents fetches TICK-307 safe, bounded structured executor-progress
+	// GetRunEvents fetches safe, bounded structured executor-progress
 	// events for a run from GET /api/runs/{id}/events. This is the source for
 	// the Run screen's default Activity pane.
 	GetRunEvents(ctx context.Context, runID string) (*RunEventsPayload, error)

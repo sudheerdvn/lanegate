@@ -13,7 +13,19 @@ import (
 type BoardModel struct {
 	data          *client.BoardPayload
 	selectedIndex int
+	grouping      BoardGrouping
 }
+
+// BoardGrouping controls the primary organization of the Board screen.
+// Status remains the default because it is the established board layout;
+// milestone grouping gives operators an all-milestones planning view without
+// asking the API to discard tickets.
+type BoardGrouping int
+
+const (
+	BoardGroupByStatus BoardGrouping = iota
+	BoardGroupByMilestone
+)
 
 // NewBoardModel creates a new board model
 func NewBoardModel() *BoardModel {
@@ -31,6 +43,35 @@ func (bm *BoardModel) SetData(data *client.BoardPayload) {
 // GetData returns the board data
 func (bm *BoardModel) GetData() *client.BoardPayload {
 	return bm.data
+}
+
+// ToggleGrouping switches between status and milestone organization while
+// keeping the currently selected ticket selected whenever it remains present.
+func (bm *BoardModel) ToggleGrouping() BoardGrouping {
+	selectedID := bm.SelectedTicketID()
+	if bm.grouping == BoardGroupByStatus {
+		bm.grouping = BoardGroupByMilestone
+	} else {
+		bm.grouping = BoardGroupByStatus
+	}
+	if selectedID != "" {
+		bm.SelectTicket(selectedID)
+	}
+	bm.clampSelection()
+	return bm.grouping
+}
+
+// Grouping returns the Board screen's current primary organization.
+func (bm *BoardModel) Grouping() BoardGrouping {
+	return bm.grouping
+}
+
+// GroupingLabel is the concise user-facing label for the current organization.
+func (bm *BoardModel) GroupingLabel() string {
+	if bm.grouping == BoardGroupByMilestone {
+		return "milestone"
+	}
+	return "status"
 }
 
 // MoveSelection moves the active board row by delta, clamped to the current
@@ -86,8 +127,8 @@ var boardStatusOrder = []string{
 	"changes_requested", "blocked", "merged", "backlog",
 }
 
-// Render renders the board screen as plain text sized to width. Each status
-// column is rendered as a labeled table of its tickets; empty boards render
+// Render renders the board screen as plain text sized to width. Tickets are
+// organized by the current status or milestone grouping; empty boards render
 // a single placeholder line.
 func (bm *BoardModel) Render(width int) string {
 	if bm.data == nil || len(bm.data.Tickets) == 0 {
@@ -96,12 +137,12 @@ func (bm *BoardModel) Render(width int) string {
 
 	var sections []string
 	rowIndex := 0
-	for _, status := range orderedStatuses(bm.data.Tickets) {
-		tickets := bm.data.Tickets[status]
+	for _, group := range bm.ticketGroups() {
+		tickets := group.tickets
 		if len(tickets) == 0 {
 			continue
 		}
-		sections = append(sections, bm.renderTicketGroup(status, tickets, width, &rowIndex))
+		sections = append(sections, bm.renderTicketGroup(group.label, tickets, width, &rowIndex))
 	}
 
 	if len(sections) == 0 {
@@ -109,6 +150,55 @@ func (bm *BoardModel) Render(width int) string {
 	}
 
 	return strings.Join(sections, "\n\n")
+}
+
+type boardTicketGroup struct {
+	label   string
+	tickets []client.Ticket
+}
+
+// ticketGroups returns every rendered group in display order. The milestone
+// view derives its groups from the status-organized API response so it retains
+// every ticket the server supplied, including tickets without a milestone.
+func (bm *BoardModel) ticketGroups() []boardTicketGroup {
+	if bm.data == nil {
+		return nil
+	}
+	if bm.grouping == BoardGroupByMilestone {
+		byMilestone := make(map[string][]client.Ticket)
+		for _, tickets := range bm.data.Tickets {
+			for _, ticket := range tickets {
+				milestone := ticket.Milestone
+				if milestone == "" {
+					milestone = "No milestone"
+				}
+				byMilestone[milestone] = append(byMilestone[milestone], ticket)
+			}
+		}
+		labels := make([]string, 0, len(byMilestone))
+		for label := range byMilestone {
+			labels = append(labels, label)
+		}
+		sort.Strings(labels)
+		groups := make([]boardTicketGroup, 0, len(labels))
+		for _, label := range labels {
+			tickets := byMilestone[label]
+			sort.SliceStable(tickets, func(i, j int) bool {
+				if tickets[i].Priority != tickets[j].Priority {
+					return tickets[i].Priority < tickets[j].Priority
+				}
+				return tickets[i].ID < tickets[j].ID
+			})
+			groups = append(groups, boardTicketGroup{label: label, tickets: tickets})
+		}
+		return groups
+	}
+
+	groups := make([]boardTicketGroup, 0, len(bm.data.Tickets))
+	for _, status := range orderedStatuses(bm.data.Tickets) {
+		groups = append(groups, boardTicketGroup{label: status, tickets: bm.data.Tickets[status]})
+	}
+	return groups
 }
 
 // orderedStatuses returns the keys of byStatus in canonical board order,
@@ -134,21 +224,36 @@ func orderedStatuses(byStatus map[string][]client.Ticket) []string {
 	return append(ordered, extra...)
 }
 
-func (bm *BoardModel) renderTicketGroup(status string, tickets []client.Ticket, width int, rowIndex *int) string {
-	header := fmt.Sprintf("%s (%d)", ui.StatusBadge(status), len(tickets))
+func (bm *BoardModel) renderTicketGroup(group string, tickets []client.Ticket, width int, rowIndex *int) string {
+	header := fmt.Sprintf("%s (%d)", group, len(tickets))
+	if bm.grouping == BoardGroupByStatus {
+		header = fmt.Sprintf("%s (%d)", ui.StatusBadge(group), len(tickets))
+	}
 
 	titleWidth := width - 15
 	if titleWidth < 8 {
 		titleWidth = 8
 	}
 
-	table := ui.NewTable([]string{"ID", "PRI", "TITLE"}, width)
+	headers := []string{"ID", "PRI", "TITLE"}
+	if bm.grouping == BoardGroupByMilestone {
+		headers = []string{"ID", "STATUS", "PRI", "TITLE"}
+		titleWidth -= 12
+		if titleWidth < 8 {
+			titleWidth = 8
+		}
+	}
+	table := ui.NewTable(headers, width)
 	for _, t := range tickets {
 		pri := "-"
 		if t.Priority != 0 {
 			pri = fmt.Sprintf("%d", t.Priority)
 		}
-		table.AddRow([]string{t.ID, pri, ui.TruncateString(t.Title, titleWidth)}, *rowIndex == bm.selectedIndex)
+		row := []string{t.ID, pri, ui.TruncateString(t.Title, titleWidth)}
+		if bm.grouping == BoardGroupByMilestone {
+			row = []string{t.ID, t.Status, pri, ui.TruncateString(t.Title, titleWidth)}
+		}
+		table.AddRow(row, *rowIndex == bm.selectedIndex)
 		(*rowIndex)++
 	}
 
@@ -172,8 +277,8 @@ func (bm *BoardModel) SelectedTicketRenderedLine(width int) (int, bool) {
 	line := 0
 	rowIndex := 0
 	first := true
-	for _, status := range orderedStatuses(bm.data.Tickets) {
-		tickets := bm.data.Tickets[status]
+	for _, group := range bm.ticketGroups() {
+		tickets := group.tickets
 		if len(tickets) == 0 {
 			continue
 		}
@@ -199,8 +304,8 @@ func (bm *BoardModel) orderedTickets() []client.Ticket {
 		return nil
 	}
 	var tickets []client.Ticket
-	for _, status := range orderedStatuses(bm.data.Tickets) {
-		tickets = append(tickets, bm.data.Tickets[status]...)
+	for _, group := range bm.ticketGroups() {
+		tickets = append(tickets, group.tickets...)
 	}
 	return tickets
 }

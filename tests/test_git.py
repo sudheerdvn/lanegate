@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from lanegate.git import git_text, pending_commits
+from lanegate.git import git_text, pending_commits, verify_local_branch
 
 
 def test_pending_commits_distinguishes_empty_success_from_failure(tmp_path):
@@ -41,6 +41,33 @@ def test_pending_commits_retains_invalid_ref_diagnostic(tmp_path):
     assert result.error is not None
     assert "exit 128" in result.error
     assert "unknown revision" in result.error
+
+
+def test_verify_local_branch_distinguishes_present_missing_and_failed_checks(tmp_path):
+    with patch(
+        "lanegate.git.subprocess.run",
+        return_value=MagicMock(returncode=0, stdout="abc123\n", stderr=""),
+    ) as run:
+        present = verify_local_branch(tmp_path, "stage")
+    with patch(
+        "lanegate.git.subprocess.run",
+        return_value=MagicMock(returncode=1, stdout="", stderr=""),
+    ):
+        missing = verify_local_branch(tmp_path, "stage")
+    with patch(
+        "lanegate.git.subprocess.run",
+        return_value=MagicMock(returncode=128, stdout="", stderr="fatal: not a git repository\n"),
+    ):
+        failed = verify_local_branch(tmp_path, "stage")
+
+    assert run.call_args.args[0] == ["git", "rev-parse", "--verify", "--quiet", "refs/heads/stage"]
+    assert present.ok is True
+    assert present.text == "abc123"
+    assert missing.ok is True
+    assert missing.text == ""
+    assert failed.ok is False
+    assert failed.error is not None
+    assert "not a git repository" in failed.error
 
 
 def test_git_text_distinguishes_empty_success_from_failure(tmp_path):
