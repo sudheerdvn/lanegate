@@ -30,9 +30,10 @@ from pathlib import Path
 from lanegate import APP_NAME
 from lanegate.concurrency import orchestrator_lock_status
 from lanegate.notify import send_ntfy
-from lanegate.pidutil import pid_alive
+from lanegate.pidutil import terminate_pid
 from lanegate.resume_watch import _RATE_LIMIT_MARKER, _read_pid as _resume_watch_read_pid, _resume_watch_pid_file
 from lanegate.ticket import load_all_tickets
+from lanegate.watch_common import read_pid as _read_pid, write_log as _write_log
 
 _STUCK_STATUSES = {"needs_review", "failed", "blocked"}
 
@@ -60,30 +61,6 @@ def _notify_watch_state_file(repo_root: Path) -> Path:
     state_dir = repo_root / f".{APP_NAME}"
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir / "notify-watch-state.json"
-
-
-def _write_log(log_path: Path, line: str) -> None:
-    """Append one already-terminated line to the notify-watch log."""
-    with open(log_path, "a") as f:
-        f.write(line)
-
-
-def _read_pid(pid_path: Path) -> int | None:
-    """
-    Return the PID from the pid file, or None if missing, unreadable, or stale
-    (i.e. the process is no longer running).
-    """
-    try:
-        raw = pid_path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    try:
-        pid = int(raw)
-    except (ValueError, TypeError):
-        return None
-    if pid_alive(pid):
-        return pid
-    return None
 
 
 def _read_last_signature(state_path: Path) -> str:
@@ -154,32 +131,44 @@ def _detect_problem(cfg: dict, repo_root: Path) -> tuple[str, str] | None:
     everything looks healthy. `signature` is a stable, order-independent key
     used to dedupe repeat pushes for the same unresolved problem.
     """
-    from lanegate.orchestrate import _read_active_status
+    from lanegate.orchestrate import _read_active_status, _read_all_active_statuses
 
     notify_cfg = cfg.get("notify") or {}
     stale_after = float(notify_cfg.get("heartbeat_stale_seconds", 180))
 
     lock = orchestrator_lock_status(repo_root)
-    active = _read_active_status(repo_root)
 
-    if active and active.get("active"):
-        ticket_id = active.get("ticket_id", "?")
-        step = active.get("step", "?")
+    # Under concurrent/pooled execution, per-session status lives under
+    # .lanegate/active-orchestrate/*.json rather than the singular
+    # active-orchestrate.json — scan both so this still fires with pools.
+    all_active = list(_read_all_active_statuses(repo_root))
+    singular = _read_active_status(repo_root)
+    if singular:
+        all_active.append(singular)
 
+    active_sessions = [a for a in all_active if a and a.get("active")]
+
+    if active_sessions:
         if not lock.get("alive"):
+            session = active_sessions[0]
+            ticket_id = session.get("ticket_id", "?")
+            step = session.get("step", "?")
             return (
                 f"process-died:{ticket_id}",
                 f"orchestrate process died unexpectedly while running {ticket_id} ({step})",
             )
 
-        last_hb = active.get("last_heartbeat_at")
-        if last_hb is not None:
-            stale_for = time.time() - float(last_hb)
-            if stale_for > stale_after:
-                return (
-                    f"heartbeat-stale:{ticket_id}",
-                    f"{ticket_id} ({step}) heartbeat stale {int(stale_for)}s — executor may be wedged",
-                )
+        for session in active_sessions:
+            ticket_id = session.get("ticket_id", "?")
+            step = session.get("step", "?")
+            last_hb = session.get("last_heartbeat_at")
+            if last_hb is not None:
+                stale_for = time.time() - float(last_hb)
+                if stale_for > stale_after:
+                    return (
+                        f"heartbeat-stale:{ticket_id}",
+                        f"{ticket_id} ({step}) heartbeat stale {int(stale_for)}s — executor may be wedged",
+                    )
         return None
 
     # No active executor right now — fine if the loop is between tickets,
@@ -208,6 +197,12 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     daemon. Logs to .lanegate/notify-watch.log. Runs indefinitely (stop with
     `lanegate notify-watch --stop`) since it monitors across orchestrate runs,
     not just one.
+
+    Shares its name with watch._run_loop and resume_watch._run_loop
+    (TICK-366 duplicate-drift sweep). Each daemon polls a different
+    condition with a different body — this one detects a stuck orchestrate
+    run and pushes a notification — so the shared name is intentional and
+    no consolidation is needed.
     """
     log_path = _notify_watch_log_file(repo_root)
     state_path = _notify_watch_state_file(repo_root)
@@ -260,16 +255,34 @@ def cmd_notify_watch(
     status: bool = False,
     stop: bool = False,
     test: bool = False,
+    background: bool = False,
 ) -> None:
     """
     Main entry point for `lanegate notify-watch`.
 
-      lanegate notify-watch            — run the poll loop
-      lanegate notify-watch --status   — report running state
-      lanegate notify-watch --stop     — kill the running watcher
-      lanegate notify-watch --test     — send one test push and exit
+      lanegate notify-watch              — run the poll loop
+      lanegate notify-watch --background — spawn the poll loop detached, survives
+                                            this terminal closing, then exit
+      lanegate notify-watch --status     — report running state
+      lanegate notify-watch --stop       — kill the running watcher
+      lanegate notify-watch --test       — send one test push and exit
     """
     pid_path = _notify_watch_pid_file(repo_root)
+
+    if background and not (status or stop or test):
+        from lanegate.lifecycle import spawn_detached
+
+        existing_pid = _read_pid(pid_path)
+        if existing_pid is not None:
+            print(
+                f"[notify-watch] already running (PID {existing_pid}). Use --stop to kill it first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        log_path = _notify_watch_log_file(repo_root)
+        spawned_pid = spawn_detached([APP_NAME, "notify-watch"], log_path)
+        print(f"[notify-watch] spawned detached (PID {spawned_pid}), survives this terminal closing")
+        return
 
     if test:
         topic = (cfg.get("notify") or {}).get("ntfy_topic")
@@ -295,12 +308,10 @@ def cmd_notify_watch(
             if pid_path.exists():
                 pid_path.unlink(missing_ok=True)
             return
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError) as exc:
-            print(f"[notify-watch] could not kill PID {pid}: {exc}", file=sys.stderr)
+        if not terminate_pid(pid):
+            print(f"[notify-watch] could not terminate PID {pid}", file=sys.stderr)
         else:
-            print(f"[notify-watch] sent SIGTERM to PID {pid}")
+            print(f"[notify-watch] terminated PID {pid}")
             pid_path.unlink(missing_ok=True)
         return
 

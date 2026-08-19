@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from lanegate.config import interactive_init
 from lanegate.create import _derive_title, _next_id, cmd_create
 from lanegate.ticket import parse_ticket, validate_ticket
 
@@ -118,6 +119,14 @@ def test_create_title_truncated_at_80(repo):
     cmd_create(long_intent, _CFG, repo)
     t = parse_ticket(repo / "tickets" / "TICK-001.md")
     assert len(t["title"]) <= 80
+    assert t["title"].endswith("…")
+
+
+def test_create_explicit_title_is_preserved_for_the_board(repo):
+    title = "Show the complete authentication migration plan and rollout safeguards on the board"
+    cmd_create("Implement the migration.", _CFG, repo, title=title)
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert t["title"] == title
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +146,10 @@ class TestDeriveTitle:
         )
         title = _derive_title(intent)
         assert len(title) <= 80
-        assert not intent[: len(title) + 1].endswith(title + "-")
-        # No mid-word cut: title is a prefix ending at a space in the original.
-        assert intent[len(title) : len(title) + 1] in ("", " ")
+        assert title.endswith("…")
+        prefix = title.removesuffix("…")
+        # No mid-word cut: the visible portion ends at a word boundary.
+        assert intent[len(prefix) : len(prefix) + 1] in ("", " ")
 
     def test_multi_sentence_uses_first_sentence_only(self):
         intent = (
@@ -160,9 +170,13 @@ class TestDeriveTitle:
     def test_degenerate_single_token_falls_back_to_hard_cutoff(self):
         title = _derive_title("x" * 120)
         assert len(title) <= 80
+        assert title.endswith("…")
 
     def test_custom_max_len(self):
-        assert _derive_title("one two three four five", max_len=13) == "one two three"
+        assert _derive_title("one two three four five", max_len=13) == "one two…"
+
+    def test_tiny_max_len_still_marks_truncation(self):
+        assert _derive_title("one two", max_len=1) == "…"
 
     def test_create_uses_derive_title(self, repo):
         """cmd_create must not have its own separate truncation logic —
@@ -211,6 +225,19 @@ def test_create_autonomy_uses_project_default(repo):
     assert t.get("autonomy") == "full"
 
 
+def test_create_autonomy_override_wins_over_project_default(repo):
+    cmd_create("Build a login page", dict(_CFG, autonomy="full"), repo, autonomy="supervised")
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert t.get("autonomy") == "supervised"
+
+
+def test_cmd_create_autonomy_override(repo):
+    cmd_create("Handle external credentials", dict(_CFG, autonomy="full"), repo, autonomy="red")
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["autonomy"] == "red"
+
+
 # --- analyze failure path (via CLI) ---
 
 # ---------------------------------------------------------------------------
@@ -237,6 +264,7 @@ def test_create_commit_does_not_use_no_verify(repo):
     git_commits = [c for c in calls if "commit" in c]
     for cmd in git_commits:
         assert "--no-verify" not in cmd, f"cmd_create used --no-verify in git commit: {cmd}"
+        assert "-s" in cmd, f"cmd_create omitted git commit signoff: {cmd}"
 
 
 def test_create_commits_ticket_when_tickets_dir_gitignored(repo):
@@ -455,3 +483,150 @@ def test_create_concurrent_no_collision(repo):
                 task_nums.add(i)
 
     assert len(task_nums) == 5, f"Not all tasks found in ticket bodies; found {task_nums}"
+
+
+def test_create_init_gitignore_excludes_pycache(repo):
+    """lanegate init scaffolds a .gitignore containing __pycache__/ and *.pyc entries without clobbering existing entries."""
+    gitignore_path = repo / ".gitignore"
+    gitignore_path.write_text("custom_build/\n*.log\n")
+
+    interactive_init(repo, use_defaults=True)
+
+    lines = [line.strip() for line in gitignore_path.read_text().splitlines()]
+    assert "custom_build/" in lines
+    assert "*.log" in lines
+    assert "__pycache__/" in lines
+    assert "*.pyc" in lines
+
+
+def test_create_cross_clone_retry_on_push_collision(tmp_path):
+    """cmd_create fetches remote tracking changes and retries ticket ID allocation on git push rejection."""
+    import shutil
+    import subprocess as _sp
+    from unittest.mock import patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required for cross-clone integration test")
+
+    remote_dir = tmp_path / "remote.git"
+    remote_dir.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "init", "--bare", "-b", "main"], cwd=remote_dir, check=True, capture_output=True)
+
+    clone1 = tmp_path / "clone1"
+    _sp.run(["git", "clone", str(remote_dir), str(clone1)], check=True, capture_output=True)
+    _sp.run(["git", "config", "user.email", "c1@example.com"], cwd=clone1, check=True)
+    _sp.run(["git", "config", "user.name", "Clone 1"], cwd=clone1, check=True)
+
+    (clone1 / "README.md").write_text("# Test Repo\n")
+    _sp.run(["git", "add", "README.md"], cwd=clone1, check=True)
+    _sp.run(["git", "commit", "-m", "initial commit"], cwd=clone1, check=True, capture_output=True)
+    _sp.run(["git", "push", "-u", "origin", "main"], cwd=clone1, check=True, capture_output=True)
+
+    clone2 = tmp_path / "clone2"
+    _sp.run(["git", "clone", str(remote_dir), str(clone2)], check=True, capture_output=True)
+    _sp.run(["git", "config", "user.email", "c2@example.com"], cwd=clone2, check=True)
+    _sp.run(["git", "config", "user.name", "Clone 2"], cwd=clone2, check=True)
+
+    cfg = dict(_CFG, commit_status_changes=True)
+
+    # Clone 1 creates TICK-001 and pushes it
+    id1 = cmd_create("Ticket from clone 1", cfg, clone1)
+    assert id1 == "TICK-001"
+
+    # Clone 2 has not fetched yet. Simulate push rejection on Clone 2's first push attempt.
+    real_run = _sp.run
+    push_attempts = []
+
+    def mock_run(cmd, **kwargs):
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "push":
+            push_attempts.append(cmd)
+            if len(push_attempts) == 1:
+                return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="[rejected] (fetch first)")
+        return real_run(cmd, **kwargs)
+
+    with patch("lanegate.create.subprocess.run", side_effect=mock_run):
+        id2 = cmd_create("Ticket from clone 2", cfg, clone2)
+
+    assert len(push_attempts) >= 2, f"Expected retry on push failure, but push called {len(push_attempts)} times"
+    assert id2 == "TICK-002"
+    assert (clone2 / "tickets" / "TICK-001.md").exists()
+    assert (clone2 / "tickets" / "TICK-002.md").exists()
+
+    git_log = _sp.run(["git", "log", "--oneline"], cwd=clone2, check=True, capture_output=True, text=True)
+    assert "TICK-002" in git_log.stdout
+
+
+def test_create_cross_clone_retry_preserves_uncommitted_files(tmp_path):
+    """Push retry rollback must not destroy uncommitted files in the working directory."""
+    import shutil
+    import subprocess as _sp
+    from unittest.mock import patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required for cross-clone integration test")
+
+    remote_dir = tmp_path / "remote.git"
+    remote_dir.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "init", "--bare", "-b", "main"], cwd=remote_dir, check=True, capture_output=True)
+
+    clone = tmp_path / "clone"
+    _sp.run(["git", "clone", str(remote_dir), str(clone)], check=True, capture_output=True)
+    _sp.run(["git", "config", "user.email", "c@example.com"], cwd=clone, check=True)
+    _sp.run(["git", "config", "user.name", "Clone User"], cwd=clone, check=True)
+
+    (clone / "README.md").write_text("# Initial\n")
+    _sp.run(["git", "add", "README.md"], cwd=clone, check=True)
+    _sp.run(["git", "commit", "-m", "initial commit"], cwd=clone, check=True, capture_output=True)
+    _sp.run(["git", "push", "-u", "origin", "main"], cwd=clone, check=True, capture_output=True)
+
+    # Create uncommitted modified and untracked files
+    uncommitted_file = clone / "work_in_progress.txt"
+    uncommitted_file.write_text("important user work\n")
+    (clone / "README.md").write_text("# Modified Working Copy\n")
+
+    cfg = dict(_CFG, commit_status_changes=True)
+    real_run = _sp.run
+    push_attempts = []
+
+    def mock_run(cmd, **kwargs):
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "push":
+            push_attempts.append(cmd)
+            if len(push_attempts) == 1:
+                return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="[rejected]")
+        return real_run(cmd, **kwargs)
+
+    with patch("lanegate.create.subprocess.run", side_effect=mock_run):
+        tid = cmd_create("Test ticket", cfg, clone)
+
+    assert tid == "TICK-001"
+    assert uncommitted_file.exists()
+    assert uncommitted_file.read_text() == "important user work\n"
+    assert (clone / "README.md").read_text() == "# Modified Working Copy\n"
+
+
+def test_create_cross_clone_rebase_failure_raises(tmp_path):
+    """When git rebase fails, cmd_create aborts the rebase and raises RuntimeError."""
+    import shutil
+    import subprocess as _sp
+    from unittest.mock import patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required for cross-clone integration test")
+
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    _sp.run(["git", "config", "user.email", "c@example.com"], cwd=repo, check=True)
+    _sp.run(["git", "config", "user.name", "Clone User"], cwd=repo, check=True)
+
+    cfg = dict(_CFG, commit_status_changes=True)
+
+    def mock_run(cmd, **kwargs):
+        if isinstance(cmd, (list, tuple)) and len(cmd) >= 3 and cmd[0] == "git" and cmd[1] == "rebase":
+            return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="rebase conflict")
+        return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    with patch("lanegate.create._has_tracking_remote", return_value=True):
+        with patch("lanegate.create.subprocess.run", side_effect=mock_run):
+            with pytest.raises(RuntimeError, match="Failed to rebase onto upstream tracking branch"):
+                cmd_create("Test ticket", cfg, repo)

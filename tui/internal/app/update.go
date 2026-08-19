@@ -43,11 +43,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.finishLoad(screenDiff, msg.err, false)
 
 	case runLoadedMsg:
-		m.run.SetData(msg.data)
+		// A newer GET /api/runs/current request is already in flight, so this
+		// response is stale. In particular, do not let its error replace the
+		// current screen status or its older snapshot overwrite newer state.
+		// Still clear the loading flag: it was set by whichever refresh is
+		// tracked by the current gen, and if this stale response turns out
+		// to be the last one the model ever sees, skipping this would leave
+		// the screen frozen on "Loading Run..." forever.
+		if msg.gen != 0 && msg.gen != m.runSnapshotReqGen {
+			if m.screen == screenRun {
+				m.loading = false
+			}
+			return m, nil
+		}
+		// A failed refresh has no payload. Keep the last successful snapshot so
+		// the Activity poller and Live Outcomes table have stable state while
+		// the status bar reports the transient API error.
+		if msg.err == nil && msg.data != nil {
+			m.run.SetData(msg.data)
+		}
 		return m, m.finishLoad(screenRun, msg.err, msg.autoRefreshing)
 
 	case runEventsLoadedMsg:
-		if m.screen != screenRun || m.run.IsAuditMode() || msg.runID != m.runActivityWant {
+		if !m.runPaneVisible() || m.run.IsAuditMode() || msg.runID != m.runActivityWant {
 			// Stale: the Activity focus has since moved to a different run.
 			return m, nil
 		}
@@ -58,21 +76,51 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.ensureRunActivityPolling()
 
+	case runSummaryLoadedMsg:
+		// Supplementary data for the live Live Outcomes table, not the
+		// primary pane — an error here should not surface a blocking error
+		// state, just leave the table as it was. Also drop a response older
+		// than the last one already applied: these fetches enrich every
+		// non-success outcome from disk and can take long enough that an
+		// earlier tick's request completes after a later tick's, which would
+		// otherwise clobber the table with stale per-ticket outcomes.
+		if msg.gen <= m.runSummaryAppliedGen {
+			return m, nil
+		}
+		if msg.err == nil && msg.data != nil {
+			m.runSummaryAppliedGen = msg.gen
+			m.run.SetLiveBatchTickets(msg.data.BatchTickets)
+		}
+		return m, nil
+
 	case runActivityPollMsg:
 		if msg.gen != m.runActivityPollGen || !m.runActivityPolling || m.screen != screenRun || m.run.IsAuditMode() {
+			// This generation's chain is being dropped without rescheduling
+			// itself. If runActivityPolling is still marked live for this
+			// same generation, clear it here — otherwise it stays stuck
+			// true forever and ensureRunActivityPolling's guard permanently
+			// refuses to restart polling.
+			if msg.gen == m.runActivityPollGen && m.runActivityPolling {
+				m.stopRunActivityPolling()
+			}
 			return m, nil
 		}
 		// Refresh the complete live Run view alongside structured progress: a
 		// worker can finish or a new worker can launch between progress events.
-		return m, tea.Batch(
+		cmds := []tea.Cmd{
 			m.loadRunActivityRefreshCmd(),
 			m.loadRunHistoryCmd(),
 			m.loadRunEventsCmd(m.runActivityWant),
-			m.nextRunActivityPollCmd(msg.gen),
-		)
+		}
+		if data := m.run.GetData(); data != nil && data.RunID != "" {
+			runID := data.RunID
+			cmds = append(cmds, m.loadRunSummaryCmd(runID))
+		}
+		cmds = append(cmds, m.nextRunActivityPollCmd(msg.gen))
+		return m, tea.Batch(cmds...)
 
 	case runLogsLoadedMsg:
-		if m.screen != screenRun || !m.run.IsAuditMode() || msg.runID != m.focusedRunID() {
+		if !m.runPaneVisible() || !m.run.IsAuditMode() || msg.runID != m.focusedRunID() {
 			return m, nil
 		}
 		if msg.err != nil {
@@ -86,7 +134,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil && msg.data != nil {
 			m.run.SetHistory(msg.data)
 		}
-		return m, nil
+		return m, m.finishLoad(screenHistory, msg.err, false)
 
 	case settingsLoadedMsg:
 		if msg.err != nil {
@@ -124,7 +172,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case runLogMsg:
-		if msg.gen != m.runStreamGen || m.screen != screenRun || !m.run.IsAuditMode() {
+		if msg.gen != m.runStreamGen || !m.runPaneVisible() || !m.run.IsAuditMode() {
 			// Stale: either a newer stream replaced this one, or the Run
 			// screen was left and the stream was stopped.
 			return m, nil
@@ -140,7 +188,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.run.SetHistoryError(msg.err)
 		} else {
-			m.run.SetHistoryPage(msg.runID, msg.offset, msg.lines)
+			m.run.SetHistoryPageWithMetadata(msg.runID, msg.offset, msg.lines, msg.levels, msg.styles)
 		}
 		return m, nil
 	}
@@ -178,6 +226,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "5":
 		return m, m.switchScreen(screenRun)
 	case "6":
+		return m, m.switchScreen(screenHistory)
+	case "7":
 		return m, m.switchScreen(screenSettings)
 
 	case "esc":
@@ -186,10 +236,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.ClearInfo()
 			return m, nil
 		}
-		if m.screen == screenRun && m.run.IsHistoryDetail() {
+		if m.screen == screenHistory && m.run.IsHistoryDetail() {
 			m.run.CloseHistoryDetail()
 			m.runActivityWant = ""
-			m.scrollOffsets[screenRun] = 0
+			m.scrollOffsets[screenHistory] = 0
 			return m, nil
 		}
 		if m.previousScreen == m.screen {
@@ -204,9 +254,20 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r":
 		return m, m.refreshCmd()
+	case "m":
+		if m.screen == screenBoard {
+			m.board.ToggleGrouping()
+			m.selectedTicketID = m.board.SelectedTicketID()
+			m.scrollOffsets[screenBoard] = 0
+			if line, ok := m.board.SelectedTicketRenderedLine(m.width); ok {
+				m.scrollToRenderedLine(line)
+			}
+			m.statusBar.SetInfo("Board grouped by " + m.board.GroupingLabel() + ".")
+		}
+		return m, nil
 
 	// p / enter / J / K drive the pools.<name>.executors reorder control
-	// (TICK-269) on the Settings screen; they are no-ops elsewhere.
+	// on the Settings screen; they are no-ops elsewhere.
 	case "p":
 		if m.screen == screenSettings && !m.settings.IsEditingPool() {
 			if m.settings.BeginPoolEdit() {
@@ -231,7 +292,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.selectedTicketID != "" {
 				return m, m.switchScreen(screenTicket)
 			}
-		case screenRun:
+		case screenHistory:
 			return m, m.openSelectedRunCmd()
 		}
 		return m, nil
@@ -254,34 +315,34 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	// a / n / N drive the Run screen's Activity <-> Raw Audit Log toggle and
-	// the audit log's page navigation (TICK-324); no-ops elsewhere.
+	// the audit log's page navigation; no-ops elsewhere.
 	case "a":
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			return m, m.toggleRunMode()
 		}
 		return m, nil
 	case "c":
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			m.copyRunPaneToClipboard()
 		}
 		return m, nil
 	case "y":
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			m.copyMarkedRunRangeToClipboard()
 		}
 		return m, nil
 	case "v":
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			m.markRunCopyStart()
 		}
 		return m, nil
 	case "n":
-		if m.screen == screenRun && m.run.IsAuditMode() {
+		if m.runPaneVisible() && m.run.IsAuditMode() {
 			return m, m.pageAuditCmd(1)
 		}
 		return m, nil
 	case "N":
-		if m.screen == screenRun && m.run.IsAuditMode() {
+		if m.runPaneVisible() && m.run.IsAuditMode() {
 			return m, m.pageAuditCmd(-1)
 		}
 		return m, nil
@@ -294,7 +355,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "home":
 		m.scrollHome()
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			return m, m.maybeLoadRunHistoryCmd()
 		}
 		return m, nil
@@ -302,7 +363,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollEnd()
 		return m, nil
 	case "H":
-		if m.screen == screenRun {
+		if m.runPaneVisible() {
 			if m.run.HistoryError() != "" {
 				m.run.RetryHistory()
 			}
@@ -329,7 +390,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) switchScreen(target screenID) tea.Cmd {
 	m.helpVisible = false
 	if target != m.screen {
-		if m.screen == screenRun {
+		if m.screen == screenRun || m.screen == screenHistory {
 			m.stopRunLogStream()
 			m.stopRunActivityPolling()
 			m.runCopyStart = -1
@@ -365,7 +426,6 @@ func (m *Model) refreshCmd() tea.Cmd {
 	case screenRun:
 		cmds := []tea.Cmd{
 			m.loadRunCmd(),
-			m.loadRunHistoryCmd(),
 			m.loadRunEventsCmd(m.runActivityWant),
 		}
 		if m.run.IsAuditMode() {
@@ -373,6 +433,16 @@ func (m *Model) refreshCmd() tea.Cmd {
 			cmds = append(cmds, m.loadRunLogsCmd(m.focusedRunID(), m.run.AuditOffset(), m.run.AuditLimit()))
 			if m.runActivityWant == "" {
 				cmds = append(cmds, m.startRunLogStream())
+			}
+		}
+		return tea.Batch(cmds...)
+	case screenHistory:
+		cmds := []tea.Cmd{m.loadRunHistoryCmd()}
+		if m.run.IsHistoryDetail() {
+			cmds = append(cmds, m.loadRunEventsCmd(m.runActivityWant))
+			if m.run.IsAuditMode() {
+				m.run.SetAuditLoading(true)
+				cmds = append(cmds, m.loadRunLogsCmd(m.focusedRunID(), m.run.AuditOffset(), m.run.AuditLimit()))
 			}
 		}
 		return tea.Batch(cmds...)
@@ -396,18 +466,25 @@ func (m *Model) focusedRunID() string {
 	return "current"
 }
 
+// runPaneVisible reports whether the active screen currently renders an
+// Activity or Raw Audit Log pane. The live Run screen always does; the Run
+// History screen does only after a historical row has been opened.
+func (m *Model) runPaneVisible() bool {
+	return m.screen == screenRun || (m.screen == screenHistory && m.run.IsHistoryDetail())
+}
+
 // openSelectedRunCmd loads the currently highlighted historical run into its
 // detail screen. History navigation itself remains local and instant; Enter
 // is the explicit action that opens Activity or Raw Audit Log data.
 func (m *Model) openSelectedRunCmd() tea.Cmd {
-	if m.screen != screenRun || !m.run.OpenSelectedHistory() {
+	if m.screen != screenHistory || !m.run.OpenSelectedHistory() {
 		m.statusBar.SetInfo("No historical run is available to open.")
 		return nil
 	}
 	sel := m.run.SelectedRun()
 	m.runActivityWant = sel.RunID
 	m.runCopyStart = -1
-	m.scrollOffsets[screenRun] = 0
+	m.scrollOffsets[screenHistory] = 0
 	if m.run.IsAuditMode() {
 		return tea.Batch(m.loadRunEventsCmd(sel.RunID), m.loadAuditPageCmd(0))
 	}
@@ -506,6 +583,8 @@ func (m *Model) moveSelectionOrScroll(delta int) {
 			m.scrollActive(delta)
 		}
 	case screenRun:
+		m.scrollActive(delta)
+	case screenHistory:
 		if m.run.IsHistoryDetail() {
 			m.scrollActive(delta)
 		} else if m.run.MoveSelection(delta) {
@@ -515,7 +594,7 @@ func (m *Model) moveSelectionOrScroll(delta int) {
 		}
 	case screenSettings:
 		// While reordering, up/down move the highlighted executor row
-		// instead of the focused pool (TICK-269); either way this is
+		// instead of the focused pool; either way this is
 		// row-selection, not free scrolling, matching Board/Blocked.
 		if m.settings.IsEditingPool() {
 			m.settings.MoveExecutorSelection(delta)

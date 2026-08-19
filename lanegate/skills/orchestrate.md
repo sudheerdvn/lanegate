@@ -1,4 +1,7 @@
-# /orchestrate — Clear the Board
+# /orchestrate — Compatibility Alias for /run
+
+> Prefer `/lanegate:run` or `lanegate run`. This legacy slash command remains
+> available for existing agent setups and follows the same run procedure.
 
 Runs the ticket-processing loop. Pulls touch-disjoint batches from `lanegate next`,
 takes each ticket as far as policy allows **in parallel up to a resource cap**,
@@ -18,7 +21,10 @@ Before doing anything else, read `.lanegate.yml` and resolve the active mileston
 1. `--milestone <m>` flag on this invocation → use that milestone.
 2. `default_milestone` key in `.lanegate.yml` → use that milestone silently.
 3. `--all` flag → process tickets across all milestones (no filter).
-4. None of the above → **exit with a clear error**:
+4. None of the above, and no ticket in the tickets dir has a `milestone` field set →
+   nothing to scope by, so process tickets across all milestones (same as `--all`).
+5. None of the above, but at least one ticket has a `milestone` field set → **exit with
+   a clear error** (the scope is ambiguous once milestones are in use):
    ```
    ERROR: no milestone specified and no default_milestone in .lanegate.yml.
    Run with --milestone <m> or --all to process tickets across all milestones.
@@ -120,7 +126,7 @@ Rules:
   aborted.
 - Pass `--no-auto-analyze` to disable this step entirely:
   ```bash
-  lanegate orchestrate --no-auto-analyze
+  lanegate run --no-auto-analyze
   ```
 - In `--dry-run` mode the orchestrator prints which drafts *would* be analyzed without
   actually calling `lanegate analyze`:
@@ -140,36 +146,12 @@ finishes, passing the touches of still-running tickets as transient exclusions t
 next queue query until their status locks are visible on disk. When `max_parallel=1`,
 this reduces to the previous batch-synchronous/sequential behavior.
 
-### Prior agent notes injection
+### Shared notes injection
 
-Before dispatching the subagent for a ticket, collect any notes left by previous agents
-for files this ticket will touch.
-
-**Step 1 — collect notes**
-
-For each path in `ticket.touches`, derive the flat filename:
-- Replace every `/` in the path with `_`
-- Read `.lanegate/notes/<flat_path>.md` if it exists; silently skip if missing
-
-**Step 2 — build the injection**
-
-Concatenate all non-empty note file contents. If the result is non-empty, prepend it to
-the agent prompt as a dedicated section:
-
-```
-## Prior agent notes
-
-<concatenated note file contents>
-```
-
-If no note files exist (or all are empty), **omit the section entirely** — do not add a
-heading with no content.
-
-**Step 3 — dispatch**
-
-Pass the (possibly augmented) prompt to the subagent. The injection is executor-agnostic:
-it works the same for `claude-subagent`, `claude-process`, `aider`, and any other
-executor in the dispatch table below.
+Do not collect or prepend `.lanegate/notes` in this coordinator. The analyze and
+implementation prompt builders inject the canonical global and touch-relevant notes once,
+through `get_bounded_shared_notes`; this keeps the content within its payload budget.
+`_collect_prior_notes` is reserved for hibernation recovery context.
 
 ---
 

@@ -7,7 +7,7 @@ TICKET    PID    STATE    RECONCILIATION
 TICK-150  55130  running  live          
 
 Resolved Dispatch
-TICK-150  driver=codex-implement executor=codex-a model=gpt-5.6-terra
+TICK-150  route=codex-implement executor=codex-a model=gpt-5.6-terra
 
 Activity
 03:15:02  TICK-150  codex-a/gpt-5.6-terra

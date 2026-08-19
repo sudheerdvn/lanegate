@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import importlib
 import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+# Maps each optional module to the pyproject.toml extra that installs it, so
+# the doctor warning can name the exact `pip install lanegate[...]` to run
+# instead of a blanket reinstall (these are opt-in per-language, not core).
+_TREESITTER_MODULES: dict[str, str] = {
+    "tree_sitter_go": "go",
+    "tree_sitter_javascript": "js",
+    "tree_sitter_typescript": "ts",
+    "tree_sitter_rust": "rust",
+    "tree_sitter_java": "java",
+    "tree_sitter_ruby": "ruby",
+    "tree_sitter_c": "c",
+    "tree_sitter_cpp": "cpp",
+    "tree_sitter_php": "php",
+    "tree_sitter_c_sharp": "csharp",
+    "tree_sitter_swift": "swift",
+    "tree_sitter_kotlin": "kotlin",
+}
 
 from lanegate.config import (
     _SCOPED_CLAUDE_HEADLESS_FLAGS,
@@ -14,6 +33,7 @@ from lanegate.config import (
     resolve_executor,
     suggested_safeguards_yaml,
 )
+from lanegate.orchestrate.autofix import combined_mode_capable
 from lanegate.ticket import load_all_tickets
 
 # --permission-mode values that don't block on interactive input. Excludes
@@ -49,6 +69,8 @@ _PY_SECURITY_SOURCE_INSTALL = (
 )
 _PY_SECURITY_SOURCE_INSTALL_CMD = "python3 -m pip install -e '.[security]'"
 
+_DEFAULT_VERSION_TIMEOUT = 3.0
+
 
 @dataclass
 class _Tool:
@@ -60,6 +82,7 @@ class _Tool:
     description: str
     condition: str | None = None
     version_args: tuple[str, ...] = ("--version",)
+    version_timeout: float = _DEFAULT_VERSION_TIMEOUT
 
 
 @dataclass(frozen=True)
@@ -107,6 +130,11 @@ _TOOLS: list[_Tool] = [
             "Darwin": "brew install semgrep  OR  pip install semgrep",
             "Windows": "winget install semgrep  OR  pip install semgrep",
         },
+        # semgrep's Python startup is slower than the other doctor-checked
+        # binaries (native Rust/Go tools); the shared 3s default timeout was
+        # intermittently too tight, reporting a spurious version-check
+        # failure for an install that's actually fine.
+        version_timeout=10.0,
     ),
     _Tool(
         name="gitleaks",
@@ -270,10 +298,14 @@ def _setup_bundle(system: str, *, has_apt: bool | None = None) -> _SetupBundle:
     )
 
 
-def _get_version(binary: str, version_args: tuple[str, ...] = ("--version",)) -> str:
+def _get_version(
+    binary: str,
+    version_args: tuple[str, ...] = ("--version",),
+    timeout: float = _DEFAULT_VERSION_TIMEOUT,
+) -> str:
     try:
         r = subprocess.run(
-            [binary, *version_args], capture_output=True, text=True, encoding="utf-8", timeout=3
+            [binary, *version_args], capture_output=True, text=True, encoding="utf-8", timeout=timeout
         )
         returncode = getattr(r, "returncode", 0)
         if isinstance(returncode, int) and returncode != 0:
@@ -299,7 +331,7 @@ def cmd_doctor(cfg: dict | None = None) -> int:
         cfg = load_config(repo_root)
 
     tickets_dir = Path(repo_root) / cfg.get("tickets_dir", ".lanegate/tickets")
-    _, quarantined = load_all_tickets(tickets_dir, cfg.get("ticket_prefix", "TICK"), cfg)
+    tickets, quarantined = load_all_tickets(tickets_dir, cfg.get("ticket_prefix", "TICK"), cfg)
     if quarantined:
         print(f"\n[doctor] ERROR: {len(quarantined)} ticket(s) failed to parse and are quarantined:")
         for q in quarantined:
@@ -330,7 +362,7 @@ def cmd_doctor(cfg: dict | None = None) -> int:
 
             found = shutil.which(tool.binary) is not None
             if found:
-                version = _get_version(tool.binary, tool.version_args)
+                version = _get_version(tool.binary, tool.version_args, tool.version_timeout)
                 if version:
                     print(f"  ✓  {tool.name:<20} {version}")
                 else:
@@ -413,7 +445,7 @@ def cmd_doctor(cfg: dict | None = None) -> int:
 
     executor = cfg.get("executor", "").lower()
     if executor == "claude":
-        executors_cfg = cfg.get("executors", {})
+        executors_cfg = cfg.get("executors") or {}
         claude_cfg = executors_cfg.get("claude", {})
         flags = claude_cfg.get("flags", [])
         if not _has_headless_permission_config(flags):
@@ -427,13 +459,93 @@ def cmd_doctor(cfg: dict | None = None) -> int:
                   f"({sorted(_NON_INTERACTIVE_PERMISSION_MODES)}), or the")
             print('         bypass flag: flags: ["--dangerously-skip-permissions"]')
 
+    if "architecture_doc" in cfg:
+        print("\n[doctor] WARNING: 'architecture_doc' in .lanegate.yml is deprecated.")
+        print("         Use 'reference_docs' list in .lanegate.yml instead.")
+
+    arch_doc_file = Path(repo_root) / "docs" / "ARCHITECTURE.md"
+    if arch_doc_file.exists() and not cfg.get("reference_docs") and "architecture_doc" not in cfg:
+        print("\n[doctor] WARNING: docs/ARCHITECTURE.md exists on disk but reference_docs is not configured.")
+        print("         Implicit docs/ARCHITECTURE.md injection is no longer supported.")
+        print("         To inject reference docs into prompts, declare them in .lanegate.yml:")
+        print("           reference_docs:")
+        print("             - docs/ARCHITECTURE.md")
+
     if cfg.get("reviewer"):
         implement_driver = resolve_executor(cfg, "implement")
         review_driver = resolve_executor(cfg, "review")
-        if implement_driver == review_driver:
+        if implement_driver == review_driver and combined_mode_capable(implement_driver, cfg):
             print("\n[doctor] WARNING: reviewer resolves identically to the implement executor.")
             print(f"         reviewer: {review_driver!r} == executor: {implement_driver!r}")
             print("         Review will silently run in combined (self-review) mode, not the")
             print("         independent review pipeline — update reviewer or executor in .lanegate.yml.")
+
+    if cfg.get("pools"):
+        executors_cfg = cfg.get("executors") or {}
+        pools_cfg = cfg.get("pools") or {}
+        real_instance_names = sorted({*executors_cfg.keys(), *pools_cfg.keys()})
+        top_executor = cfg.get("executor")
+        top_reviewer = cfg.get("reviewer")
+        for field_name, value in (("executor", top_executor), ("reviewer", top_reviewer)):
+            if value and value not in executors_cfg and value not in pools_cfg:
+                print(f"\n[doctor] WARNING: top-level '{field_name}: {value}' does not name any real executor instance or pool.")
+                print(f"         Real instance names: {', '.join(real_instance_names)}")
+                print("         Per-ticket executor/reviewer pins and default_pool/pools routing")
+                print("         (resolve_pool_executor in orchestrate/loop.py) govern actual dispatch.")
+                print(f"         This field only serves as the resolve_max_parallel_detail (config.py ~L1263)")
+                print("         fallback base and the default for new tickets without a pin.")
+                print(f"         Set '{field_name}' to a real executors[] key or pool name, or remove it.")
+
+    model_without_executor_pin = [
+        ticket
+        for ticket in tickets
+        if ticket.get("model") and not ticket.get("executor")
+    ]
+    if model_without_executor_pin:
+        print("\n[doctor] WARNING: ticket(s) set model: without an executor: pin.")
+        for ticket in model_without_executor_pin:
+            print(
+                f"         {ticket.get('id')}: model={ticket.get('model')!r} "
+                "missing pin: executor"
+            )
+        print("         The implementation/fix step falls back to the project default executor, but")
+        print("         still applies this ticket's model string — a pool-selected driver might not")
+        print("         recognize that model. Review routing uses reviewer:/review_model_pin instead.")
+
+    # Grammars are opt-in per language (pyproject.toml extras), not installed
+    # by default -- so only warn about ones the project actually needs, based
+    # on file extensions found in the repo. Warning about all 12 regardless
+    # of what the project uses would be noise for every single install.
+    from lanegate.analyze import _TS_LANGUAGE_MAP, _is_ignored_analysis_path
+
+    used_extensions: set[str] = set()
+    for src_file in Path(repo_root).rglob("*"):
+        if src_file.suffix in _TS_LANGUAGE_MAP and not _is_ignored_analysis_path(
+            src_file, Path(repo_root)
+        ):
+            used_extensions.add(src_file.suffix)
+            if used_extensions == set(_TS_LANGUAGE_MAP):
+                break
+
+    missing_grammars: dict[str, str] = {}
+    for mod_name, extra in _TREESITTER_MODULES.items():
+        if not any(_TS_LANGUAGE_MAP.get(ext) == mod_name for ext in used_extensions):
+            continue
+        try:
+            importlib.import_module(mod_name)
+        except Exception:
+            missing_grammars[mod_name] = extra
+
+    if missing_grammars:
+        print("\n[doctor] WARNING: missing tree-sitter grammar(s) for languages used in this repo.")
+        print(f"         Unimportable modules: {', '.join(missing_grammars)}")
+        extras = ",".join(sorted(set(missing_grammars.values())))
+        print(f"         AST-quality skeletons/symbol-search for these files will fall back to ripgrep until installed:")
+        print(f"         pip install 'lanegate[{extras}]'")
+
+    from lanegate.pending_globals import check_pending_globals, format_pending_globals_notice
+    pg_info = check_pending_globals(Path(repo_root))
+    if pg_info["has_pending"]:
+        print(f"\n[doctor] {format_pending_globals_notice(pg_info)}")
 
     return 1 if (any_required_missing or quarantined) else 0

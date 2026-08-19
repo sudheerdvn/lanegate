@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -412,6 +413,40 @@ func TestFixtureClient_RunActivityAndAuditFixtures(t *testing.T) {
 	audit, err := fc.GetRunLogs(context.Background(), "current", 0, 1)
 	if err != nil || len(audit.Events) != 1 || audit.TotalCount < 2 || audit.NextOffset == nil {
 		t.Fatalf("GetRunLogs = %+v, %v; want first paginated audit fixture event", audit, err)
+	}
+	if got := audit.Events[0]; got.Level != "info" || got.Kind != "executor" {
+		t.Errorf("audit event metadata = level %q, kind %q; want info, executor", got.Level, got.Kind)
+	}
+	if got := audit.Events[0]; got.Style != "dim" {
+		t.Errorf("audit event style = %q, want dim", got.Style)
+	}
+
+	auditErr, err := fc.GetRunLogs(context.Background(), "current", 2, 1)
+	if err != nil || len(auditErr.Events) != 1 {
+		t.Fatalf("GetRunLogs error event = %+v, %v; want third paginated audit fixture event", auditErr, err)
+	}
+	if got := auditErr.Events[0]; got.Level != "error" || got.Kind != "executor" {
+		t.Errorf("audit error event metadata = level %q, kind %q; want error, executor", got.Level, got.Kind)
+	}
+	if got := auditErr.Events[0]; got.Style != "bold red" {
+		t.Errorf("audit error event style = %q, want bold red", got.Style)
+	}
+
+	basicPage, err := fc.GetRunLogPage(context.Background(), 0, 10)
+	if err != nil || len(basicPage.Events) == 0 {
+		t.Fatalf("GetRunLogPage = %+v, %v; want basic sse fixture events", basicPage, err)
+	}
+	if got := basicPage.Events[0]; got.Level != "info" || got.Kind != "orchestrator" {
+		t.Errorf("basic sse event metadata = level %q, kind %q; want info, orchestrator", got.Level, got.Kind)
+	}
+	if got := basicPage.Events[0]; got.Style != "dim" {
+		t.Errorf("basic sse event style = %q, want dim", got.Style)
+	}
+	if len(basicPage.Events) < 3 {
+		t.Fatalf("expected at least 3 basic sse fixture events, got %d", len(basicPage.Events))
+	}
+	if got := basicPage.Events[2]; got.Style != "bold blue" {
+		t.Errorf("basic sse third event style = %q, want bold blue", got.Style)
 	}
 }
 
@@ -1066,6 +1101,33 @@ func TestFixtureClient_GetRunLogPage_SlicesEventsBySequentialOffset(t *testing.T
 	}
 }
 
+func TestFixtureClient_GetRunLogPage_PreservesSemanticMetadata(t *testing.T) {
+	fixtureDir := t.TempDir()
+	runDir := filepath.Join(fixtureDir, "run")
+	if err := os.Mkdir(runDir, 0o755); err != nil {
+		t.Fatalf("Mkdir run fixture directory: %v", err)
+	}
+	fixture := "id: 1\nevent: log\ndata: {\"id\":\"1\",\"type\":\"log\",\"run_id\":\"run-1\",\"message\":\"executor failed\",\"level\":\"error\",\"kind\":\"executor\"}\n\n"
+	if err := os.WriteFile(filepath.Join(runDir, "events_basic.sse"), []byte(fixture), 0o644); err != nil {
+		t.Fatalf("Write events_basic.sse: %v", err)
+	}
+
+	fc, err := NewFixtureClient(fixtureDir)
+	if err != nil {
+		t.Fatalf("NewFixtureClient: %v", err)
+	}
+	page, err := fc.GetRunLogPage(context.Background(), 0, 1)
+	if err != nil {
+		t.Fatalf("GetRunLogPage: %v", err)
+	}
+	if len(page.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(page.Events))
+	}
+	if got := page.Events[0]; got.Level != "error" || got.Kind != "executor" {
+		t.Errorf("event metadata = level %q, kind %q; want error, executor", got.Level, got.Kind)
+	}
+}
+
 // --- SSE parsing ---
 
 func TestParseSSE_ParsesMultipleFrames(t *testing.T) {
@@ -1113,6 +1175,16 @@ func TestDecodeLogEvent(t *testing.T) {
 	}
 	if ev.Message != "hello" {
 		t.Errorf("Message = %q, want hello", ev.Message)
+	}
+}
+
+func TestDecodeLogEvent_Style(t *testing.T) {
+	ev, err := DecodeLogEvent(SSEEvent{ID: "1", Type: "log", Data: `{"id":"1","message":"@@ -1,2 +1,2 @@","style":"bold red"}`})
+	if err != nil {
+		t.Fatalf("DecodeLogEvent: %v", err)
+	}
+	if ev.Style != "bold red" {
+		t.Errorf("Style = %q, want %q", ev.Style, "bold red")
 	}
 }
 
@@ -1326,6 +1398,28 @@ func TestHTTPClient_GetRunEvents(t *testing.T) {
 	}
 	if payload.RunID != "run-123" || len(payload.Events) != 1 || payload.Events[0].Progress.TestSummary.Passed != 4 {
 		t.Errorf("unexpected payload: %+v", payload)
+	}
+}
+
+// TestNoPrivateTicketReferences guards against private LaneGate ticket IDs
+// (e.g. "TICK-304") leaking into comments in the client package's own
+// source files. Fixture/test data using ticket-shaped IDs (as in the tests
+// above) is exempt; only the non-test source files are scanned.
+func TestNoPrivateTicketReferences(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	ticketRef := regexp.MustCompile(`TICK-\d+`)
+	for _, name := range []string{"types.go", "http.go", "fixtures.go"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		if m := ticketRef.FindString(string(data)); m != "" {
+			t.Errorf("%s contains private ticket reference %q", name, m)
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -34,10 +35,24 @@ import time
 import venv
 from pathlib import Path
 
+# Single source of truth for the inline/sidecar skeleton cutoff lives in
+# executor.py (TICK-315); imported rather than duplicated so this script and
+# the prompt builder can never silently drift apart on what ">10KB" means.
+from lanegate.executor import _SKELETON_INLINE_THRESHOLD_BYTES as SKELETON_INLINE_THRESHOLD_BYTES
+
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "orchestration-smoke-sample"
 DEFAULT_WORK = Path.home() / "ai" / "tests" / "lanegate-e2e"
 DEFAULT_SOURCE = Path(__file__).resolve().parents[1]
 STEP_POLL_TIMEOUT = 600  # 10 min ceiling for a single orchestrate invocation
+
+# TICK-415: paired discovery-guidance A/B test constants. The baseline commit
+# predates the sidecar-contradiction fix (790066d); current main should
+# already have it. A frozen (hand-written, not analyze-generated) ticket with
+# fixed touches is used so both arms dispatch the identical prompt -- a real
+# `analyze` pass could pick different touches run to run.
+DISCOVERY_AB_BASELINE_COMMIT = "d11c02e"
+DISCOVERY_AB_TICKET_ID = "TICK-901"
+DISCOVERY_AB_POOL = "claude-b-only"
 
 
 class SmokeFailure(RuntimeError):
@@ -129,6 +144,9 @@ pools:
   default:
     executors: [claude-a, claude-b]
     strategy: least-loaded
+  claude-b-only:
+    executors: [claude-b]
+    strategy: least-loaded
 default_pool: default
 """
     config_path.write_text(text)
@@ -158,10 +176,18 @@ def verify_ticket_tracked(repo: Path, ticket_id: str) -> None:
         raise SmokeFailure(f"{ticket_id} is not git-tracked (TICK-356 regression)")
 
 
-def orchestrate(bindir: Path, repo: Path, tickets: list[str], max_parallel: int) -> str:
+def orchestrate(
+    bindir: Path,
+    repo: Path,
+    tickets: list[str],
+    max_parallel: int,
+    *,
+    pool: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
     argv = [
         bindir / "lanegate",
-        "orchestrate",
+        "run",
         "--tickets",
         ",".join(tickets),
         "--max",
@@ -169,8 +195,16 @@ def orchestrate(bindir: Path, repo: Path, tickets: list[str], max_parallel: int)
         "--human-review",
         "none",
     ]
+    if pool:
+        argv += ["--pool", pool]
+    run_env = {**os.environ, **env} if env else None
     result = subprocess.run(
-        [str(a) for a in argv], cwd=repo, capture_output=True, text=True, timeout=STEP_POLL_TIMEOUT
+        [str(a) for a in argv],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=STEP_POLL_TIMEOUT,
+        env=run_env,
     )
     output = result.stdout + "\n" + result.stderr
     if result.returncode != 0:
@@ -215,6 +249,214 @@ def assert_sample_suite_green(bindir: Path, repo: Path) -> None:
         raise SmokeFailure(f"sample repo test suite not green after merge:\n{result.stdout[-2000:]}")
 
 
+# ---------------------------------------------------------------------------
+# TICK-415: paired claude discovery-guidance A/B test.
+#
+# TICK-403 dispatched a ticket whose skeleton set was only 6.8KB -- under the
+# 10KB sidecar threshold -- so it never exercised the inline/sidecar branch
+# that 790066d actually fixed. This harness freezes a ticket whose single
+# touched file's own AST skeleton exceeds the threshold and dispatches it via
+# the claude-b-only pool against both a pre-fix baseline commit and current
+# main, checking whether the agent's first tool call is `lanegate symbols`
+# (the fixed guidance) or a native Grep/grep fallback (the TICK-413
+# regression).
+# ---------------------------------------------------------------------------
+
+
+def checkout_baseline(work: Path, source: Path, commit: str) -> Path:
+    """Clone `source` into `work` and check out `commit`, isolated from the
+    live source tree (never a worktree add against it -- this script must
+    not mutate the repo it was invoked from)."""
+    if work.exists():
+        shutil.rmtree(work)
+    run(["git", "clone", "-q", str(source), str(work)], cwd=work.parent, timeout=90)
+    run(["git", "checkout", "-q", commit], cwd=work, timeout=30)
+    return work
+
+
+def freeze_large_skeleton_ticket(repo: Path, ticket_id: str = DISCOVERY_AB_TICKET_ID) -> Path:
+    """Write a ticket directly with fixed touches, skipping `analyze` so both
+    A/B arms dispatch the identical prompt -- a real analyze pass could pick
+    different touches from run to run."""
+    path = repo / ".lanegate" / "tickets" / f"{ticket_id}.md"
+    lines = [
+        "---",
+        f"id: {ticket_id}",
+        "title: Add a round-trip rounding helper to converter/cli.py",
+        "status: open",
+        "touches:",
+        "  - converter/cli.py",
+        "close_criteria: converter/cli.py exposes a round_km_to_miles(km) helper "
+        "used by the km2m branch of main().",
+        "---",
+        "Add a small rounding helper near the existing validators in "
+        "converter/cli.py and use it in the km2m branch of main().",
+        "",
+    ]
+    path.write_text("\n".join(lines))
+    run(["git", "add", "-A"], cwd=repo)
+    run(["git", "commit", "-q", "-m", f"add frozen {ticket_id} for discovery-guidance A/B"], cwd=repo)
+    verify_ticket_tracked(repo, ticket_id)
+    return path
+
+
+def first_tool_call(repo: Path, ticket_id: str) -> dict | None:
+    """Return the first captured tool_use block from the implement step's
+    executor-session.jsonl transcript (see orchestrate/audit.py), or None if
+    no audit bundle/transcript was captured."""
+    bundles_dir = repo / ".lanegate" / "executor-runs" / ticket_id
+    if not bundles_dir.is_dir():
+        return None
+    session_dirs = sorted(
+        (d for d in bundles_dir.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime
+    )
+    for session_dir in reversed(session_dirs):
+        transcript = session_dir / "executor-session.jsonl"
+        if not transcript.is_file():
+            continue
+        for line in transcript.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for block in (entry.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    return {"name": block.get("name"), "input": block.get("input")}
+    return None
+
+
+def _is_symbols_discovery_call(call: dict | None) -> bool:
+    """True for a `lanegate symbols` Bash call (the sidecar-fixed discovery
+    path); False for a Grep tool use or a native grep/rg shell fallback (the
+    TICK-413/790066d regression this A/B test guards against)."""
+    if not call:
+        return False
+    if call.get("name") != "Bash":
+        return False
+    command = str((call.get("input") or {}).get("command", ""))
+    if re.search(r"\bgrep\b", command, re.IGNORECASE):
+        return False
+    return "lanegate symbols" in command
+
+
+def ticket_cost_stats(bindir: Path, repo: Path, ticket_id: str, db_path: Path) -> dict:
+    """Sum turns/cost/cache-token usage across all step_costs rows logged for
+    `ticket_id` in the isolated analytics DB at `db_path`."""
+    script = (
+        "import json, pathlib\n"
+        "from lanegate.context_log import _load_step_costs_from_db, _get_project_id\n"
+        f"project = _get_project_id(pathlib.Path({str(repo)!r}))\n"
+        f"rows = [r for r in _load_step_costs_from_db(pathlib.Path({str(db_path)!r}), project) "
+        f"if r.get('ticket_id') == {ticket_id!r}]\n"
+        "print(json.dumps({\n"
+        "    'turns': sum(r.get('num_turns') or 0 for r in rows),\n"
+        "    'cost_usd': round(sum(r.get('cost_usd') or 0 for r in rows), 4),\n"
+        "    'cache_read_tokens': sum(r.get('cache_read_tokens') or 0 for r in rows),\n"
+        "    'cache_creation_tokens': sum(r.get('cache_creation_tokens') or 0 for r in rows),\n"
+        "    'rows': len(rows),\n"
+        "}))\n"
+    )
+    result = run([bindir / "python", "-c", script], cwd=repo, timeout=30)
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def run_discovery_ab_arm(name: str, arm_dir: Path, source: Path) -> dict:
+    """Run one full A/B arm: fresh venv + sample repo + claude-b-only pool +
+    frozen >10KB-skeleton ticket, dispatched through the real orchestrate
+    pipeline. Returns the captured first tool call, cost stats, and final
+    ticket status."""
+    setup_work_dir(arm_dir)
+    bindir = setup_venv(arm_dir, source)
+    repo = setup_sample_repo(arm_dir)
+    configure_executors(bindir, repo)
+    freeze_large_skeleton_ticket(repo)
+
+    db_path = arm_dir / "analytics.db"
+    orchestrate(
+        bindir,
+        repo,
+        [DISCOVERY_AB_TICKET_ID],
+        max_parallel=1,
+        pool=DISCOVERY_AB_POOL,
+        env={"LANEGATE_ANALYTICS_DB": str(db_path)},
+    )
+    return {
+        "name": name,
+        "tool_call": first_tool_call(repo, DISCOVERY_AB_TICKET_ID),
+        "stats": ticket_cost_stats(bindir, repo, DISCOVERY_AB_TICKET_ID, db_path),
+        "status": ticket_status(repo, DISCOVERY_AB_TICKET_ID),
+    }
+
+
+def assert_symbols_discovery(arm: dict) -> None:
+    call = arm["tool_call"]
+    if not _is_symbols_discovery_call(call):
+        raise SmokeFailure(
+            f"{arm['name']} arm: first tool call was {call!r}, expected a `lanegate symbols` "
+            "Bash call (native Grep/grep fallback -- TICK-413/790066d sidecar-contradiction "
+            "regression)"
+        )
+
+
+def run_discovery_ab(source: Path, work: Path, baseline_commit: str) -> int:
+    """Entry point for `--discovery-ab`: paired dispatch of the frozen
+    >10KB-skeleton ticket against `baseline_commit` and current `source`,
+    asserting only the current-main arm used `lanegate symbols`. The baseline
+    arm is expected to still show the pre-fix grep fallback and is recorded
+    for comparison, not asserted on."""
+    failures: list[tuple[str, str]] = []
+    work.mkdir(parents=True, exist_ok=True)
+
+    baseline_src = _run_check(
+        f"checkout baseline {baseline_commit}",
+        lambda: checkout_baseline(work / "baseline-src", source, baseline_commit),
+        failures,
+    )
+    if baseline_src is None:
+        print("[orchestration-smoke] FAILED checks: checkout baseline", file=sys.stderr)
+        return 1
+
+    baseline_arm = _run_check(
+        f"arm 1/2: baseline {baseline_commit} ({DISCOVERY_AB_POOL}, frozen >10KB-skeleton ticket)",
+        lambda: run_discovery_ab_arm("baseline", work / "baseline-arm", baseline_src),
+        failures,
+    )
+    main_arm = _run_check(
+        f"arm 2/2: current main ({DISCOVERY_AB_POOL}, frozen >10KB-skeleton ticket)",
+        lambda: run_discovery_ab_arm("main", work / "main-arm", source),
+        failures,
+    )
+
+    if main_arm is not None:
+        _run_check(
+            "main arm used `lanegate symbols`, not a native grep fallback",
+            lambda: assert_symbols_discovery(main_arm),
+            failures,
+        )
+
+    for arm in (baseline_arm, main_arm):
+        if arm is None:
+            continue
+        call = arm["tool_call"] or {}
+        stats = arm["stats"]
+        print(
+            f"[orchestration-smoke] {arm['name']:>8}: first_tool={call.get('name')!r} "
+            f"turns={stats['turns']} cost_usd={stats['cost_usd']} "
+            f"cache_read={stats['cache_read_tokens']} cache_creation={stats['cache_creation_tokens']}"
+        )
+
+    print(f"\n[orchestration-smoke] discovery-ab results left under {work}")
+    if failures:
+        names = ", ".join(name for name, _ in failures)
+        print(f"[orchestration-smoke] FAILED checks: {names}", file=sys.stderr)
+        return 1
+    print("[orchestration-smoke] all checks passed")
+    return 0
+
+
 def _run_check(name: str, action, failures: list[tuple[str, str]]):
     print(f"[orchestration-smoke] {name}", flush=True)
     try:
@@ -231,7 +473,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE, help="LaneGate source root to install (default: this repo)")
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK, help="Persistent working directory (default: ~/ai/tests/lanegate-e2e)")
+    parser.add_argument(
+        "--discovery-ab",
+        action="store_true",
+        help=(
+            "TICK-415: instead of the normal 2-phase smoke, run the paired claude "
+            f"discovery-guidance A/B test ({DISCOVERY_AB_POOL} pool, frozen >10KB-skeleton "
+            "ticket) against --baseline and --source, asserting the current-source arm's "
+            "first tool call is `lanegate symbols` rather than a native grep fallback."
+        ),
+    )
+    parser.add_argument(
+        "--baseline",
+        default=DISCOVERY_AB_BASELINE_COMMIT,
+        help=f"Pre-fix commit to compare against with --discovery-ab (default: {DISCOVERY_AB_BASELINE_COMMIT})",
+    )
     args = parser.parse_args()
+
+    if args.discovery_ab:
+        return run_discovery_ab(args.source, args.work_dir, args.baseline)
 
     failures: list[tuple[str, str]] = []
     work = args.work_dir

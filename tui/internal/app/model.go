@@ -23,6 +23,7 @@ const (
 	screenBlocked
 	screenDiff
 	screenRun
+	screenHistory
 	screenSettings
 )
 
@@ -39,6 +40,8 @@ func screenName(s screenID) string {
 		return "Diff"
 	case screenRun:
 		return "Run"
+	case screenHistory:
+		return "Run History"
 	case screenSettings:
 		return "Settings"
 	default:
@@ -94,6 +97,20 @@ type Model struct {
 	// to remain live while an executor is running.
 	runActivityPollGen int
 	runActivityPolling bool
+	// runSummaryReqGen/AppliedGen order the Live Outcomes table's
+	// GET /api/runs/{id}/summary fetches (2s cadence, alongside Activity):
+	// each request captures the next sequence number, and a response is only
+	// applied if its gen is newer than the last one actually applied — one of
+	// these requests can be slow (it enriches every non-success outcome with
+	// on-disk reviewer context) and complete after a later tick's response
+	// already landed, and without this guard the older reply would overwrite
+	// the newer table with stale per-ticket outcomes.
+	runSummaryReqGen     int
+	runSummaryAppliedGen int
+	// runSnapshotReqGen orders GET /api/runs/current responses. The Activity
+	// poll can issue another request before a slow earlier one returns; only
+	// the newest request is allowed to replace the cached run snapshot.
+	runSnapshotReqGen int
 	// runCopyStart is the first body line of an in-progress multi-page copy
 	// selection, or -1 when no range has been marked.
 	runCopyStart int
@@ -118,7 +135,7 @@ func (m *Model) copyRunPaneToClipboard() {
 // of a multi-page copy range.
 func (m *Model) markRunCopyStart() {
 	vp := m.viewportFor(m.currentBody())
-	vp.SetOffset(m.scrollOffsets[screenRun])
+	vp.SetOffset(m.scrollOffsets[m.screen])
 	m.runCopyStart = vp.Offset()
 	m.statusBar.SetInfo("Copy range starts here — scroll to the end, then press y.")
 }
@@ -134,7 +151,7 @@ func (m *Model) copyMarkedRunRangeToClipboard() {
 	body := ansi.Strip(m.currentBody())
 	lines := strings.Split(body, "\n")
 	vp := m.viewportFor(body)
-	vp.SetOffset(m.scrollOffsets[screenRun])
+	vp.SetOffset(m.scrollOffsets[m.screen])
 	end := vp.Offset() + m.bodyHeight()
 	if end > len(lines) {
 		end = len(lines)
@@ -185,6 +202,7 @@ func New(c client.Client) *Model {
 			screenBlocked:  0,
 			screenDiff:     0,
 			screenRun:      0,
+			screenHistory:  0,
 			screenSettings: 0,
 		},
 		board:        screens.NewBoardModel(),
@@ -240,6 +258,7 @@ type runLoadedMsg struct {
 	data           *client.RunPayload
 	err            error
 	autoRefreshing bool
+	gen            int
 }
 
 // runEventsLoadedMsg carries a GET /api/runs/{id}/events result for the
@@ -249,6 +268,18 @@ type runLoadedMsg struct {
 type runEventsLoadedMsg struct {
 	runID string
 	data  *client.RunEventsPayload
+	err   error
+}
+
+// runSummaryLoadedMsg carries a GET /api/runs/{id}/summary result used to
+// populate the Run screen's live, incrementally-updated per-ticket
+// outcome table while the run is still in progress. gen is the request's
+// sequence number (see runSummaryReqGen) so a slower, older request that
+// completes after a newer one cannot clobber the table with stale data.
+type runSummaryLoadedMsg struct {
+	runID string
+	gen   int
+	data  *client.RunSummaryPayload
 	err   error
 }
 
@@ -272,20 +303,22 @@ type runLogsLoadedMsg struct {
 	err   error
 }
 
-// runHistoryPageSize bounds one Activity-history fetch (TICK-304), matching
-// the live tail's own cap (screens.maxLogLines is unexported, but the two
+// runHistoryPageSize bounds one Activity-history fetch, matching the live
+// tail's own cap (screens.maxLogLines is unexported, but the two
 // values are intentionally kept equal) so a page fetch is never larger than
 // what the Run screen already holds in memory for the live tail.
 const runHistoryPageSize = 200
 
 // runLogHistoryMsg carries the result of one GET /api/runs/current/logs
-// page fetch (TICK-304), keyed to the run_id it was requested for so a
+// page fetch, keyed to the run_id it was requested for so a
 // response that arrives after the run has changed can be told apart from a
 // stale one (see screens.RunModel.SetHistoryPage).
 type runLogHistoryMsg struct {
 	runID  string
 	offset int
 	lines  []string
+	levels []string
+	styles []string
 	err    error
 }
 
@@ -295,8 +328,8 @@ type settingsLoadedMsg struct {
 }
 
 // poolsLoadedMsg carries a GET /api/pools result, loaded alongside settings
-// so the Settings screen's pools section (TICK-269) populates on the same
-// screen switch/refresh as the rest of the screen.
+// so the Settings screen's pools section populates on the same screen
+// switch/refresh as the rest of the screen.
 type poolsLoadedMsg struct {
 	data *client.PoolsPayload
 	err  error
@@ -365,9 +398,11 @@ func (m *Model) loadRunActivityRefreshCmd() tea.Cmd {
 
 func (m *Model) loadRunCmdForRefresh(autoRefreshing bool) tea.Cmd {
 	c := m.client
+	m.runSnapshotReqGen++
+	gen := m.runSnapshotReqGen
 	return func() tea.Msg {
 		data, err := c.GetCurrentRun(context.Background())
-		return runLoadedMsg{data: data, err: err, autoRefreshing: autoRefreshing}
+		return runLoadedMsg{data: data, err: err, autoRefreshing: autoRefreshing, gen: gen}
 	}
 }
 
@@ -379,8 +414,8 @@ func (m *Model) loadRunHistoryCmd() tea.Cmd {
 	}
 }
 
-// maybeLoadRunHistoryCmd issues one Activity-history page fetch (TICK-304)
-// if RunModel.HistoryRequest says one is due (not already loading/failed/
+// maybeLoadRunHistoryCmd issues one Activity-history page fetch if
+// RunModel.HistoryRequest says one is due (not already loading/failed/
 // exhausted, and the live tail's boundary is known); otherwise it is a
 // no-op, so callers (a "home" press, an explicit "H" press) can call it
 // unconditionally without duplicating RunModel's own gating logic.
@@ -401,10 +436,14 @@ func (m *Model) maybeLoadRunHistoryCmd() tea.Cmd {
 			return runLogHistoryMsg{runID: runID, offset: offset, err: err}
 		}
 		lines := make([]string, len(page.Events))
+		levels := make([]string, len(page.Events))
+		styles := make([]string, len(page.Events))
 		for i, ev := range page.Events {
 			lines[i] = ev.Message
+			levels[i] = ev.Level
+			styles[i] = ev.Style
 		}
-		return runLogHistoryMsg{runID: runID, offset: offset, lines: lines}
+		return runLogHistoryMsg{runID: runID, offset: offset, lines: lines, levels: levels, styles: styles}
 	}
 }
 
@@ -416,13 +455,25 @@ func (m *Model) loadRunLogsCmd(runID string, offset, limit int) tea.Cmd {
 	}
 }
 
-// loadRunEventsCmd fetches TICK-307 safe structured events for runID ("" for
+// loadRunEventsCmd fetches safe structured events for runID ("" for
 // the live/current run) for the Run screen's default Activity pane.
 func (m *Model) loadRunEventsCmd(runID string) tea.Cmd {
 	c := m.client
 	return func() tea.Msg {
 		data, err := c.GetRunEvents(context.Background(), runID)
 		return runEventsLoadedMsg{runID: runID, data: data, err: err}
+	}
+}
+
+// loadRunSummaryCmd fetches the current run's per-ticket outcome snapshot
+// for the Run screen's live Live Outcomes table.
+func (m *Model) loadRunSummaryCmd(runID string) tea.Cmd {
+	c := m.client
+	m.runSummaryReqGen++
+	gen := m.runSummaryReqGen
+	return func() tea.Msg {
+		data, err := c.GetRunSummary(context.Background(), runID)
+		return runSummaryLoadedMsg{runID: runID, gen: gen, data: data, err: err}
 	}
 }
 
@@ -441,17 +492,14 @@ func (m *Model) ensureRunActivityPolling() tea.Cmd {
 }
 
 // scrollToSelectedRunHistory brings the selected Run History table row into
-// view. Unlike board rows, run IDs have a stable unique rendered token.
+// view. The table's STARTED column no longer echoes the raw run id (it
+// shows a formatted local timestamp instead — see run.go), and the "Selected
+// Run:" detail line below the table always contains the true run id
+// regardless of which row is being scrolled to, so a text search for that
+// id would match the wrong line. Use the table's known fixed layout instead.
 func (m *Model) scrollToSelectedRunHistory() {
-	sel := m.run.SelectedRun()
-	if sel == nil {
-		return
-	}
-	for line, text := range strings.Split(m.currentBody(), "\n") {
-		if strings.Contains(text, sel.RunID) {
-			m.scrollToRenderedLine(line)
-			return
-		}
+	if line, ok := m.run.SelectedRunRenderedLine(); ok {
+		m.scrollToRenderedLine(line)
 	}
 }
 

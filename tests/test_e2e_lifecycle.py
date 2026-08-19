@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import shlex
 import subprocess
@@ -8,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from lanegate.analyze import cmd_analyze
+from lanegate.analyze import _build_file_skeleton, cmd_analyze
+from lanegate.executor import _SKELETON_INLINE_THRESHOLD_BYTES
 from lanegate.lifecycle import (
     cmd_complete,
     cmd_done,
@@ -20,6 +22,17 @@ from lanegate.lifecycle import (
 )
 from lanegate.config import CONFIG_FILENAME, load_config
 from lanegate.ticket import get_ticket_diff, parse_ticket
+
+CI_DIR = Path(__file__).resolve().parents[1] / "ci"
+
+
+def _load_orchestration_smoke():
+    spec = importlib.util.spec_from_file_location(
+        "orchestration_smoke", CI_DIR / "orchestration_smoke.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 TICKET_ID = "TICK-141"
@@ -354,3 +367,34 @@ def test_post_merge_verify_catches_combination_break_and_routes_to_needs_review(
 
     err = capsys.readouterr().err
     assert "post_merge_verify" in err or "post-merge" in err.lower()
+
+
+def test_orchestration_smoke_large_skeleton():
+    """TICK-415: TICK-403's discovery-guidance A/B fixture was only 6.8KB, so
+    it never exercised the >10KB sidecar-contradiction path fixed in
+    790066d. The orchestration-smoke fixture's own AST skeleton must exceed
+    the inline threshold, and the paired A/B harness's tool-call classifier
+    must actually tell a `lanegate symbols` discovery call apart from a
+    native grep fallback. No live executor is dispatched here."""
+    smoke = _load_orchestration_smoke()
+
+    fixture = CI_DIR / "fixtures" / "orchestration-smoke-sample" / "converter" / "cli.py"
+    skeleton = _build_file_skeleton(fixture, fixture.parent)
+    skeleton_bytes = len(skeleton.encode("utf-8"))
+    assert skeleton_bytes > _SKELETON_INLINE_THRESHOLD_BYTES, (
+        f"fixture skeleton is only {skeleton_bytes} bytes, must exceed "
+        f"{_SKELETON_INLINE_THRESHOLD_BYTES} or the A/B test never reaches the "
+        "sidecar code path it exists to cover"
+    )
+    assert smoke.SKELETON_INLINE_THRESHOLD_BYTES == _SKELETON_INLINE_THRESHOLD_BYTES
+
+    symbols_call = {"name": "Bash", "input": {"command": "lanegate symbols converter/cli.py"}}
+    grep_tool_call = {"name": "Grep", "input": {"pattern": "def main"}}
+    grep_bash_call = {"name": "Bash", "input": {"command": "grep -n 'def main' converter/cli.py"}}
+    other_bash_call = {"name": "Bash", "input": {"command": "python -m pytest -q"}}
+
+    assert smoke._is_symbols_discovery_call(symbols_call) is True
+    assert smoke._is_symbols_discovery_call(grep_tool_call) is False
+    assert smoke._is_symbols_discovery_call(grep_bash_call) is False
+    assert smoke._is_symbols_discovery_call(other_bash_call) is False
+    assert smoke._is_symbols_discovery_call(None) is False

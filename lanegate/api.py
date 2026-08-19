@@ -1,5 +1,5 @@
 """
-api.py — loopback-only HTTP server implementing the lanegate API (TICK-107 contract).
+api.py — loopback-only HTTP server implementing the lanegate API.
 
 Routes:
   GET  /api/board              → board state (tickets grouped by status + pipeline)
@@ -7,9 +7,10 @@ Routes:
   GET  /api/tickets/{id}       → full ticket detail (frontmatter, body, review, findings)
   GET  /api/blocked            → blocked/changes-requested review queue
   GET  /api/diff/{ticket_id}   → structured diff for ticket branch vs main
-  POST /api/orchestrate/start  → start an addressable orchestration run
-  POST /api/orchestrate/stop   → request graceful orchestrator shutdown
-  GET  /api/status             → active orchestration status
+  POST /api/runs/start          → start an addressable LaneGate run
+  POST /api/runs/stop           → request graceful run shutdown
+  POST /api/orchestrate/*       → backward-compatible aliases for /api/runs/*
+  GET  /api/status             → active run status
   GET  /api/v1/analyze/status  → active standalone-analysis status
   GET  /api/runs/current       → current API-started run state
   GET  /api/runs/current/logs/stream → SSE stream of run log lines
@@ -26,6 +27,7 @@ import datetime
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -37,12 +39,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from lanegate.executor_events import redact_transcript_text
+from lanegate.logs import semantic_line_metadata
+from lanegate.orchestrate.loop import _pool_state_path
 from lanegate.pidutil import pid_alive
+from lanegate.timeutil import utc_now_iso as _utc_now_iso
 
 _DEFAULT_PORT = 8000
 _BIND_HOST = "127.0.0.1"
 _RUN_STATE_FILE = "api-run-current.json"
 _STREAM_POLL_SECONDS = 0.5
+_API_TOKEN_FILE_PREFIX = "api-token-"
+_API_TOKEN_HEADER = "X-LaneGate-Token"
 
 
 def _json_response(handler: BaseHTTPRequestHandler, data: object, status: int = 200) -> None:
@@ -58,8 +65,20 @@ def _error_response(handler: BaseHTTPRequestHandler, message: str, status: int =
     _json_response(handler, {"error": message}, status)
 
 
-def _utc_now_iso() -> str:
-    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+def _api_token_path(repo_root: Path, port: int) -> Path:
+    """Return the gitignored local token file for one API listener."""
+    return repo_root / ".lanegate" / f"{_API_TOKEN_FILE_PREFIX}{port}"
+
+
+def _write_api_token(repo_root: Path, port: int, token: str) -> Path:
+    """Persist a server token for local native clients with owner-only access."""
+    path = _api_token_path(repo_root, port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as token_file:
+        token_file.write(f"{token}\n")
+    path.chmod(0o600)
+    return path
 
 
 # Config only ever stores *references* to secrets (e.g. api_key_env holds an
@@ -73,7 +92,7 @@ _SAFE_KEY_SUFFIX_RE = re.compile(r"_env$", re.IGNORECASE)
 
 def _redact_secrets(value: object) -> object:
     if isinstance(value, dict):
-        redacted = {}
+        redacted: dict[object, object] = {}
         for k, v in value.items():
             if (
                 isinstance(k, str)
@@ -129,13 +148,9 @@ def _sanitized_config_payload(cfg: dict, repo_root: Path, *, api_host: str, api_
     }
 
 
-def _pool_state_path(repo_root: Path) -> Path:
-    return repo_root / ".lanegate" / "pool_state.json"
-
-
 def _read_pool_state(repo_root: Path) -> dict:
-    """Read the rotation/dispatch state orchestrate persists per pool
-    (TICK-268) so /api/pools can show live load alongside static config."""
+    """Read the rotation/dispatch state the run engine persists per pool
+    so /api/pools can show live load alongside static config."""
     try:
         return json.loads(_pool_state_path(repo_root).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -213,46 +228,67 @@ def _get_resume_watch_status(repo_root: Path) -> dict | None:
 
 
 def _run_payload(repo_root: Path, processes: dict[str, subprocess.Popen], run: dict | None) -> dict:
-    from lanegate.orchestrate import get_orchestration_status
+    from lanegate.analyze import get_active_analysis_status
+    from lanegate.orchestrate import get_all_active_statuses, get_orchestration_status
 
     orchestration = get_orchestration_status(repo_root)
+    active_statuses = get_all_active_statuses(repo_root)
+    analysis = get_active_analysis_status(repo_root)
     resume_watch_status = _get_resume_watch_status(repo_root)
 
-    tickets = [orchestration.get("ticket_id")] if orchestration.get("ticket_id") else []
-    workers = (
-        [
-            {
-                "ticket_id": orchestration.get("ticket_id"),
-                "executor_pid": orchestration.get("executor_pid"),
-                "state": orchestration.get("state"),
-                "reconciliation_state": orchestration.get("reconciliation_state"),
-                "resolved_driver": orchestration.get("resolved_driver"),
-                "resolved_executor": orchestration.get("resolved_executor"),
-                "resolved_model": orchestration.get("resolved_model"),
-                "last_executor_event": orchestration.get("last_executor_event"),
-            }
-        ]
-        if orchestration.get("ticket_id") or orchestration.get("executor_pid")
-        else []
-    )
+    worker_statuses = [
+        s for s in active_statuses
+        if s.get("ticket_id") or s.get("executor_pid")
+    ]
+    if not worker_statuses and (orchestration.get("ticket_id") or orchestration.get("executor_pid")):
+        worker_statuses = [orchestration]
+
+    tickets = list(dict.fromkeys(s["ticket_id"] for s in worker_statuses if s.get("ticket_id")))
+    workers = [
+        {
+            "ticket_id": s.get("ticket_id"),
+            "executor_pid": s.get("executor_pid"),
+            "state": s.get("state"),
+            "reconciliation_state": s.get("reconciliation_state"),
+            "resolved_driver": s.get("resolved_driver"),
+            "resolved_executor": s.get("resolved_executor"),
+            "resolved_model": s.get("resolved_model"),
+            "last_executor_event": s.get("last_executor_event"),
+        }
+        for s in worker_statuses
+    ]
+
 
     if not run:
-        # No run was started through this API instance's own /api/orchestrate
-        # endpoint, but an `orchestrate` process started independently (e.g.
+        # No run was started through this API instance's own /api/runs/start
+        # endpoint, but a `lanegate run` process started independently (e.g.
         # from the CLI) still shows up in `orchestration` via the on-disk
         # executor marker — reflect that instead of always reporting idle,
         # or the Run screen falsely says "no active run" while one is live.
-        active = bool(orchestration.get("active"))
+        lock = orchestration.get("orchestrator_lock") or {}
+        active = bool(orchestration.get("active") or lock.get("held"))
+        state = orchestration.get("state")
+        from lanegate.orchestrate.run_report import _resolve_active_run_session_ts
+
+        # ``executor_session`` identifies a single ticket dispatch, not the
+        # board-clearing run. The Run screen uses this value to request the raw
+        # audit log, so it must be the durable run session instead.
+        run_id = _resolve_active_run_session_ts(repo_root) if active else None
+        if not run_id and active and isinstance(lock.get("pid"), int):
+            run_id = f"orchestrator-{lock['pid']}"
         return {
-            "run_id": orchestration.get("executor_session") if active else None,
-            "status": "running" if active else "idle",
+            "run_id": run_id if active else None,
+            "status": state if active and state in ("running", "between-dispatches") else ("running" if active else "idle"),
             "started_at_iso": orchestration.get("started_at_iso") if active else None,
-            "orchestrator_pid": (orchestration.get("orchestrator_lock") or {}).get("pid") if active else None,
+            "orchestrator_pid": lock.get("pid") if active else None,
             "process_alive": active,
             "tickets": tickets if active else [],
             "workers": workers if active else [],
             "last_event_id": orchestration.get("heartbeat_count") if active else None,
             "orchestration": orchestration,
+            "analysis": analysis,
+            "batch_line": orchestration.get("batch_line") or "",
+            "underfilled_reason": orchestration.get("underfilled_reason"),
             "resume_watch_status": resume_watch_status,
         }
 
@@ -272,7 +308,11 @@ def _run_payload(repo_root: Path, processes: dict[str, subprocess.Popen], run: d
     if payload.get("stop_requested"):
         status = "stopping" if process_alive else "stopped"
     elif process_alive:
-        status = "running"
+        status = (
+            "between-dispatches"
+            if orchestration.get("state") == "between-dispatches"
+            else "running"
+        )
     elif returncode is not None or payload.get("process_exit_code") is not None:
         status = "finished"
     else:
@@ -286,6 +326,9 @@ def _run_payload(repo_root: Path, processes: dict[str, subprocess.Popen], run: d
             "workers": workers,
             "last_event_id": orchestration.get("heartbeat_count"),
             "orchestration": orchestration,
+            "analysis": analysis,
+            "batch_line": orchestration.get("batch_line") or "",
+            "underfilled_reason": orchestration.get("underfilled_reason"),
             "resume_watch_status": resume_watch_status,
         }
     )
@@ -303,8 +346,9 @@ def _with_active_dispatch(ticket: dict, orchestration: dict) -> dict:
     return result
 
 
-def _build_orchestrate_cmd(params: dict) -> list[str]:
-    cmd = [sys.executable, "-m", "lanegate.cli", "orchestrate"]
+def _build_run_cmd(params: dict) -> list[str]:
+    """Build the canonical CLI invocation for an API-started LaneGate run."""
+    cmd = [sys.executable, "-m", "lanegate.cli", "run"]
 
     max_parallel = params.get("max_parallel")
     if max_parallel is not None:
@@ -423,6 +467,7 @@ def _stream_log_events(
             lines = []
         for line in lines[line_no:]:
             line_no += 1
+            message = redact_transcript_text(line)
             if not write_event(
                 {
                     "id": str(line_no),
@@ -430,7 +475,8 @@ def _stream_log_events(
                     "timestamp": _utc_now_iso(),
                     "run_id": payload.get("run_id"),
                     "ticket_id": (payload.get("orchestration") or {}).get("ticket_id"),
-                    "message": redact_transcript_text(line),
+                    "message": message,
+                    **semantic_line_metadata(message),
                     "data": {"path": str(log_path)},
                 }
             ):
@@ -453,10 +499,12 @@ def _stream_log_events(
 def make_handler(
     cfg: dict,
     repo_root: Path,
-    processes: dict[str, subprocess.Popen] | None = None,
+    processes_param: dict[str, subprocess.Popen] | None = None,
+    api_token_param: str | None = None,
 ):
     """Return a BaseHTTPRequestHandler subclass bound to cfg and repo_root."""
-    processes = {} if processes is None else processes
+    processes: dict[str, subprocess.Popen] = {} if processes_param is None else processes_param
+    api_token: str = api_token_param or secrets.token_urlsafe(32)
 
     class _ApiHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -518,7 +566,8 @@ def make_handler(
             path = parsed.path.rstrip("/")
             match = re.match(r"^/api/pools/([^/]+)/executors$", path)
             if match:
-                self._handle_pool_executors_update(match.group(1))
+                if self._authorize_mutation():
+                    self._handle_pool_executors_update(match.group(1))
             else:
                 _error_response(self, "not found", 404)
 
@@ -526,10 +575,12 @@ def make_handler(
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/")
 
-            if path == "/api/orchestrate/start":
-                self._handle_orchestrate_start()
-            elif path == "/api/orchestrate/stop":
-                self._handle_orchestrate_stop()
+            if path in ("/api/runs/start", "/api/orchestrate/start"):
+                if self._authorize_mutation():
+                    self._handle_run_start()
+            elif path in ("/api/runs/stop", "/api/orchestrate/stop"):
+                if self._authorize_mutation():
+                    self._handle_run_stop()
             else:
                 _error_response(self, "not found", 404)
 
@@ -674,6 +725,18 @@ def make_handler(
             from lanegate.orchestrate.run_report import read_executor_events, _resolve_run_session_ts
 
             try:
+                if run_id.startswith("action-"):
+                    # Direct-action logs are already structured JSONL. Expose
+                    # their bounded event projection through the same history
+                    # endpoint used by TUI run detail views.
+                    from lanegate.orchestrate.run_report import read_logs_paginated
+
+                    page = read_logs_paginated(repo_root, run_id, offset=0, limit=1000)
+                    if page is None:
+                        _error_response(self, f"run events not found: {run_id}", 404)
+                    else:
+                        _json_response(self, {"run_id": run_id, "events": page["events"]})
+                    return
                 session_ts = _resolve_run_session_ts(repo_root, None if run_id == "current" else run_id)
                 if not session_ts:
                     _error_response(self, f"run events not found: {run_id}", 404)
@@ -712,18 +775,21 @@ def make_handler(
                     _error_response(self, "no log file available", 404)
                     return
                 page = read_log_page(log_path, offset, limit)
-                events = [
-                    {
-                        "id": str(offset + i + 1),
-                        "type": "log",
-                        "timestamp": _utc_now_iso(),
-                        "run_id": payload.get("run_id"),
-                        "ticket_id": (payload.get("orchestration") or {}).get("ticket_id"),
-                        "message": redact_transcript_text(line),
-                        "data": {"path": str(log_path)},
-                    }
-                    for i, line in enumerate(page["lines"])
-                ]
+                events = []
+                for i, line in enumerate(page["lines"]):
+                    message = redact_transcript_text(line)
+                    events.append(
+                        {
+                            "id": str(offset + i + 1),
+                            "type": "log",
+                            "timestamp": _utc_now_iso(),
+                            "run_id": payload.get("run_id"),
+                            "ticket_id": (payload.get("orchestration") or {}).get("ticket_id"),
+                            "message": message,
+                            **semantic_line_metadata(message),
+                            "data": {"path": str(log_path)},
+                        }
+                    )
                 _json_response(
                     self,
                     {
@@ -791,7 +857,7 @@ def make_handler(
 
         # ── POST handlers ─────────────────────────────────────────────────────
 
-        def _handle_orchestrate_start(self):
+        def _handle_run_start(self):
             body = self._read_body()
             try:
                 params = json.loads(body) if body else {}
@@ -802,7 +868,7 @@ def make_handler(
                 _error_response(self, "request body must be a JSON object", 400)
                 return
 
-            cmd = _build_orchestrate_cmd(params)
+            cmd = _build_run_cmd(params)
             run_id = f"run-{datetime.datetime.now(datetime.UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
 
             try:
@@ -834,7 +900,7 @@ def make_handler(
             data = _run_payload(repo_root, processes, run)
             _json_response(self, data)
 
-        def _handle_orchestrate_stop(self):
+        def _handle_run_stop(self):
             from lanegate.concurrency import orchestrator_lock_status
 
             try:
@@ -910,6 +976,14 @@ def make_handler(
 
         # ── helpers ───────────────────────────────────────────────────────────
 
+        def _authorize_mutation(self) -> bool:
+            """Reject unauthenticated writes before handlers inspect their bodies."""
+            supplied = self.headers.get(_API_TOKEN_HEADER)
+            if not supplied or not secrets.compare_digest(supplied, api_token):
+                _error_response(self, "missing or invalid API token", 401)
+                return False
+            return True
+
         def _read_body(self) -> bytes:
             length = int(self.headers.get("Content-Length", 0))
             return self.rfile.read(length) if length else b""
@@ -927,10 +1001,15 @@ class LaneGateApiServer:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._processes: dict[str, subprocess.Popen] = {}
+        self._api_token = secrets.token_urlsafe(32)
+        self.token_path: Path | None = None
 
     def start(self) -> None:
-        handler = make_handler(self.cfg, self.repo_root, self._processes)
+        handler = make_handler(self.cfg, self.repo_root, self._processes, self._api_token)
         self._server = ThreadingHTTPServer((_BIND_HOST, self.port), handler)
+        self.token_path = _write_api_token(
+            self.repo_root, self._server.server_address[1], self._api_token
+        )
         self._thread = threading.Thread(
             target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         )
@@ -943,8 +1022,11 @@ class LaneGateApiServer:
 
     def serve_forever(self) -> None:
         """Block the calling thread, serving requests until KeyboardInterrupt."""
-        handler = make_handler(self.cfg, self.repo_root, self._processes)
+        handler = make_handler(self.cfg, self.repo_root, self._processes, self._api_token)
         self._server = ThreadingHTTPServer((_BIND_HOST, self.port), handler)
+        self.token_path = _write_api_token(
+            self.repo_root, self._server.server_address[1], self._api_token
+        )
         print(
             f"lanegate api: listening on {_BIND_HOST}:{self.port} (loopback only)",
             file=sys.stderr,

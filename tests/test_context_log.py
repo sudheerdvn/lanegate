@@ -5,6 +5,7 @@ tests/test_context_log.py — Unit tests for lanegate.context_log
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,11 +16,17 @@ from lanegate.context_log import (
     _is_legacy_imported,
     _load_entries_from_db,
     _load_step_costs_from_db,
+    _local_day,
+    _print_basic_table,
+    _print_by_day,
+    _print_compare,
+    _real_executor_by_ticket,
     _upsert_row,
     cmd_context_stats,
     cmd_log_backfill,
     compute_stats,
     compute_step_cost_stats,
+    get_ticket_executor,
     load_entries_for_analytics,
     log_agent_run,
     log_step_cost,
@@ -34,6 +41,25 @@ from lanegate.executor import (
     parse_structured_result,
 )
 from lanegate.lifecycle import _get_branch_wall_time_ms, _get_touched_files
+
+
+@pytest.fixture(autouse=True)
+def fixture_project_root(tmp_path, monkeypatch):
+    """Prevent payload analytics from discovering real tickets via Path.cwd()."""
+    monkeypatch.chdir(tmp_path)
+
+
+def test_default_analytics_root_is_fixture_root(tmp_path):
+    """Default analytics discovery reads the fixture tickets directory."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    tickets_dir = tmp_path / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+    with patch("lanegate.ticket.load_all_tickets", return_value=[]) as load_tickets:
+        compute_payload_composition_stats()
+
+    assert load_tickets.call_args.args[0] == tickets_dir
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -337,6 +363,32 @@ def test_cmd_context_stats_table_and_totals(tmp_path: Path, capsys: pytest.Captu
     assert "50,210" in out
 
 
+def test_print_basic_table_with_step_costs_shows_real_numbers_not_dashes(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The bug this fixes: with step_costs data available, per-ticket rows
+    show real tokens/cost instead of the '—'/0 the dead subagent_tokens
+    channel produced for every ticket (TICK-488)."""
+    entries = [{"ticket_id": "TICK-480"}, {"ticket_id": "TICK-481"}]
+    step_costs = [
+        {"ticket_id": "TICK-480", "step": "implement", "input_tokens": 1000, "output_tokens": 200, "cost_usd": 0.05},
+        {"ticket_id": "TICK-481", "step": "implement", "input_tokens": 500, "output_tokens": 100, "cost_usd": 0.03},
+    ]
+
+    _print_basic_table(entries, step_costs=step_costs)
+    out = capsys.readouterr().out
+
+    assert "TICK-480" in out
+    assert "TICK-481" in out
+    assert "1,200" in out  # TICK-480 total tokens
+    assert "$0.05" in out
+    assert "TOTAL" in out
+    assert "$0.08" in out  # combined total cost
+    # the old broken table's columns must not appear
+    assert "Work tokens" not in out
+    assert "Compression" not in out
+
+
 # ---------------------------------------------------------------------------
 # cmd_context_stats(full=True) — extended panels
 # ---------------------------------------------------------------------------
@@ -524,6 +576,10 @@ def test_cmd_context_stats_compare_groups_by_executor_model(
     assert "aider" in out
     assert "gpt-4o" in out
 
+    # header columns present
+    assert "cost" in out
+    assert "tokens" in out
+
     # avg work tok for claude-subagent: (28656+21554)//2 = 25105
     assert "25,105" in out
 
@@ -532,6 +588,317 @@ def test_cmd_context_stats_compare_groups_by_executor_model(
 
     # pass rate for claude-subagent: 2/2 = 100%
     assert "100%" in out
+
+
+def test_cmd_context_stats_compare_with_step_costs(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--compare uses step_costs to show real aggregated cost and token usage."""
+    db_path = tmp_path / "analytics.db"
+    monkeypatch.setenv("LANEGATE_CONTEXT_LOG_DB", str(db_path))
+
+    log_file = tmp_path / "context.jsonl"
+    records = [
+        {
+            "project": "proj",
+            "ticket_id": "TICK-100",
+            "subagent_tokens": 10000,
+            "summary_tokens": 100,
+            "wall_time_ms": 1000,
+            "tool_uses": 5,
+            "duration_ms": 900,
+            "executor": "claude-b",
+            "model": "claude-3-5-sonnet",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T10:00:00Z",
+        },
+        {
+            "project": "proj",
+            "ticket_id": "TICK-101",
+            "subagent_tokens": 8000,
+            "summary_tokens": 100,
+            "wall_time_ms": 900,
+            "tool_uses": 4,
+            "duration_ms": 800,
+            "executor": "codex",
+            "model": "gpt-5-codex",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T11:00:00Z",
+        },
+    ]
+    _write_records(log_file, records)
+
+    log_step_cost(
+        db_path,
+        "proj",
+        "TICK-100",
+        "implement",
+        executor="claude-b",
+        model="claude-3-5-sonnet",
+        input_tokens=1500,
+        output_tokens=300,
+        cost_usd=0.05,
+    )
+
+    step_costs = _load_step_costs_from_db(db_path)
+    cmd_context_stats(log_file, compare=True, step_costs=step_costs)
+    out = capsys.readouterr().out
+
+    assert "claude-b" in out
+    assert "$0.0500" in out
+    assert "1,800" in out
+
+
+def test_cmd_context_stats_compare_explicit_log_does_not_cross_contaminate_with_db(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit JSONL log comparisons do not query DB or cross-contaminate ticket executors."""
+    db_path = tmp_path / "analytics.db"
+    monkeypatch.setenv("LANEGATE_CONTEXT_LOG_DB", str(db_path))
+
+    log_file = tmp_path / "context.jsonl"
+    records = [
+        {
+            "project": "proj",
+            "ticket_id": "TICK-100",
+            "subagent_tokens": 10000,
+            "summary_tokens": 100,
+            "wall_time_ms": 1000,
+            "tool_uses": 5,
+            "duration_ms": 900,
+            "executor": "claude-b",
+            "model": "claude-3-5-sonnet",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T10:00:00Z",
+        },
+        {
+            "project": "proj",
+            "ticket_id": "TICK-101",
+            "subagent_tokens": 8000,
+            "summary_tokens": 100,
+            "wall_time_ms": 900,
+            "tool_uses": 4,
+            "duration_ms": 800,
+            "executor": "codex",
+            "model": "gpt-5-codex",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T11:00:00Z",
+        },
+    ]
+    _write_records(log_file, records)
+
+    # DB has contradictory data for TICK-100
+    log_step_cost(
+        db_path,
+        "proj",
+        "TICK-100",
+        "implement",
+        executor="different-executor",
+        model="different-model",
+        input_tokens=99999,
+        output_tokens=99999,
+        cost_usd=99.0,
+    )
+
+    # Calling cmd_context_stats with explicit log file and compare=True does NOT load DB
+    cmd_context_stats(log_file, compare=True)
+    out = capsys.readouterr().out
+
+    assert "claude-b" in out
+    assert "codex" in out
+    assert "different-executor" not in out
+
+
+def test_cmd_context_stats_compare_multi_attempt_step_costs_isolated_by_executor(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """When a ticket has multiple step_cost attempts by different executors, costs are strictly partitioned."""
+    db_path = tmp_path / "analytics.db"
+
+    log_file = tmp_path / "context.jsonl"
+    records = [
+        {
+            "project": "proj",
+            "ticket_id": "TICK-100",
+            "subagent_tokens": 10000,
+            "summary_tokens": 100,
+            "wall_time_ms": 1000,
+            "tool_uses": 5,
+            "duration_ms": 900,
+            "executor": "claude-b",
+            "model": "claude-3-5-sonnet",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T10:00:00Z",
+        },
+        {
+            "project": "proj",
+            "ticket_id": "TICK-101",
+            "subagent_tokens": 8000,
+            "summary_tokens": 100,
+            "wall_time_ms": 900,
+            "tool_uses": 4,
+            "duration_ms": 800,
+            "executor": "codex",
+            "model": "gpt-5-codex",
+            "tests_passed": True,
+            "timestamp": "2026-06-20T11:00:00Z",
+        },
+    ]
+    _write_records(log_file, records)
+
+    # TICK-100 has a first attempt by a different executor that failed
+    log_step_cost(
+        db_path,
+        "proj",
+        "TICK-100",
+        "implement",
+        executor="failed-executor",
+        model="failed-model",
+        input_tokens=5000,
+        output_tokens=1000,
+        cost_usd=0.10,
+    )
+    # TICK-100 final attempt by claude-b
+    log_step_cost(
+        db_path,
+        "proj",
+        "TICK-100",
+        "implement",
+        executor="claude-b",
+        model="claude-3-5-sonnet",
+        input_tokens=1000,
+        output_tokens=200,
+        cost_usd=0.03,
+    )
+    # TICK-101 by codex
+    log_step_cost(
+        db_path,
+        "proj",
+        "TICK-101",
+        "implement",
+        executor="codex",
+        model="gpt-5-codex",
+        input_tokens=2000,
+        output_tokens=400,
+        cost_usd=0.07,
+    )
+
+    step_costs = _load_step_costs_from_db(db_path)
+    cmd_context_stats(log_file, compare=True, step_costs=step_costs)
+    out = capsys.readouterr().out
+
+    assert "claude-b" in out
+    assert "$0.0300" in out
+    assert "codex" in out
+    assert "$0.0700" in out
+    assert "failed-executor" not in out
+
+
+def test_real_executor_by_ticket_prefers_implement_step() -> None:
+    step_costs = [
+        {"project": "org/repo", "ticket_id": "TICK-1", "step": "analyze", "executor": "claude-a", "timestamp": "t1"},
+        {"project": "org/repo", "ticket_id": "TICK-1", "step": "implement", "executor": "claude-b", "timestamp": "t2"},
+        {"project": "org/repo", "ticket_id": "TICK-2", "step": "fix", "executor": "codex", "timestamp": "t1"},
+    ]
+    result = _real_executor_by_ticket(step_costs)
+    assert result == {("org/repo", "TICK-1"): "claude-b", ("org/repo", "TICK-2"): "codex"}
+
+
+def test_real_executor_by_ticket_ignores_review_and_drift_check_rows() -> None:
+    """review/drift_check are dispatched to a deliberately *different*,
+    independent executor instance -- a ticket implemented by aider but
+    reviewed by claude-a must not be attributed to claude-a (TICK-549
+    review round 3 finding)."""
+    step_costs = [
+        {"project": "org/repo", "ticket_id": "TICK-1", "step": "review", "executor": "claude-a", "timestamp": "t1"},
+        {"project": "org/repo", "ticket_id": "TICK-1", "step": "drift_check", "executor": "codex", "timestamp": "t2"},
+    ]
+    result = _real_executor_by_ticket(step_costs)
+    assert result == {}
+
+
+def test_real_executor_by_ticket_does_not_collide_across_projects() -> None:
+    """Ticket ids are per-project sequential and collide across projects --
+    keying on ticket_id alone would let one project's real executor bleed
+    into another's identically-numbered ticket (TICK-549 review finding)."""
+    step_costs = [
+        {"project": "org/alpha", "ticket_id": "TICK-100", "step": "implement", "executor": "claude-b", "timestamp": "2026-06-20T10:00:00Z"},
+        {"project": "org/beta", "ticket_id": "TICK-100", "step": "implement", "executor": "codex", "timestamp": "2026-07-01T10:00:00Z"},
+    ]
+    result = _real_executor_by_ticket(step_costs)
+    assert result == {("org/alpha", "TICK-100"): "claude-b", ("org/beta", "TICK-100"): "codex"}
+
+
+def test_print_compare_resolves_executor_from_step_costs(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """--compare must not trust the analytics table's own (often wrong)
+    per-ticket executor guess: TICK-549 found production tickets actually
+    driven by claude-a/claude-b logged in the analytics table under the
+    project's static default executor (here 'codex') instead. When
+    step_costs is available it is authoritative."""
+    entries = [
+        {
+            "ticket_id": "TICK-100",
+            "executor": "codex",  # analytics table's wrong per-ticket guess
+            "model": "",
+            "subagent_tokens": 10000,
+            "wall_time_ms": 1000,
+            "tests_passed": True,
+        },
+        {
+            "ticket_id": "TICK-101",
+            "executor": "codex",
+            "model": "gpt-5-codex",
+            "subagent_tokens": 8000,
+            "wall_time_ms": 900,
+            "tests_passed": True,
+        },
+    ]
+    step_costs = [
+        {
+            "ticket_id": "TICK-100",
+            "step": "implement",
+            "executor": "claude-b",
+            "timestamp": "2026-06-20T10:00:00Z",
+        },
+    ]
+
+    _print_compare(entries, step_costs=step_costs)
+    out = capsys.readouterr().out
+
+    assert "claude-b" in out
+    assert "codex" in out
+    # TICK-100 must be bucketed under claude-b, not codex: only TICK-101
+    # remains in the codex/gpt-5-codex group.
+    codex_line = next(line for line in out.splitlines() if line.startswith("codex"))
+    assert codex_line.split()[2] == "1"
+
+
+def test_print_compare_blank_executor_buckets_as_claude(
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A row whose stored executor is '' or absent (e.g. an _import_legacy'd
+    entry, or a partial cmd_log_backfill call) buckets under 'claude', not a
+    blank-labeled row -- and with no step_costs data to resolve it from,
+    _print_compare's own e.get("executor") or "claude" fallback is what
+    catches it (TICK-549)."""
+    entries = [
+        {"ticket_id": "TICK-1", "executor": "", "model": "", "tests_passed": True},
+        {"ticket_id": "TICK-2", "model": "", "tests_passed": True},  # key omitted entirely
+        {"ticket_id": "TICK-3", "executor": "codex", "model": "", "tests_passed": True},
+    ]
+
+    _print_compare(entries)
+    out = capsys.readouterr().out
+
+    lines = out.splitlines()
+    sep_idx = next(i for i, line in enumerate(lines) if line.startswith("---"))
+    data_lines = [line for line in lines[sep_idx + 1 :] if line.strip()]
+    # Exactly two groups: no separate blank-labeled bucket for TICK-1/TICK-2.
+    assert {line.split()[0] for line in data_lines} == {"claude", "codex"}
+    claude_line = next(line for line in data_lines if line.startswith("claude "))
+    assert claude_line.split()[1] == "2"
 
 
 def test_cmd_context_stats_compare_single_executor(
@@ -609,6 +976,57 @@ def test_cmd_context_stats_compare_null_tokens_shows_dash(
     # human row should show — for avg work tok
     assert "human" in out
     assert "—" in out
+
+
+# ---------------------------------------------------------------------------
+# _local_day / _print_by_day — real cost grouped by operator-local day
+# ---------------------------------------------------------------------------
+
+
+def test_local_day_converts_utc_to_pacific_crossing_midnight() -> None:
+    """A UTC timestamp shortly after UTC midnight is still the *previous*
+    Pacific day -- grouping by raw UTC date would misattribute it."""
+    # 2026-08-13T05:30:00Z is 2026-08-12T22:30:00 in America/Los_Angeles (PDT, UTC-7).
+    assert _local_day("2026-08-13T05:30:00Z") == "2026-08-12"
+    # 2026-08-12T20:00:00Z is 2026-08-12T13:00:00 local -- same UTC and local day.
+    assert _local_day("2026-08-12T20:00:00Z") == "2026-08-12"
+
+
+def test_local_day_unparseable_returns_placeholder() -> None:
+    assert _local_day("not-a-timestamp") == "?"
+    assert _local_day("") == "?"
+
+
+def test_print_by_day_groups_across_utc_date_boundary(capsys: pytest.CaptureFixture) -> None:
+    """Two dispatches on different UTC calendar dates that are the same
+    Pacific day must land in one row, not two (the bug this feature fixes)."""
+    step_costs = [
+        {"ticket_id": "TICK-A", "cost_usd": 1.0, "timestamp": "2026-08-12T20:00:00Z"},
+        {"ticket_id": "TICK-B", "cost_usd": 2.0, "timestamp": "2026-08-13T05:30:00Z"},
+        {"ticket_id": "TICK-C", "cost_usd": 5.0, "timestamp": "2026-08-13T20:00:00Z"},
+    ]
+
+    _print_by_day(step_costs)
+
+    out = capsys.readouterr().out
+    assert "=== Real Cost by Day (America/Los_Angeles) ===" in out
+
+    lines = {line.split()[0]: line for line in out.splitlines() if line.split()[:1] and line.split()[0].startswith("2026-")}
+    assert "2026-08-12" in lines
+    assert "2026-08-13" in lines
+    # 08-12 local day got both TICK-A and TICK-B (2 dispatches, $3.00)
+    assert lines["2026-08-12"].split()[1] == "2"
+    assert "3.00" in lines["2026-08-12"]
+    # 08-13 local day got only TICK-C (1 dispatch, $5.00)
+    assert lines["2026-08-13"].split()[1] == "1"
+    assert "5.00" in lines["2026-08-13"]
+    assert "8.00" in out.rsplit("\n", 2)[-2]  # TOTAL row has the grand total
+
+
+def test_print_by_day_empty_shows_message(capsys: pytest.CaptureFixture) -> None:
+    _print_by_day([])
+    out = capsys.readouterr().out
+    assert "No step-cost data logged yet." in out
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +1183,61 @@ def test_compute_stats_cost_trend_none_below_minimum() -> None:
 
 
 # ---------------------------------------------------------------------------
+# compute_stats(step_cost_entries=...) — real step_costs grounding (TICK-488)
+# ---------------------------------------------------------------------------
+
+_STEP_COST_FIXTURE = [
+    {"ticket_id": "TICK-100", "step": "implement", "input_tokens": 1000, "output_tokens": 200, "cost_usd": 0.05},
+    {"ticket_id": "TICK-100", "step": "review", "input_tokens": 300, "output_tokens": 50, "cost_usd": 0.02},
+    {"ticket_id": "TICK-101", "step": "implement", "input_tokens": 500, "output_tokens": 100, "cost_usd": 0.03},
+]
+
+
+def test_compute_stats_ignores_step_costs_when_not_passed() -> None:
+    """Without step_cost_entries, compute_stats is 100% unchanged (legacy path)."""
+    result = compute_stats(_FIXTURE)
+    assert result["verdict"]["grounded"] is False
+    assert result["verdict"]["label"] == "PAYING OFF"
+    assert result["tickets"][0]["work_tokens"] == 28656
+
+
+def test_compute_stats_per_ticket_rollup_from_step_costs() -> None:
+    """tickets rolls up real per-ticket token/cost totals from step_costs,
+    even though the fixture's own subagent_tokens/summary_tokens are empty --
+    the real numbers don't depend on that dead channel at all."""
+    entries = [{"ticket_id": "TICK-100"}, {"ticket_id": "TICK-101"}]
+    result = compute_stats(entries, step_cost_entries=_STEP_COST_FIXTURE)
+    tickets = {t["ticket_id"]: t for t in result["tickets"]}
+    assert tickets["TICK-100"]["total_tokens"] == 1000 + 200 + 300 + 50
+    assert tickets["TICK-100"]["total_cost_usd"] == 0.07
+    assert tickets["TICK-100"]["dispatches"] == 2
+    assert tickets["TICK-101"]["total_tokens"] == 500 + 100
+    assert tickets["TICK-101"]["total_cost_usd"] == 0.03
+    assert tickets["TICK-101"]["dispatches"] == 1
+
+
+def test_compute_stats_verdict_grounded_in_step_costs_not_fabricated() -> None:
+    """When step_cost_entries is given, the verdict is a factual real-cost
+    summary -- no NOT WORTH IT/BREAK-EVEN/PAYING OFF label fabricated from a
+    comparison baseline that doesn't exist in the data."""
+    entries = [{"ticket_id": "TICK-100", "subagent_tokens": None}, {"ticket_id": "TICK-101", "subagent_tokens": None}]
+    result = compute_stats(entries, step_cost_entries=_STEP_COST_FIXTURE)
+    verdict = result["verdict"]
+    assert verdict["grounded"] is True
+    assert "label" not in verdict
+    assert verdict["total_cost_usd"] == 0.10
+    assert verdict["avg_cost_per_ticket_usd"] == 0.05
+    assert "$0.10 real cost across 2 tickets" in verdict["detail"]
+
+
+def test_compute_stats_verdict_not_grounded_when_step_costs_empty() -> None:
+    """An empty (not None) step_cost_entries list falls back to the legacy
+    path rather than claiming to be grounded in zero real data."""
+    result = compute_stats(_FIXTURE, step_cost_entries=[])
+    assert result["verdict"]["grounded"] is False
+
+
+# ---------------------------------------------------------------------------
 # stats_json — JSON contract
 # ---------------------------------------------------------------------------
 
@@ -852,6 +1325,83 @@ def test_cli_analytics_json_empty_log(tmp_path: Path) -> None:
     assert parsed == {"has_entries": False}
 
 
+def test_cli_analytics_shows_prompt_payload_composition_table(tmp_path: Path) -> None:
+    """lgt analytics output includes the per-step Prompt Payload Composition table."""
+    from unittest.mock import patch
+    from lanegate import cli
+
+    log_file = tmp_path / "ctx.jsonl"
+    _write_records(log_file, _FIXTURE)
+
+    captured = []
+    with (
+        patch("sys.argv", ["lanegate", "analytics", "--log", str(log_file)]),
+        patch("builtins.print", side_effect=lambda *a, **k: captured.append(" ".join(str(x) for x in a))),
+    ):
+        cli.main()
+
+    output = "\n".join(captured)
+    assert "Prompt Payload Composition" in output
+    assert "% Prompt" in output or "Mean B" in output
+    assert "instruction-template" in output
+
+
+def test_compute_payload_composition_stats_aggregates_metrics(tmp_path: Path) -> None:
+    """compute_payload_composition_stats aggregates per-step component metrics."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    ticket = {
+        "id": "TICK-101",
+        "title": "Test payload composition",
+        "touches": ["lanegate/cli.py"],
+        "close_criteria": "Done.",
+        "_body": "Implement prompt composition.",
+    }
+
+    stats = compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path)
+    assert "steps" in stats
+    steps = stats["steps"]
+    assert "implement" in steps
+    assert "analyze" in steps
+    assert "review" in steps
+    assert "fix" in steps
+
+    impl_step = steps["implement"]
+    assert "total_bytes_mean" in impl_step
+    assert impl_step["total_bytes_mean"] > 0
+    comps = impl_step["components"]
+    assert len(comps) > 0
+    for c in comps:
+        assert "label" in c
+        assert "mean_bytes" in c
+        assert "median_bytes" in c
+        assert "max_bytes" in c
+        assert "tokens_est" in c
+        assert "pct_of_prompt" in c
+        assert "reason" in c
+
+
+def test_cli_analytics_json_includes_payload_composition(tmp_path: Path) -> None:
+    """lgt analytics --json output includes payload_composition field."""
+    import json
+    from unittest.mock import patch
+    from lanegate import cli
+
+    log_file = tmp_path / "ctx.jsonl"
+    _write_records(log_file, _FIXTURE)
+
+    captured = []
+    with (
+        patch("sys.argv", ["lanegate", "analytics", "--json", "--log", str(log_file)]),
+        patch("builtins.print", side_effect=lambda *a, **k: captured.append(a[0] if a else "")),
+    ):
+        cli.main()
+
+    parsed = json.loads(captured[0])
+    assert "payload_composition" in parsed
+    assert "steps" in parsed["payload_composition"]
+
+
 def test_cli_context_stats_alias_still_works(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """context-stats alias produces same text output as before."""
     from unittest.mock import patch
@@ -927,6 +1477,23 @@ def test_sqlite_upsert_and_load(tmp_path: Path) -> None:
     assert e["subagent_tokens"] == 12000
     assert e["tests_passed"] is True
     assert e["project"] == "org/repo"
+
+
+def test_sqlite_upsert_missing_executor_defaults_to_claude(tmp_path: Path) -> None:
+    """A row with no 'executor' key (or an explicitly blank one) is stored as
+    'claude', matching log_agent_run's own default and _print_compare's
+    grouping default, instead of a bare empty string (TICK-549)."""
+    db = tmp_path / "analytics.db"
+    _upsert_row(db, "org/repo", {"ticket_id": "TICK-001", "timestamp": "2026-06-20T10:00:00Z"})
+    _upsert_row(
+        db,
+        "org/repo",
+        {"ticket_id": "TICK-002", "executor": "", "timestamp": "2026-06-20T10:00:00Z"},
+    )
+
+    entries = {e["ticket_id"]: e for e in _load_entries_from_db(db, project="org/repo")}
+    assert entries["TICK-001"]["executor"] == "claude"
+    assert entries["TICK-002"]["executor"] == "claude"
 
 
 def test_sqlite_upsert_replaces_on_same_pk(tmp_path: Path) -> None:
@@ -1483,11 +2050,15 @@ _CODEX_PONG_JSONL = "\n".join(
 def test_parse_codex_json_result_real_sample() -> None:
     parsed = parse_codex_json_result(_CODEX_PONG_JSONL)
     assert parsed["result_text"] == "pong"
-    assert parsed["input_tokens"] == 13142
+    assert parsed["input_tokens"] == 13142  # already uncached: cached_input_tokens is 0 here
     assert parsed["output_tokens"] == 5  # 5 output + 0 reasoning
     assert parsed["cache_read_tokens"] == 0
     assert parsed["cache_creation_tokens"] == 0
-    assert parsed["cost_usd"] is None  # codex reports no dollar figure
+    assert parsed["num_turns"] == 1
+    # Codex reports no dollar figure itself; lanegate estimates one from the
+    # normalized token counts so the step is not silently free in analytics.
+    assert parsed["cost_usd"] is not None
+    assert parsed["cost_usd"] > 0
 
 
 def test_parse_codex_json_result_sums_reasoning_into_output_tokens() -> None:
@@ -1681,6 +2252,54 @@ def test_log_step_cost_appends_does_not_overwrite(tmp_path: Path) -> None:
     assert {r["step"] for r in rows} == {"analyze", "implement", "review"}
 
 
+def test_get_ticket_executor_prefers_implement_step(tmp_path: Path) -> None:
+    """get_ticket_executor() picks the ticket's real implement-step executor
+    over an earlier analyze-step dispatch that used a different one."""
+    db = tmp_path / "analytics.db"
+    log_step_cost(db, "proj", "TICK-1", "analyze", executor="claude-a", cost_usd=0.01)
+    log_step_cost(db, "proj", "TICK-1", "implement", executor="claude-b", cost_usd=0.05)
+
+    assert get_ticket_executor(db, "proj", "TICK-1") == "claude-b"
+
+
+def test_get_ticket_executor_falls_back_to_latest_fix_row(tmp_path: Path) -> None:
+    """With no implement-step row, the most recent *fix* row wins -- fix is
+    implementer-owned work (resolve_driver routes it the same way as
+    implement), unlike review/drift_check."""
+    db = tmp_path / "analytics.db"
+    log_step_cost(
+        db, "proj", "TICK-1", "fix", executor="agy", timestamp="2026-06-20T10:00:00Z"
+    )
+    log_step_cost(
+        db, "proj", "TICK-1", "fix", executor="claude-b", timestamp="2026-06-20T11:00:00Z"
+    )
+
+    assert get_ticket_executor(db, "proj", "TICK-1") == "claude-b"
+
+
+def test_get_ticket_executor_ignores_review_and_drift_check_rows(tmp_path: Path) -> None:
+    """review and drift_check are dispatched to a deliberately *different*,
+    independent executor instance (resolve_driver) -- a ticket implemented
+    by aider but reviewed by claude-a must not be attributed to claude-a."""
+    db = tmp_path / "analytics.db"
+    log_step_cost(
+        db, "proj", "TICK-1", "review", executor="claude-a", timestamp="2026-06-20T10:00:00Z"
+    )
+    log_step_cost(
+        db, "proj", "TICK-1", "drift_check", executor="codex", timestamp="2026-06-20T11:00:00Z"
+    )
+
+    assert get_ticket_executor(db, "proj", "TICK-1") is None
+
+
+def test_get_ticket_executor_none_when_no_rows(tmp_path: Path) -> None:
+    db = tmp_path / "analytics.db"
+    log_step_cost(db, "proj", "TICK-1", "implement", executor="claude", cost_usd=0.01)
+
+    assert get_ticket_executor(db, "proj", "TICK-2") is None
+    assert get_ticket_executor(tmp_path / "nope.db", "proj", "TICK-1") is None
+
+
 def test_load_step_costs_from_db_missing_file_returns_empty(tmp_path: Path) -> None:
     assert _load_step_costs_from_db(tmp_path / "nope.db") == []
 
@@ -1721,6 +2340,35 @@ def test_compute_step_cost_stats_empty() -> None:
     assert stats["steps"] == []
     assert stats["total_cost_usd"] is None
     assert stats["total_dispatches"] == 0
+
+
+def test_compute_step_cost_stats_balanced_across_claude_and_codex_rows() -> None:
+    """A Claude row (input_tokens already uncached) and a normalized Codex row
+    (parse_codex_json_result output -- input_tokens is uncached, cost_usd
+    estimated) must average together to a sane figure instead of the old bug
+    where Codex's raw cumulative-including-cache input_tokens dwarfed
+    Claude's uncached-only figure by orders of magnitude, and Codex's
+    cost_usd=0 made "total cost" claude-only while "avg tokens" was
+    codex-dominated."""
+    claude_row = {
+        "step": "implement", "executor": "claude-a",
+        "cost_usd": 0.08, "input_tokens": 2, "output_tokens": 4,
+    }
+    codex_parsed = parse_codex_json_result(_CODEX_PONG_JSONL)
+    codex_row = {
+        "step": "implement", "executor": "codex",
+        "cost_usd": codex_parsed["cost_usd"],
+        "input_tokens": codex_parsed["input_tokens"],
+        "output_tokens": codex_parsed["output_tokens"],
+    }
+    stats = compute_step_cost_stats([claude_row, codex_row])
+    implement = stats["steps"][0]
+    # Both rows contribute real, non-None cost -- no more "claude-only total".
+    assert implement["total_cost_usd"] == round(0.08 + codex_parsed["cost_usd"], 4)
+    # Neither uncached-input figure is orders of magnitude off the other --
+    # both are single-dispatch token counts, not one cumulative-across-turns.
+    assert implement["avg_input_tokens"] == round((2 + codex_parsed["input_tokens"]) / 2)
+    assert implement["avg_input_tokens"] < 100_000
 
 
 def test_compute_step_cost_stats_null_costs_excluded_from_average() -> None:
@@ -1767,6 +2415,36 @@ def test_record_step_cost_writes_row(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["cost_usd"] == 0.05
     assert rows[0]["executor"] == "claude-a"
+
+
+def test_record_step_cost_clamps_duration_to_wall_clock(tmp_path: Path) -> None:
+    """A self-reported duration_ms larger than the dispatch's own measured
+    wall-clock elapsed time is capped to that measured value -- confirmed
+    live in a fresh-install agy smoke test: agy's duration_seconds reflects
+    the whole resumed --conversation session (prior turns included), not
+    just this invocation's turn, so it reported ~42s for a subprocess call
+    LaneGate's own started_at/finished_at measured at ~22s."""
+    db = tmp_path / "analytics.db"
+    parsed = {"cost_usd": 0.0, "duration_ms": 300_000, "num_turns": 2}
+    with patch("lanegate.context_log._get_project_id", return_value="proj"):
+        record_step_cost(
+            tmp_path, "TICK-1", "implement", "agy", "default", parsed,
+            db_path=db, dispatch_start_time=time.time(),
+        )
+    rows = _load_step_costs_from_db(db, project="proj")
+    assert len(rows) == 1
+    assert rows[0]["duration_ms"] < 5000
+
+
+def test_record_step_cost_no_clamp_without_dispatch_start_time(tmp_path: Path) -> None:
+    """Existing callers that don't pass dispatch_start_time keep writing the
+    self-reported duration_ms unchanged -- no behavior change for them."""
+    db = tmp_path / "analytics.db"
+    parsed = {"cost_usd": 0.0, "duration_ms": 300_000, "num_turns": 2}
+    with patch("lanegate.context_log._get_project_id", return_value="proj"):
+        record_step_cost(tmp_path, "TICK-1", "implement", "agy", "default", parsed, db_path=db)
+    rows = _load_step_costs_from_db(db, project="proj")
+    assert rows[0]["duration_ms"] == 300_000
 
 
 def test_record_step_cost_swallows_db_errors(tmp_path: Path) -> None:
@@ -1870,3 +2548,73 @@ def test_resume_session_gate_scopes_by_session_id(tmp_path: Path) -> None:
     allowed, reason = resume_session_gate({}, db, "proj", "sess-mine")
     assert allowed is True
     assert "no prior step_costs history" in reason
+
+
+def test_get_default_db_path_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Both analytics DB overrides work and remain documented for test isolation."""
+    from lanegate.context_log import _get_default_db_path
+
+    custom_db = tmp_path / "custom.db"
+    monkeypatch.setenv("LANEGATE_CONTEXT_LOG_DB", str(custom_db))
+    assert _get_default_db_path() == custom_db
+
+    monkeypatch.delenv("LANEGATE_CONTEXT_LOG_DB")
+    analytics_db = tmp_path / "analytics_env.db"
+    monkeypatch.setenv("LANEGATE_ANALYTICS_DB", str(analytics_db))
+    assert _get_default_db_path() == analytics_db
+
+    config_reference = (
+        Path(__file__).resolve().parents[1] / "docs" / "config-reference.md"
+    ).read_text()
+    assert "LANEGATE_CONTEXT_LOG_DB" in config_reference
+    assert "LANEGATE_ANALYTICS_DB" in config_reference
+    assert "~/.local/share/lanegate/analytics.db" in config_reference
+    assert "test isolation" in config_reference
+
+
+def test_cleanup_test_pollution(tmp_path: Path) -> None:
+    """cleanup_test_pollution removes TICK-997/TICK-998 rows by ticket_id only,
+    preserves genuine zero-value production rows, and scopes deletes to project
+    when one is given."""
+    import sqlite3
+    from lanegate.context_log import _init_db, _upsert_row, cleanup_test_pollution, log_step_cost
+
+    db = tmp_path / "test_polluted.db"
+    _init_db(db)
+
+    # Test fixture rows (the only intended targets)
+    _upsert_row(db, "proj", {"ticket_id": "TICK-997", "subagent_tokens": 0, "summary_tokens": 0, "duration_ms": 0, "wall_time_ms": 0})
+    _upsert_row(db, "proj", {"ticket_id": "TICK-998", "subagent_tokens": 0, "summary_tokens": 0, "duration_ms": 0, "wall_time_ms": 0})
+    # Genuine production rows: normal, and zero-value for legitimate reasons
+    # (e.g. wall_time_ms not yet backfilled, or an agy dispatch with no usage
+    # in its envelope) -- must survive regardless of column values.
+    _upsert_row(db, "proj", {"ticket_id": "TICK-100", "subagent_tokens": 5000, "summary_tokens": 100, "duration_ms": 1000, "wall_time_ms": 1200})
+    _upsert_row(db, "proj", {"ticket_id": "TICK-101", "subagent_tokens": 0, "summary_tokens": 0, "tool_uses": 0, "duration_ms": 0, "wall_time_ms": 0})
+    # A TICK-997 in a different project must survive when cleanup is scoped.
+    _upsert_row(db, "other-proj", {"ticket_id": "TICK-997", "subagent_tokens": 42, "summary_tokens": 10, "duration_ms": 500, "wall_time_ms": 600})
+
+    log_step_cost(db, "proj", "TICK-997", "review", input_tokens=0, output_tokens=0, duration_ms=0, cost_usd=0.0)
+    log_step_cost(db, "proj", "TICK-998", "drift_check", input_tokens=0, output_tokens=0, duration_ms=0, cost_usd=0.0)
+    log_step_cost(db, "proj", "TICK-100", "implement", input_tokens=1000, output_tokens=200, duration_ms=5000, cost_usd=0.05)
+    # Genuine zero-cost step (e.g. agy envelope lacking usage/duration_seconds).
+    log_step_cost(db, "proj", "TICK-101", "implement", input_tokens=0, output_tokens=0, duration_ms=0, cost_usd=0.0)
+    log_step_cost(db, "other-proj", "TICK-997", "implement", input_tokens=300, output_tokens=50, duration_ms=2000, cost_usd=0.02)
+
+    cleanup_test_pollution(db, project="proj")
+
+    conn = sqlite3.connect(str(db))
+    analytics_rows = conn.execute("SELECT project, ticket_id FROM analytics").fetchall()
+    step_costs_rows = conn.execute("SELECT project, ticket_id FROM step_costs").fetchall()
+    conn.close()
+
+    assert ("proj", "TICK-997") not in analytics_rows
+    assert ("proj", "TICK-998") not in analytics_rows
+    assert ("proj", "TICK-100") in analytics_rows
+    assert ("proj", "TICK-101") in analytics_rows  # zero-value production row preserved
+    assert ("other-proj", "TICK-997") in analytics_rows  # other project untouched
+
+    assert ("proj", "TICK-997") not in step_costs_rows
+    assert ("proj", "TICK-998") not in step_costs_rows
+    assert ("proj", "TICK-100") in step_costs_rows
+    assert ("proj", "TICK-101") in step_costs_rows  # zero-value production row preserved
+    assert ("other-proj", "TICK-997") in step_costs_rows  # other project untouched

@@ -2,6 +2,232 @@
 
 All notable changes to LaneGate are logged here. Dates are the day a change merged to `main`.
 
+## Unreleased
+
+## v1.1.0 (2026-08-19): model-validation hardening, security fixes, review/merge reliability
+
+- Model validation now catches a cross-vendor model string leaking to the wrong executor
+  on every dispatch path, not just implement: the review path's `resolve_model` fallback
+  and analyze's dispatch are now validated (previously only an explicit `review_model_pin`
+  was checked on review, and analyze validated against the named `executors:` instance name
+  instead of its resolved type, so the check silently no-op'd for any named instance). A
+  named `executors:` instance can now also carry a single blanket `model:` field (as
+  `docs/config-reference.md`'s own worked example already showed) as a fallback when no
+  step-keyed `models:` entry is set. This is validated at config-load time like any other
+  model field, so a bad value here is now a startup error where it was previously silently
+  ignored.
+- Removed the `treesitter` optional extra; tree-sitter grammars are now built-in.
+- Removed implicit `docs/ARCHITECTURE.md` prompt injection. Reference documentation is now opt-in via `reference_docs` in `.lanegate.yml` with no hardcoded filename assumptions. Deprecated `architecture_doc` config key while continuing to honor it for backward compatibility.
+- Analyze now stays read-only in practice, not just by convention: Claude-CLI executors get
+  `--disallowedTools Bash,Write,Edit` during analyze, closing a gap where the executor's own
+  `--dangerously-skip-permissions` flag otherwise left analyze with full unrestricted tool
+  access it never needed (touches/close_criteria/change_notes were always written by
+  `analyze.py` parsing the model's JSON response, never by the model editing files itself).
+- The analyze prompt now embeds real, line-numbered signatures (via the existing stdlib-`ast`
+  skeleton builder) for the files its symbol/importer search already matched, bounded to 25
+  files / 15KB. The model gets accurate signatures up front instead of fetching them one file
+  at a time through Read tool calls, which was the main source of analyze's multi-minute
+  latency on tickets touching many files.
+- `lanegate orchestrate`'s auto-analyze pass no longer drains the entire draft backlog before
+  dispatching anything. It now stops as soon as one analyzed draft is actually dispatchable, so
+  ready-to-implement work (already open, unblocked) never sits idle behind unrelated drafts
+  still waiting their turn; the remaining drafts get analyzed interleaved with dispatch instead
+  of front-loaded ahead of it. Priority order is unchanged: already-open/hibernated tickets
+  always dispatch before any draft gets analyzed at all.
+- Added `profile: strict` in `.lanegate.yml`. It bundles the safer end of the
+  existing review/acceptance-contract knobs into one name: it defaults
+  `acceptance_contract_mode` to `blocker` instead of `advisory`, and rejects
+  `review_fallback: same_model` at config-load time (the one fallback that
+  silently self-reviews when no independent reviewer or model is available).
+  `profile: default` (or omitting the key) is unchanged. See
+  [config reference](docs/config-reference.md#profile).
+- Added `CONTRIBUTING.md` documenting the project's DCO (`Signed-off-by`)
+  sign-off policy for commits, per the Developer Certificate of Origin.
+- Fixed several permission-boundary gaps found in a pre-release security audit:
+  `.lanegate.yml` is now hard-blocked from a worktree-planted override that could
+  otherwise lower an agent's own permission thresholds; the reviewer's trusted
+  instruction layer no longer builds from files an agent could edit inside its own
+  worktree; review diffs now use three-dot (`...`) comparison instead of two-dot so a
+  stale local branch can't pollute what the reviewer sees; the remote-divergence check
+  compares the actual ticket branch instead of `HEAD`; ticket branches are now cleaned
+  up on fail/reopen instead of accumulating; and the loopback API's mutating endpoints
+  now require an auth token, closing a CSRF-style gap that survived an earlier
+  CORS-only fix.
+- Narrowed the `lanegate/` self-modification guard back down to just the
+  safety-critical files (guards, reviewer, review dispatch, lifecycle status
+  transitions) instead of leaving the whole directory unprotected. This restores real
+  protection without re-blocking most of this repo's own dogfooded tickets.
+- Closed two auto-merge code paths that could merge a ticket to main without ever
+  running the red-lane risk scan, the blocked-file check, or static analysis. The
+  red-lane scan itself no longer fails open (it used to silently treat a broken `git
+  diff` as "no risk"); it now fails closed like every other gate in the chain.
+- Review no longer strands a ticket in permanent `needs_review` when every eligible
+  independent reviewer is temporarily unhealthy or cooling down: that case now gets a
+  bounded hibernate/retry with a recorded reason and next-retry time, and `lanegate
+  run` auto-recovers once the window passes.
+- Lifecycle verification no longer downgrades or strands an already-merged ticket when
+  a configured verification command can't resolve on the shell PATH; the pipeline now
+  validates commands resolve before changing ticket state, and a later failed
+  verification is recorded as a separate diagnostic instead of overwriting the merged
+  state.
+- The review agent no longer re-runs the full test suite during review (pre_complete /
+  pre_merge / post_merge_verify already run it deterministically); it's now required
+  to reproduce a correctness or verification-gap finding before reporting it rather
+  than asserting a bug from reading the diff alone; and the "tests already ran" claim
+  it's given is now tied to the actual commit under re-review instead of a stale claim
+  carried across an auto-fix cycle.
+- The read-only guard during `analyze` (no Bash/Write/Edit) now applies to every
+  executor type, not just Claude. Aider, codex, and agy previously kept full
+  edit/commit access during what's supposed to be a read-only planning step.
+- The orchestrator's run history and TUI no longer fabricate a stream of fake
+  "direct action" entries for every ticket dispatched during a normal `lanegate run`.
+  Only genuinely direct human/CLI actions are tracked now, and the spurious
+  per-action log file written for each ticket at each phase is gone.
+- Fixed an edge case where a ticket that had ever been rate-limit-hibernated and later
+  resumed could carry a stale hibernation marker forever, causing a later genuine
+  human-escalation case to be misclassified as an old rate limit.
+- Analysis contracts for high-risk control-plane tickets (config, security, lifecycle,
+  orchestration, prompt-trust) now require a structured acceptance matrix: invariants,
+  adversarial/failure cases, compatibility cases, and exact regression tests, mapped
+  to tests before implementation starts, to cut down on review churn from
+  underspecified tickets.
+- Fixed several crash and false-positive bugs in ticket-ID handling and dispatch: a
+  malformed ticket ID no longer crashes every command scanning the board (hardened
+  across the CLI, the MCP boundary, and internal call sites); `--tickets` no longer
+  false-positives "unknown ticket" on real tickets, caused by two dispatch code paths
+  loading the ticket list differently; a crash on a stale, non-fast-forward branch no
+  longer gets misreported as a rate-limit pause; and stale-branch recovery can now
+  complete a multi-conflict rebase without dropping back to manual git steps.
+- Fixed an orchestrator-lock race that could leave an orphaned run with no run_end
+  event or ticket list if the lock was already held when a run started; run history
+  now also distinguishes a manually-triggered run from one launched automatically by
+  the resume-watch daemon after a rate-limit recovery.
+- `resume-watch`'s retry backoff is now lock-aware, so it no longer burns a full
+  backoff cycle retrying while the original orchestrator process still holds the lock.
+- Fixed the global batch dispatch cap silently throttling an entire run to one
+  concurrent ticket whenever any single low-capacity pool member (e.g. a GPU-bound
+  local model) was present, instead of reflecting the pool's real total capacity.
+- Removed the vestigial top-level `executor:`/`reviewer:` config keys and collapsed a
+  sprawl of overlapping named pools down to one canonical pool. Least-loaded routing
+  already picks the right instance, so the extra pool names were just confusing which
+  one was actually active.
+- `needs_review` recovery advice no longer points at recovery commands that silently
+  no-op for a ticket that's already had an auto-fix attempt.
+- The TUI Run screen no longer gets stuck failing to update live after a while,
+  requiring a full quit-and-reopen to see progress again.
+- Fixed a severity-classifier false-positive rate: the Raw Audit Log's error flagging
+  matched the substring "error" anywhere in a line, including in ordinary prose, so
+  unrelated ticket text was getting flagged red.
+- Added an MCP `create` tool so a master agent driving lanegate purely over MCP can
+  create tickets without falling back to the CLI or writing ticket files directly.
+- `lanegate create` now explains what a failed auto-analyze pass actually means and
+  gives a concrete next step, instead of leaving the ticket stuck in draft with no
+  guidance.
+- `lanegate doctor`'s remedy text for a missing tree-sitter grammar no longer suggests
+  a plain `pip install lanegate`, which was a no-op once lanegate was already
+  installed and left the warning reappearing on every run.
+- Added `--reviewer`, `--executor`, and `--model` flags to `lanegate route` so routing
+  metadata can be updated safely instead of hand-edited.
+- `context-stats --compare` now shows a `claude` row (it was silently missing despite
+  claude driving the majority of tracked spend) and adds a cost/token-usage column for
+  DB-backed executor rows.
+- Tiered CLI help is now fixed to 80 columns regardless of terminal width, instead of
+  expanding unpredictably on wide terminals.
+- Raised this repo's unattended review-fix budget to two auto-fix cycles.
+- The aider-ollama executor can now pick from an ordered list of context-size tiers
+  (`context_tiers`) and automatically selects the smallest model whose context window
+  fits the ticket's estimated token cost.
+- Assorted hardening and cleanup: automated commits (including the daily
+  traffic-snapshot job) are now DCO-signed like the rest of the tree; the shared
+  ticket-notes store tolerates missing symlink privilege on Windows and no longer
+  fails closed on a pre-existing real notes directory; safeguard test subprocesses are
+  now reaped via process groups with a concurrency lock so parallel test runs stop
+  thrashing host resources; pre-merge worktree verification is re-enabled before
+  merge; the agy executor resumes a previous session with `--conversation` instead of
+  an unsupported `--resume` flag; and a full mypy typecheck pass now runs clean across
+  the tree.
+- Combined (self-review) mode — where one executor implements and reviews a ticket in the
+  same session — is now gated behind an allowlist of executor types that actually have the
+  shell/tool-execution capability to self-drive it (`claude`, `claude-subagent`,
+  `claude-process`, `codex`, `agy`; asserted to stay a subset of the canonical
+  `_VALID_EXECUTOR_TYPES` registry). A pure code-editing tool like `aider` has no such
+  capability — pinning `reviewer:` to it explicitly used to force combined mode anyway,
+  producing a ticket that committed real, correct code and then failed identically on
+  every retry. An executor outside the allowlist now falls through to split-mode/
+  independence-ladder dispatch instead, which always completes. The "reviewer resolves
+  identically to the implement executor" warning (`lanegate doctor` and the startup config
+  check) shares the same allowlist, so it no longer fires for executors that can't run
+  combined mode anyway.
+- `lane init --interactive`'s reviewer prompt now distinguishes a blank answer from a
+  typed one: leaving it blank keeps `reviewer` unset in `.lanegate.yml`, so the
+  independence ladder resolves it at dispatch time (including its `review_fallback:
+  needs_review` safety escalation for single-account setups) instead of a blank Enter
+  permanently disabling that safety net. Typing a value — even one matching the executor —
+  is still a deliberate pin; an unrecognized/typo'd answer is now treated like blank rather
+  than silently pinning self-review by mistake. The prompt's bracketed default now reads
+  `[auto]` instead of the executor's name, since a blank answer here doesn't behave like
+  every other prompt's accepted default.
+- `lanegate run` no longer hard-errors on a fresh project's first ticket just because no
+  `--milestone`/`--all`/`default_milestone` was given. If no ticket in the tickets dir uses
+  the `milestone` field at all, there's nothing to scope by, so it now runs everything
+  (same as `--all`). The error still fires once any ticket actually sets `milestone`, since
+  the scope becomes ambiguous at that point.
+- After a review attempt comes back unapproved, `lanegate run` now logs the ticket's real
+  outcome instead of a generic one: a ticket escalated to `needs_review` (e.g. no
+  independent reviewer available), one hibernated for a temporary rate limit/reviewer
+  cooldown, and one correctly parked at `in_review` awaiting a pool-resolved human
+  reviewer each get their own accurate outcome, rather than risking an "auto-fix/re-review
+  did not reach approval" message overwriting a more specific reason already recorded on
+  the ticket. `run_auto_fix_cycle` also enforces its own `code_complete` precondition
+  internally now, so a future caller can't reintroduce that overwrite.
+- `.lanegate.yml` is no longer gitignored by `lanegate init` — `git worktree add` only
+  checks out committed content, so an ignored (never-committed) config left the very first
+  ticket's worktree without one at all. Re-running `init` (or upgrading) also migrates a
+  project whose `.gitignore` already had a stale `.lanegate.yml` entry from before this
+  change, instead of leaving it gitignored forever.
+- Analyze now corrects a flat-guessed touches path (e.g. `calc.py`) against the real
+  nested file (`src/calc.py`) when the guess doesn't exist on disk but uniquely matches a
+  tracked file's basename elsewhere in the repo, deduping the touches list when two
+  declared paths correct to the same real file.
+- Fixed the interactive `lanegate start`/`=== Context Prompt ===` terminal block always
+  printing `Invariants: none`, even when the ticket has real invariants. It was reading a
+  top-level `invariants` field that never exists; the analyzer nests it under
+  `acceptance_matrix.invariants`, which is what the actual executor prompt already read
+  correctly. Cosmetic only — the executor's prompt was never affected — but misleading to a
+  human glancing at the terminal.
+- Wizard prompts (`_prompt` and the five yes/no confirms) now degrade to their default
+  instead of raising a raw `EOFError` traceback when piped/non-interactive stdin runs out
+  mid-wizard — previously inconsistent, since one unrelated prompt in `cli.py` already
+  caught `EOFError` while everything in the main wizard didn't.
+- Docs: fixed `docs/config-reference.md`'s `--human-review` reference table and
+  `README.md`'s security recommendation, both of which described the wrong default
+  behavior (a default project silently skips review and auto-merges, and `autonomy` is
+  unrelated to the merge gate — neither is true; see the fixed docs for the actual two
+  independent axes). Fixed `docs/demo-walkthrough.md`'s local-Ollama example, which showed
+  a bare `executor: ollama` config that errors at dispatch for implement/review (only
+  `executor: aider` with an `ollama`/`ollama_chat`-prefixed model is a supported
+  code-writing path); added the missing `needs_review` (no independent reviewer) escape
+  hatch via `lanegate human-review --rationale`, which the walkthrough's review-step
+  coverage skipped entirely; added a one-line prerequisite note (README and the walkthrough)
+  that safeguard commands like `pytest` run in the project's own environment and must be
+  installed there first; documented `lane init --interactive`'s agy setup adding
+  `--disable-slash-commands` alongside the already-documented
+  `--dangerously-skip-permissions`; and replaced `AGENTS.md`'s stale Codex flag combo
+  (`--sandbox workspace-write --approve-for-me`) with the one already fixed everywhere else.
+- `lane init --interactive` now prints a one-time warning when piped/non-interactive stdin
+  runs out mid-wizard, instead of silently defaulting every remaining prompt with no
+  signal. Degrading to defaults on exhausted stdin (see above) fixed a raw traceback, but
+  it also removed the only sign that a piped answer string had the wrong line count — a
+  miscounted/misaligned answer set could silently write an unintended config (e.g. with
+  `executor`/`reviewer` swapped) with nothing flagging it before `.lanegate.yml` was
+  written.
+- Cost tracking (`context-stats`, `step_costs`) no longer trusts a self-reported
+  `duration_ms`/`duration_seconds` larger than the dispatch's own measured wall-clock
+  elapsed time — it's now clamped to that measured value. `agy`'s `duration_seconds`
+  reflects the whole resumed `--conversation` session (prior turns included), not just the
+  current invocation, so it could report nearly double the actual subprocess call's
+  duration and inflate that step's tracked cost.
+
 ## v1.0.3 (2026-08-04): fixture redaction, docs
 
 - A test fixture (`tests/fixtures/captured_output/tick-349-nested-brace-review.txt`) was a
@@ -28,6 +254,9 @@ All notable changes to LaneGate are logged here. Dates are the day a change merg
   and this closes out the rest of the tree.
 - Added test coverage for two previously-untested modules: `lanegate/ghsync.py` (GitHub
   Issues mirror) and `lanegate/agent_tools.py` (Claude/Codex/MCP installer).
+- Fixed a pre-rename leftover (TICK-388): 96 ticket files still had `file_skeletons_ref`
+  pointing at `.vyuha/context/...` instead of `.lanegate/context/...`, which failed schema
+  validation and silently quarantined those tickets off the board.
 
 ## v1.0.0 (2026-08-03): first public release
 

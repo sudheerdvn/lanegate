@@ -10,8 +10,8 @@ import (
 )
 
 // SettingsModel represents the settings/config preview screen state. Most of
-// it is read-only by design (see TICK-157 non-goals): a rendering of GET
-// /api/config's sanitized response. TICK-269 adds one narrow editing
+// it is read-only by design (see non-goals): a rendering of GET
+// /api/config's sanitized response. Adds one narrow editing
 // surface on top of that — a pools.<name>.executors reorder control — since
 // tie-break preference and round-robin start order otherwise require
 // hand-editing .lanegate.yml.
@@ -272,11 +272,11 @@ func (sm *SettingsModel) Render(width int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderPools appends the pools.<name>.executors view (TICK-269), including
+// renderPools appends the pools.<name>.executors view, including
 // live dispatch state, the focused pool/executor cursor, and — while
 // editing — the "p to reorder / enter to save / esc to cancel" hint. It is
 // silent when no pools are configured and no pools fetch was attempted, so
-// projects without a pools: block see no change from the pre-TICK-269
+// projects without a pools: block see no change from the pre-pool
 // settings screen.
 func (sm *SettingsModel) renderPools(b *strings.Builder) {
 	if sm.poolsErr != "" {

@@ -133,7 +133,7 @@ func (fc *FixtureClient) GetRunLogPage(ctx context.Context, offset, limit int) (
 		return nil, fmt.Errorf("parse events_basic.sse: %w", err)
 	}
 
-	var lines []string
+	var sourceEvents []LogEvent
 	var runID string
 	for _, f := range frames {
 		ev, err := DecodeLogEvent(f)
@@ -143,10 +143,10 @@ func (fc *FixtureClient) GetRunLogPage(ctx context.Context, offset, limit int) (
 		if runID == "" {
 			runID = ev.RunID
 		}
-		lines = append(lines, ev.Message)
+		sourceEvents = append(sourceEvents, ev)
 	}
 
-	total := len(lines)
+	total := len(sourceEvents)
 	if offset > total {
 		offset = total
 	}
@@ -154,15 +154,18 @@ func (fc *FixtureClient) GetRunLogPage(ctx context.Context, offset, limit int) (
 	if end > total {
 		end = total
 	}
-	page := lines[offset:end]
+	page := sourceEvents[offset:end]
 
 	events := make([]LogEvent, len(page))
-	for i, msg := range page {
+	for i, source := range page {
 		events[i] = LogEvent{
 			ID:      fmt.Sprintf("%d", offset+i+1),
 			Type:    "log",
 			RunID:   runID,
-			Message: msg,
+			Message: source.Message,
+			Level:   source.Level,
+			Style:   source.Style,
+			Kind:    source.Kind,
 		}
 	}
 
@@ -416,8 +419,8 @@ func (fc *FixtureClient) GetRunLogs(ctx context.Context, runID string, offset, l
 	}, nil
 }
 
-// GetRunEvents loads a TICK-307 safe structured-event fixture: the live
-// fixture for "" / "current", the historical fixture for any other run ID.
+// GetRunEvents loads a safe structured-event fixture: the live fixture for
+// "" / "current", the historical fixture for any other run ID.
 func (fc *FixtureClient) GetRunEvents(ctx context.Context, runID string) (*RunEventsPayload, error) {
 	path := "run/executor_events_live.json"
 	if runID != "" && runID != "current" {

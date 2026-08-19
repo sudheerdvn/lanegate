@@ -49,7 +49,7 @@ Sleep 1s
 Type "lanegate board" Enter
 Sleep 2500ms
 
-Type "lanegate orchestrate --dry-run --milestone demo --human-review per_ticket" Enter
+Type "lanegate run --dry-run --milestone demo --human-review per_ticket" Enter
 Sleep 2500ms
 
 Type "lanegate start TICK-001" Enter

@@ -21,6 +21,8 @@ type Ticket struct {
 	ReviewExecutor    string   `json:"review_executor"`
 	ExecutionMode     string   `json:"execution_mode"`
 	ReviewVerdict     string   `json:"review_verdict"`
+	NeedsAttention    bool     `json:"needs_attention"`
+	AttentionCategory string   `json:"attention_category"`
 }
 
 // PipelineEntry represents a deployment pipeline entry
@@ -73,13 +75,15 @@ type BlockedPayload struct {
 
 // BlockedTicket represents a single blocked ticket
 type BlockedTicket struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Branch    string   `json:"branch"`
-	DiffCmd   string   `json:"diff_cmd"`
-	Priority  int      `json:"priority"`
-	Milestone string   `json:"milestone"`
-	Findings  []string `json:"findings"`
+	ID                string   `json:"id"`
+	Title             string   `json:"title"`
+	Branch            string   `json:"branch"`
+	DiffCmd           string   `json:"diff_cmd"`
+	Priority          int      `json:"priority"`
+	Milestone         string   `json:"milestone"`
+	Findings          []string `json:"findings"`
+	AttentionSummary  string   `json:"attention_summary"`
+	AttentionCategory string   `json:"attention_category"`
 }
 
 // ErrorPayload represents a structured error response
@@ -129,23 +133,36 @@ type ResumeWatchStatus struct {
 
 // RunPayload represents the response from GET /api/runs/current.
 type RunPayload struct {
-	RunID             string             `json:"run_id"`
-	Status            string             `json:"status"`
-	StartedAtISO      string             `json:"started_at_iso"`
-	OrchestratorPID   int                `json:"orchestrator_pid"`
-	ProcessAlive      bool               `json:"process_alive"`
-	StopRequested     bool               `json:"stop_requested"`
-	Tickets           []string           `json:"tickets"`
-	Workers           []RunWorker        `json:"workers"`
+	RunID           string      `json:"run_id"`
+	Status          string      `json:"status"`
+	StartedAtISO    string      `json:"started_at_iso"`
+	OrchestratorPID int         `json:"orchestrator_pid"`
+	ProcessAlive    bool        `json:"process_alive"`
+	StopRequested   bool        `json:"stop_requested"`
+	Tickets         []string    `json:"tickets"`
+	Workers         []RunWorker `json:"workers"`
+	// BatchLine and UnderfilledReason mirror the compact [orchestrate] batch
+	// diagnostics emitted by orchestrate/loop.py.
+	BatchLine         string             `json:"batch_line"`
+	UnderfilledReason *string            `json:"underfilled_reason"`
 	LastEventID       int                `json:"last_event_id"`
 	Orchestration     *Orchestration     `json:"orchestration"`
+	Analysis          *AnalysisStatus    `json:"analysis"`
 	ResumeWatchStatus *ResumeWatchStatus `json:"resume_watch_status"`
 }
 
-// RunWorker represents one active executor within a RunPayload. Today the
-// Python core tracks at most one active executor (see TICK-089 gap noted in
-// TICK-157), so Workers has 0 or 1 entries — the shape is a list so the
-// screen renders correctly once multi-worker aggregation lands.
+// AnalysisStatus describes a currently-running ticket analysis folded into
+// GET /api/runs/current so the Run screen can explain orchestration gaps.
+type AnalysisStatus struct {
+	TicketID       string `json:"ticket_id"`
+	Phase          string `json:"phase"`
+	Executor       string `json:"executor"`
+	Model          string `json:"model"`
+	ElapsedSeconds int    `json:"elapsed_seconds"`
+	LogPath        string `json:"log_path"`
+}
+
+// RunWorker represents one active executor within a RunPayload.
 type RunWorker struct {
 	TicketID            string `json:"ticket_id"`
 	ExecutorPID         int    `json:"executor_pid"`
@@ -217,10 +234,10 @@ type SettingsAPIMeta struct {
 	Port int    `json:"port"`
 }
 
-// PoolsPayload represents the response from GET /api/pools (TICK-269): the
-// executors in each `pools.<name>` entry in their configured preference
-// order, plus the rotation/dispatch state orchestrate persists per pool
-// (TICK-268) across separate runs.
+// PoolsPayload represents the response from GET /api/pools: the executors
+// in each `pools.<name>` entry in their configured preference order, plus
+// the rotation/dispatch state orchestrate persists per pool across separate
+// runs.
 type PoolsPayload struct {
 	Pools []Pool `json:"pools"`
 }
@@ -241,13 +258,19 @@ type Pool struct {
 // LogEvent is one decoded SSE event from GET /api/runs/current/logs/stream
 // (see lanegate.api._sse_event / _stream_log_events).
 type LogEvent struct {
-	ID        string                 `json:"id"`
-	Type      string                 `json:"type"`
-	Timestamp string                 `json:"timestamp"`
-	RunID     string                 `json:"run_id"`
-	TicketID  string                 `json:"ticket_id"`
-	Message   string                 `json:"message"`
-	Data      map[string]interface{} `json:"data"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	RunID     string `json:"run_id"`
+	TicketID  string `json:"ticket_id"`
+	Message   string `json:"message"`
+	// Level, Style, and Kind are display metadata derived by the API from the
+	// raw audit line. Style is the canonical shared CLI/API/TUI presentation
+	// token; Message remains the verbatim (redacted) audit payload.
+	Level string                 `json:"level,omitempty"`
+	Style string                 `json:"style,omitempty"`
+	Kind  string                 `json:"kind,omitempty"`
+	Data  map[string]interface{} `json:"data"`
 }
 
 // LogPagePayload represents the response from GET /api/runs/current/logs —
@@ -266,10 +289,12 @@ type LogPagePayload struct {
 // RunSummaryPayload represents one RunSummary from the Python API
 // (lanegate.orchestrate.run_summary.RunSummary).
 type RunSummaryPayload struct {
-	RunID        string          `json:"run_id"`
-	Timestamp    string          `json:"timestamp"`
-	Reason       string          `json:"reason"`
-	BatchTickets []TicketOutcome `json:"batch_tickets"`
+	RunID         string          `json:"run_id"`
+	Timestamp     string          `json:"timestamp"`
+	Reason        string          `json:"reason"`
+	BatchTickets  []TicketOutcome `json:"batch_tickets"`
+	TriggeredBy   string          `json:"triggered_by"`
+	TriggerReason *string         `json:"trigger_reason,omitempty"`
 }
 
 // TicketOutcome represents one dispatched ticket's outcome within a RunSummaryPayload.
@@ -299,9 +324,9 @@ type RunLogsPayload struct {
 	Limit      int        `json:"limit"`
 	NextOffset *int       `json:"next_offset"`
 }
-// RunEventsPayload represents the response from GET /api/runs/{id}/events
-// (TICK-307): a bounded feed of normalized, safe executor-progress records
-// for a run. This is the only run activity source the Run screen's default
+
+// RunEventsPayload represents the response from GET /api/runs/{id}/events:
+// a bounded feed of normalized, safe executor-progress records for a run. This is the only run activity source the Run screen's default
 // Activity pane may render — it never carries raw executor stdout,
 // stream-JSON protocol lines, prompts, full shell commands, source content,
 // reasoning, or secrets. See lanegate.orchestrate.run_report.read_executor_events

@@ -6,10 +6,268 @@ Split out of the former monolithic tests/test_orchestrate.py (TICK-316).
 
 from __future__ import annotations
 
+from lanegate.git import GitText
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
 
+def test_structured_429_overrides_earlier_setup_error_text():
+    """A real provider 429 must start the resume path even when the executor
+    transcript also contains an earlier setup/configuration error."""
+    from lanegate.orchestrate.loop import _is_rate_limit
+
+    assert _is_rate_limit(
+        1,
+        captured_stderr=(
+            "executor setup/configuration error: stale tool configuration\n"
+            '{"error":"rate_limit","api_error_status":429}'
+        ),
+    )
+
+
+def test_flat_note_name_injective():
+    """Paths differing only by '/' vs '_' placement must not collide on the same note filename."""
+    from lanegate.prompts import canonical_note_filename
+
+    assert canonical_note_filename("a/b.py") != canonical_note_filename("a_b.py")
+    # Adjacent slash/underscore swaps: a naive '_' -> '__' then '/' -> '_'
+    # escape merges these into the same run of underscores.
+    assert canonical_note_filename("a_/b.py") != canonical_note_filename("a/_b.py")
+
+
 class TestConflictAwareResume:
+    def test_review_pending_resume_skips_implementation(self, tmp_path):
+        """A hibernated completed ticket resumes at review, not invoke_executor."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        def approve(tid, cfg_, root, **kwargs):
+            # resume_review_pending has already restored code_complete by the
+            # time cmd_review runs -- see the regression test below for that
+            # transition in isolation.
+            text = path.read_text().replace("status: code_complete", "status: in_review")
+            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
+            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
+            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
+            patch("lanegate.orchestrate.invoke_executor") as invoke,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        invoke.assert_not_called()
+        assert parse_ticket(path)["status"] == "in_review"
+
+    def test_review_pending_conflict_recovery_reverifies_before_review(self, tmp_path):
+        """Agent-resolved rebase conflicts invalidate pre-hibernation checks."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        def approve(tid, cfg_, root, **kwargs):
+            text = path.read_text().replace("status: code_complete", "status: in_review")
+            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
+            patch("lanegate.orchestrate._run_rebase", return_value=("conflict", "### a.py")),
+            patch("lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True),
+            patch("lanegate.orchestrate.loop._git_head_sha", side_effect=["before", "after"]),
+            patch("lanegate.safeguards.run_safeguards", return_value=(True, "")) as safeguards,
+            patch("lanegate.lifecycle.cmd_review", side_effect=approve) as review,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        safeguards.assert_called_once()
+        assert safeguards.call_args.args[0] == "pre_complete"
+        assert safeguards.call_args.args[2:] == (cfg, tmp_path / "worktrees" / "tick-001")
+        review.assert_called_once()
+        assert parse_ticket(path)["pre_complete_verified_sha"] == "after"
+
+    def test_review_pending_conflict_recovery_blocks_review_when_verification_fails(self, tmp_path):
+        """A failed post-rebase safeguard must not dispatch a reviewer."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
+            patch("lanegate.orchestrate._run_rebase", return_value=("conflict", "### a.py")),
+            patch("lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True),
+            patch("lanegate.orchestrate.loop._git_head_sha", return_value="after"),
+            patch("lanegate.safeguards.run_safeguards", return_value=(False, "tests failed")) as safeguards,
+            patch("lanegate.lifecycle.cmd_review") as review,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        safeguards.assert_called_once()
+        review.assert_not_called()
+        assert parse_ticket(path)["status"] == "needs_review"
+
+    def test_review_pending_resume_full_autonomy_auto_merges_without_crash(self, tmp_path, capsys):
+        """Regression test: resuming a hibernated review-pending ticket under
+        full autonomy must reach auto_merge_approved_local_tickets and log the
+        merged outcome without an UnboundLocalError on final_ticket."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        def approve(tid, cfg_, root, **kwargs):
+            text = path.read_text().replace("status: code_complete", "status: in_review")
+            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
+
+        def fake_merge(tid, cfg_, root):
+            path.write_text(path.read_text().replace("status: in_review", "status: merged"))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
+            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
+            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
+            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge),
+            patch("lanegate.orchestrate.invoke_executor") as invoke,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        captured = capsys.readouterr()
+        assert "worker thread crashed" not in captured.err
+        assert "UnboundLocalError" not in captured.err
+        invoke.assert_not_called()
+        assert parse_ticket(path)["status"] == "merged"
+
+    def test_review_pending_resume_red_lane_does_not_auto_merge(self, tmp_path):
+        """A resumed review must re-scan its diff before the shared merge path."""
+        from types import SimpleNamespace
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        def approve(tid, cfg_, root, **kwargs):
+            text = path.read_text().replace("status: code_complete", "status: in_review")
+            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
+            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
+            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
+            patch(
+                "lanegate.orchestrate.loop._git_text",
+                return_value=SimpleNamespace(ok=True, text="+ token = 'sk-red-lane'"),
+            ),
+            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red") as mock_scan,
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_scan.assert_called_once()
+        mock_merge.assert_not_called()
+        ticket = parse_ticket(path)
+        assert ticket["status"] == "needs_review"
+        assert ticket["review_verdict"] == "changes_requested"
+
+    def test_ready_to_merge_ticket_drains_before_dispatching_new_open_work(self, tmp_path):
+        """Approved in_review work must merge before the loop dispatches a new
+        open ticket -- otherwise WIP (and the touch-locks it holds) keeps
+        growing while already-finished tickets sit waiting, which is exactly
+        what produces avoidable lock contention on the rest of the board."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        cfg["max_parallel"] = 1
+        tickets_dir = tmp_path / "tickets"
+        p1 = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
+        p1.write_text(p1.read_text().replace("close_criteria:", "review_verdict: approved\nclose_criteria:"))
+        _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"])
+
+        call_order = []
+
+        def fake_merge(tid, cfg_, root):
+            call_order.append(f"merge:{tid}")
+            p1.write_text(p1.read_text().replace("status: in_review", "status: merged"))
+
+        def fake_start(tid, cfg_, root, **kwargs):
+            call_order.append(f"start:{tid}")
+            # Stop right here -- this test only cares about dispatch order,
+            # not a full implement/review/merge pipeline for TICK-002. The
+            # worker exception handler downgrades this one ticket to
+            # needs_review without crashing the rest of the run.
+            raise RuntimeError("stop-here: ordering test only cares about start order")
+
+        with (
+            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge),
+            patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.orchestrate.spawn_watch_daemon"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        assert call_order == ["merge:TICK-001", "start:TICK-002"]
+        assert parse_ticket(p1)["status"] == "merged"
+
+    def test_full_autonomy_holds_agent_resolved_rebase_for_human_merge(self, tmp_path, capsys):
+        """A passed review cannot auto-merge a branch whose rebase needed an agent."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
+        path.write_text(
+            path.read_text().replace(
+                "close_criteria:",
+                "review_verdict: approved\nrequires_human_merge: true\n"
+                "rebase_conflict_files: [a.py]\nclose_criteria:",
+            )
+        )
+
+        with (
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.orchestrate.spawn_watch_daemon"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_merge.assert_not_called()
+        assert parse_ticket(path)["status"] == "in_review"
+        assert "requires human merge approval (a.py)" in capsys.readouterr().err
+
     def test_run_rebase_uses_real_git_rebase_main(self, tmp_path):
         with patch(
             "lanegate.orchestrate.subprocess.run",
@@ -113,6 +371,7 @@ class TestConflictAwareResume:
 
         mock_rebase_fix.assert_called_once()
         assert mock_rebase_fix.call_args.args[4] == "## Conflict resolution required\n\n### a.py"
+        assert mock_rebase_fix.call_args.kwargs["pool_name"] is None
         mock_continue.assert_not_called()
 
     def test_hibernated_conflict_executor_failure_aborts_rebase(self, tmp_path):
@@ -350,6 +609,24 @@ class TestCmdOrchestrateDryRun:
         mock_lock.assert_not_called()
         mock_release.assert_not_called()
 
+    def test_write_batch_status_receives_max_parallel_and_total_open(self, tmp_path):
+        """TICK-464: write_batch_status must be called with the cap and the
+        total open-ticket count so get_orchestration_status can recompute a
+        live running count later instead of replaying a frozen string."""
+        cfg = _default_cfg(tmp_path)
+        cfg["max_parallel"] = 3
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"], priority=1)
+        _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"], priority=2)
+
+        with patch("lanegate.orchestrate.loop.write_batch_status") as mock_write:
+            cmd_orchestrate(cfg, tmp_path, dry_run=True, all_milestones=True, auto_analyze=False)
+
+        mock_write.assert_called_once()
+        _, kwargs = mock_write.call_args
+        assert kwargs["max_parallel"] == 3
+        assert kwargs["total_open"] == 2
+
 
 # ---------------------------------------------------------------------------
 # cmd_orchestrate — board clear
@@ -435,15 +712,31 @@ class TestCmdOrchestrateLock:
         cfg = _default_cfg(tmp_path)
         # No tickets — loop exits immediately
 
+        events = []
+
+        def track_acquire(root):
+            events.append(("acquire", root))
+            return 9999
+
+        def track_write_pointer(root, session_ts, log_path):
+            events.append(("write_pointer", session_ts))
+
+        def track_append_event(root, session_ts, event_type, **kwargs):
+            events.append(("append_event", event_type))
+
         with (
-            patch("lanegate.orchestrate.acquire_orchestrator_lock") as mock_acquire,
-            patch("lanegate.orchestrate.release_orchestrator_lock") as mock_release,
+            patch("lanegate.orchestrate.loop.acquire_orchestrator_lock", side_effect=track_acquire),
+            patch("lanegate.orchestrate.loop.release_orchestrator_lock") as mock_release,
+            patch("lanegate.orchestrate.loop._write_last_run_pointer", side_effect=track_write_pointer),
+            patch("lanegate.orchestrate.loop._append_run_event", side_effect=track_append_event),
         ):
-            mock_acquire.return_value = 9999
             cmd_orchestrate(cfg, tmp_path, all_milestones=True)
 
-        mock_acquire.assert_called_once_with(tmp_path)
         mock_release.assert_called_once_with(tmp_path)
+        assert len(events) >= 3
+        assert events[0][0] == "acquire"
+        assert events[1][0] == "write_pointer"
+        assert events[2] == ("append_event", "run_start")
 
     def test_lock_released_on_exception(self, tmp_path):
         cfg = _default_cfg(tmp_path)
@@ -451,9 +744,9 @@ class TestCmdOrchestrateLock:
         _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
 
         with (
-            patch("lanegate.orchestrate.acquire_orchestrator_lock") as mock_acquire,
-            patch("lanegate.orchestrate.release_orchestrator_lock") as mock_release,
-            patch("lanegate.orchestrate._drain_loop", side_effect=RuntimeError("boom")),
+            patch("lanegate.orchestrate.loop.acquire_orchestrator_lock") as mock_acquire,
+            patch("lanegate.orchestrate.loop.release_orchestrator_lock") as mock_release,
+            patch("lanegate.orchestrate.loop._drain_loop", side_effect=RuntimeError("boom")),
         ):
             mock_acquire.return_value = 9999
             with pytest.raises(RuntimeError, match="boom"):
@@ -465,14 +758,20 @@ class TestCmdOrchestrateLock:
         cfg = _default_cfg(tmp_path)
         from lanegate.concurrency import OrchestratorLockError
 
-        with patch(
-            "lanegate.orchestrate.acquire_orchestrator_lock",
-            side_effect=OrchestratorLockError("already held"),
+        with (
+            patch(
+                "lanegate.orchestrate.loop.acquire_orchestrator_lock",
+                side_effect=OrchestratorLockError("already held"),
+            ),
+            patch("lanegate.orchestrate.loop._write_last_run_pointer") as mock_write_pointer,
+            patch("lanegate.orchestrate.loop._append_run_event") as mock_append_event,
         ):
             with pytest.raises(SystemExit) as exc_info:
                 cmd_orchestrate(cfg, tmp_path, all_milestones=True)
 
         assert exc_info.value.code == 1
+        mock_write_pointer.assert_not_called()
+        mock_append_event.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +832,9 @@ class TestCmdOrchestrateWatchDaemon:
         )
 
         def fake_merge(tid, cfg_, repo_root):
+            from lanegate.orchestrate.run_report import direct_action_tracking_suppressed
+
+            assert direct_action_tracking_suppressed()
             p = tickets_dir / f"{tid}.md"
             text = p.read_text().replace("status: in_review", "status: merged")
             p.write_text(text)
@@ -547,6 +849,200 @@ class TestCmdOrchestrateWatchDaemon:
 
         mock_merge.assert_called_once_with("TICK-001", cfg, tmp_path)
         mock_spawn.assert_not_called()
+
+    def test_ready_to_merge_red_lane_ticket_requires_human_review(self, tmp_path):
+        """An approved ticket from a prior run cannot bypass the red-lane scan."""
+        from types import SimpleNamespace
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
+        path.write_text(
+            path.read_text().replace(
+                "close_criteria:", "review_verdict: approved\nclose_criteria:"
+            )
+        )
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        with (
+            patch(
+                "lanegate.orchestrate.loop._git_text",
+                return_value=SimpleNamespace(ok=True, text="+ token = 'sk-red-lane'"),
+            ),
+            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red") as mock_scan,
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.orchestrate.spawn_watch_daemon"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_scan.assert_called_once()
+        mock_merge.assert_not_called()
+        ticket = parse_ticket(path)
+        assert ticket["status"] == "needs_review"
+        assert ticket["review_verdict"] == "changes_requested"
+
+    def test_auto_merge_suppresses_direct_action(self, tmp_path):
+        import json
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        (tickets_dir / "TICK-001.md").write_text(
+            "---\n"
+            "id: TICK-001\n"
+            "title: Auto Merge Test\n"
+            "status: in_review\n"
+            "priority: 5\n"
+            "parallel_safe: true\n"
+            "review_verdict: approved\n"
+            "review_summary: Ready for merge\n"
+            "---\n"
+            "Body.\n"
+        )
+
+        from lanegate.lifecycle import _track_direct_action
+
+        def fake_merge(tid, cfg_, repo_root):
+            p = tickets_dir / f"{tid}.md"
+            text = p.read_text().replace("status: in_review", "status: merged")
+            p.write_text(text)
+
+        tracked_fake_merge = _track_direct_action("merge")(fake_merge)
+
+        with (
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.lifecycle.cmd_merge", side_effect=tracked_fake_merge),
+            patch("lanegate.orchestrate.spawn_watch_daemon"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        logs_dir = tmp_path / ".lanegate" / "logs"
+        direct_action_logs = list(logs_dir.glob("action-*.events.jsonl"))
+        assert direct_action_logs == [], "auto-merge should suppress direct action tracking logs"
+
+        orchestrate_logs = list(logs_dir.glob("orchestrate-*.events.jsonl"))
+        assert len(orchestrate_logs) == 1
+        events = [json.loads(line) for line in orchestrate_logs[0].read_text().splitlines() if line]
+        merged_event = next(
+            (e for e in events if e.get("event") == "ticket_outcome" and e.get("ticket_id") == "TICK-001"),
+            None,
+        )
+        assert merged_event is not None
+        assert merged_event.get("outcome") == "merged"
+
+    def test_dispatch_suppresses_direct_action_for_start_and_complete(self, tmp_path):
+        """TICK-510: an orchestrated split-mode dispatch calls cmd_start and
+        cmd_complete as ordinary lifecycle steps, not standalone human
+        actions -- both must run with direct-action tracking suppressed and
+        leave no action-*.events.jsonl behind, same as the auto-merge case
+        above."""
+        import json
+
+        from lanegate.lifecycle import _track_direct_action
+        from lanegate.orchestrate.run_report import direct_action_tracking_suppressed
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+        def fake_start(tid, cfg_, repo_root, **kwargs):
+            assert direct_action_tracking_suppressed()
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: open", "status: in_progress"))
+
+        def fake_complete(tid, cfg_, repo_root):
+            assert direct_action_tracking_suppressed()
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: code_complete"))
+
+        def fake_review(tid, cfg_, repo_root, **kwargs):
+            assert direct_action_tracking_suppressed()
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(
+                p.read_text().replace(
+                    "status: code_complete",
+                    "status: in_review\nreview_verdict: approved",
+                )
+            )
+
+        tracked_start = _track_direct_action("start")(fake_start)
+        tracked_complete = _track_direct_action("complete")(fake_complete)
+        tracked_review = _track_direct_action("review")(fake_review)
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=tracked_start),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.lifecycle.cmd_complete", side_effect=tracked_complete),
+            patch("lanegate.lifecycle.cmd_review", side_effect=tracked_review),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        assert parse_ticket(tickets_dir / "TICK-001.md")["status"] == "in_review"
+
+        logs_dir = tmp_path / ".lanegate" / "logs"
+        direct_action_logs = list(logs_dir.glob("action-*.events.jsonl"))
+        assert direct_action_logs == [], (
+            "orchestrated start/complete/review must suppress direct action tracking logs"
+        )
+
+        orchestrate_logs = list(logs_dir.glob("orchestrate-*.events.jsonl"))
+        assert len(orchestrate_logs) == 1
+        events = [json.loads(line) for line in orchestrate_logs[0].read_text().splitlines() if line]
+        assert any(e.get("event") == "ticket_outcome" for e in events)
+
+    def test_review_pending_resume_suppresses_direct_action(self, tmp_path):
+        """TICK-510: resuming a hibernated review-pending ticket re-invokes
+        cmd_start (to reattach the worktree) and cmd_review (to record the
+        recovered verdict) -- this recovery path must suppress direct-action
+        tracking exactly like a fresh dispatch."""
+        from lanegate.lifecycle import _track_direct_action
+        from lanegate.orchestrate.run_report import direct_action_tracking_suppressed
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def start_review_pending(tid, cfg_, root, **kwargs):
+            assert direct_action_tracking_suppressed()
+            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
+
+        def approve(tid, cfg_, root, **kwargs):
+            assert direct_action_tracking_suppressed()
+            text = path.read_text().replace("status: code_complete", "status: in_review")
+            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
+
+        tracked_start = _track_direct_action("start")(start_review_pending)
+        tracked_review = _track_direct_action("review")(approve)
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=tracked_start),
+            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
+            patch("lanegate.lifecycle.cmd_review", side_effect=tracked_review),
+            patch("lanegate.orchestrate.invoke_executor") as invoke,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        invoke.assert_not_called()
+        assert parse_ticket(path)["status"] == "in_review"
+
+        logs_dir = tmp_path / ".lanegate" / "logs"
+        direct_action_logs = list(logs_dir.glob("action-*.events.jsonl"))
+        assert direct_action_logs == [], (
+            "review-pending resume must suppress direct action tracking logs"
+        )
 
     def test_merge_failure_does_not_crash_orchestrate_run(self, tmp_path, capsys):
         """A merge failure in auto_merge_approved_local_tickets must not crash the
@@ -686,6 +1182,7 @@ class TestCmdOrchestrateWatchDaemon:
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.orchestrate.run_review_agent", side_effect=lambda ticket, repo_root, **kw: (fake_review(ticket["id"], cfg, repo_root), True)[1]),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch("lanegate.lifecycle.cmd_review", side_effect=fake_review),
@@ -739,7 +1236,12 @@ class TestCmdOrchestrateWatchDaemon:
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
         ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False)
+            # recover=False: this test is about the blocked-board diagnostic
+            # printer, not startup recovery. Since _hibernate_orphaned now
+            # also reclaims stranded code_complete tickets (TICK-415 area
+            # fix), the default recover=True would queue TICK-001 for review
+            # resume before the diagnostic scan ever saw it as a lock holder.
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False, recover=False)
 
         captured = capsys.readouterr()
         assert "TICK-002" in captured.out
@@ -757,7 +1259,7 @@ class TestCmdOrchestrateWatchDaemon:
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
         ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False)
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False, recover=False)
 
         captured = capsys.readouterr()
         assert "TICK-002" in captured.out
@@ -795,7 +1297,7 @@ class TestCmdOrchestrateWatchDaemon:
             patch("lanegate.orchestrate.release_orchestrator_lock"),
             patch("lanegate.reviewer.get_worktree_diff", side_effect=ReviewError("no commits")),
         ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False)
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False, recover=False)
 
         captured = capsys.readouterr()
         assert "Ignoring hollow lock holder(s)" in captured.out
@@ -874,6 +1376,7 @@ class TestSiblingRetryOnRateLimit:
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch("lanegate.lifecycle.cmd_review", side_effect=fake_review),
             patch("lanegate.lifecycle.cmd_hibernate") as mock_hibernate,
@@ -983,6 +1486,228 @@ class TestSiblingRetryOnRateLimit:
         mock_hibernate.assert_called_once()
 
 
+def _pool_failure_signature_scenario(tmp_path, num_tickets):
+    """Single-instance pool ('claude-1'), *num_tickets* independent open tickets."""
+    cfg = _default_cfg(tmp_path)
+    cfg["max_parallel"] = 1
+    cfg["executors"] = {"claude-1": {"type": "claude-process"}}
+    cfg["pools"] = {"default": {"executors": ["claude-1"], "strategy": "round-robin"}}
+    tickets_dir = tmp_path / "tickets"
+    for i in range(1, num_tickets + 1):
+        _write_ticket(tickets_dir, f"TICK-{i:03d}", "open", touches=[f"f{i}.py"], priority=i)
+    return cfg, tickets_dir
+
+
+class TestConsecutiveFailureSignatureFallback:
+    def test_below_threshold_falls_through_to_failed(self, tmp_path):
+        """Fewer than the threshold of identically-signatured failures leaves
+        the existing generic failed path untouched — no hibernation."""
+        cfg, tickets_dir = _pool_failure_signature_scenario(tmp_path, 4)
+
+        durations = iter([1.8, 42.0, 81.0, 5.5])
+
+        def fake_invoke(ticket, cfg_, wt, **kwargs):
+            return (
+                1,
+                "",
+                json.dumps(
+                    {
+                        "status": "ERROR",
+                        "error": "timeout waiting for response",
+                        "duration_seconds": next(durations),
+                    }
+                ),
+            )
+
+        def fake_fail(tid, cfg_, repo_root, *, reason=""):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: failed", 1))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail) as mock_fail,
+            patch("lanegate.lifecycle.cmd_hibernate") as mock_hibernate,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                max_parallel=1,
+                human_review="none",
+                all_milestones=True,
+                auto_analyze=False,
+                pool="default",
+            )
+
+        mock_hibernate.assert_not_called()
+        assert {c.args[0] for c in mock_fail.call_args_list} == {
+            "TICK-001",
+            "TICK-002",
+            "TICK-003",
+            "TICK-004",
+        }
+
+    def test_threshold_reached_hibernates_like_rate_limit(self, tmp_path):
+        """5 consecutive identically-signatured failures on one pool instance
+        within the window hibernate the 5th ticket with a rate-limit-marked
+        reason (so resume-watch picks it up) and mark the instance unhealthy,
+        the same as a real rate limit would."""
+        cfg, tickets_dir = _pool_failure_signature_scenario(tmp_path, 5)
+
+        durations = iter([1.8, 42.0, 81.0, 5.5, 12.3])
+
+        def fake_invoke(ticket, cfg_, wt, **kwargs):
+            return (
+                1,
+                "",
+                json.dumps(
+                    {
+                        "status": "ERROR",
+                        "error": "timeout waiting for response",
+                        "duration_seconds": next(durations),
+                    }
+                ),
+            )
+
+        def fake_fail(tid, cfg_, repo_root, *, reason=""):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: failed", 1))
+
+        def fake_hibernate(tid, cfg_, repo_root, *, reason="", **kwargs):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: hibernated", 1))
+
+        from lanegate.executor import is_cooling_down
+        from lanegate.orchestrate.loop import _pool_instance_healthy
+        from lanegate.ticket import _RATE_LIMIT_MARKER
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail) as mock_fail,
+            patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate) as mock_hibernate,
+            patch("lanegate.orchestrate.time.sleep"),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                max_parallel=1,
+                human_review="none",
+                all_milestones=True,
+                auto_analyze=False,
+                pool="default",
+            )
+
+        assert {c.args[0] for c in mock_fail.call_args_list} == {
+            "TICK-001",
+            "TICK-002",
+            "TICK-003",
+            "TICK-004",
+        }
+        mock_hibernate.assert_called_once()
+        hib_call = mock_hibernate.call_args
+        assert hib_call.args[0] == "TICK-005"
+        reason = hib_call.kwargs.get("reason", "")
+        assert _RATE_LIMIT_MARKER in reason
+        assert "pool instance: claude-1" in reason
+        assert is_cooling_down(tmp_path, "claude-1") is True
+        assert _pool_instance_healthy(tmp_path, cfg, "claude-1") is False
+
+    def test_crash_reason_overwrites_stale_needs_review_reason(self, tmp_path):
+        """A fresh crash reason must overwrite whatever is already in
+        '## Needs Review Reason', even if that section holds a stale
+        rate-limit marker left over from an earlier, unrelated hibernation —
+        otherwise classify_needs_review_cause/needs_review_recovery_advice
+        keep pointing at the wrong recovery command forever."""
+        from lanegate.ticket import _RATE_LIMIT_MARKER, needs_review_recovery_advice
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = Path(cfg["tickets_dir"])
+        path = _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"])
+        path.write_text(
+            path.read_text()
+            + f"\n## Needs Review Reason\n\n{_RATE_LIMIT_MARKER} (stale)\n"
+        )
+
+        crash_message = (
+            "ERROR: Existing branch 'tick-001' was preserved because it shares no "
+            "history with 'main'; inspect or explicitly recover it before retrying."
+        )
+        ticket_for_batch = parse_ticket(path)
+
+        batches = iter([[ticket_for_batch], []])
+
+        def fake_next_batch(cfg_, repo_root, milestone=None, *, exclude_touches=None, ticket_ids=None):
+            return next(batches, [])
+
+        with (
+            patch("lanegate.orchestrate.loop.next_batch", side_effect=fake_next_batch),
+            patch("lanegate.lifecycle.cmd_start", side_effect=RuntimeError(crash_message)),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                max_parallel=1,
+                human_review="none",
+                all_milestones=True,
+                auto_analyze=False,
+                recover=False,
+            )
+
+        ticket = parse_ticket(path)
+        assert ticket["status"] == "needs_review"
+        reason_section = ticket["_body"].split("## Needs Review Reason", 1)[1]
+        assert "shares no history with" in reason_section
+        assert _RATE_LIMIT_MARKER not in reason_section
+        assert "reviewer/executor was rate limited" not in needs_review_recovery_advice(ticket)
+
+    def test_differing_signature_never_hibernates(self, tmp_path):
+        cfg, tickets_dir = _pool_failure_signature_scenario(tmp_path, 3)
+
+        errors = iter(["timeout waiting for response", "connection reset by peer", "unexpected EOF"])
+
+        def fake_invoke(ticket, cfg_, wt, **kwargs):
+            return (
+                1,
+                "",
+                json.dumps({"status": "ERROR", "error": next(errors), "duration_seconds": 5.0}),
+            )
+
+        def fake_fail(tid, cfg_, repo_root, *, reason=""):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: failed", 1))
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail) as mock_fail,
+            patch("lanegate.lifecycle.cmd_hibernate") as mock_hibernate,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                max_parallel=1,
+                human_review="none",
+                all_milestones=True,
+                auto_analyze=False,
+                pool="default",
+            )
+
+        mock_hibernate.assert_not_called()
+        assert {c.args[0] for c in mock_fail.call_args_list} == {"TICK-001", "TICK-002", "TICK-003"}
+
+
 # ---------------------------------------------------------------------------
 # Milestone — cmd_orchestrate error, --all bypass, next_batch filtering
 # ---------------------------------------------------------------------------
@@ -1021,11 +1746,26 @@ def _write_milestone_ticket(
 class TestOrchestrateMilestone:
     """Milestone resolution and filtering in cmd_orchestrate and next_batch."""
 
-    def test_no_milestone_no_default_exits_with_error(self, tmp_path, capsys):
-        """cmd_orchestrate without --milestone or default_milestone exits 1 with a clear error."""
+    def test_no_milestone_no_default_no_tickets_use_milestone_runs_clear(self, tmp_path, capsys):
+        """No --milestone/default_milestone, and no ticket uses the field: nothing to scope by,
+        so it runs (treated as --all) instead of hard-erroring on a fresh project."""
         cfg = _default_cfg(tmp_path)
-        # Ensure no default_milestone in cfg
         cfg.pop("default_milestone", None)
+        tickets_dir = tmp_path / "tickets"
+        _write_milestone_ticket(tickets_dir, "TICK-001", "merged", touches=["a.py"])
+
+        cmd_orchestrate(cfg, tmp_path)
+
+        err = capsys.readouterr().err
+        assert "milestone" not in err.lower()
+
+    def test_no_milestone_no_default_tickets_use_milestone_exits_with_error(self, tmp_path, capsys):
+        """cmd_orchestrate without --milestone or default_milestone exits 1 with a clear error
+        once any ticket actually uses the milestone field, since the scope is now ambiguous."""
+        cfg = _default_cfg(tmp_path)
+        cfg.pop("default_milestone", None)
+        tickets_dir = tmp_path / "tickets"
+        _write_milestone_ticket(tickets_dir, "TICK-001", "open", milestone="v1", touches=["a.py"])
 
         with pytest.raises(SystemExit) as exc_info:
             cmd_orchestrate(cfg, tmp_path)
@@ -1036,9 +1776,11 @@ class TestOrchestrateMilestone:
         assert "--all" in err
 
     def test_no_milestone_no_default_explicit_cfg_none_exits(self, tmp_path, capsys):
-        """cfg with default_milestone=None also triggers the error."""
+        """cfg with default_milestone=None also triggers the error when a ticket uses milestone."""
         cfg = _default_cfg(tmp_path)
         cfg["default_milestone"] = None
+        tickets_dir = tmp_path / "tickets"
+        _write_milestone_ticket(tickets_dir, "TICK-001", "open", milestone="v1", touches=["a.py"])
 
         with pytest.raises(SystemExit) as exc_info:
             cmd_orchestrate(cfg, tmp_path)
@@ -1059,6 +1801,7 @@ class TestOrchestrateMilestone:
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.lifecycle.cmd_review"),
         ):
@@ -1338,6 +2081,26 @@ class TestOrchestrateTicketsFlag:
         assert "TICK-999" in err
         assert "unknown" in err.lower()
 
+    def test_tickets_flag_named_executor_ticket_not_flagged_unknown(self, tmp_path, capsys):
+        """TICK-533: a real ticket whose `executor` field names a driver from
+        cfg['executors'] must not be dropped by validate_ticket() (which needs
+        cfg to resolve named drivers) and then reported as an unknown id."""
+        cfg = _default_cfg(tmp_path)
+        cfg.pop("default_milestone", None)
+        cfg["executors"] = {"claude-1": {"type": "claude-process"}}
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+        path = tickets_dir / "TICK-001.md"
+        path.write_text(path.read_text().replace("priority: 1\n", "priority: 1\nexecutor: claude-1\n", 1))
+
+        cmd_orchestrate(
+            cfg, tmp_path, all_milestones=True, tickets=["TICK-001"], dry_run=True
+        )
+
+        err = capsys.readouterr().err
+        assert "unknown" not in err.lower()
+        assert "TICK-001" not in err
+
 
 # ---------------------------------------------------------------------------
 # Auto-analyze drafts
@@ -1369,6 +2132,7 @@ def _write_draft_ticket(
 from lanegate.orchestrate import (  # noqa: E402
     _analyze_drafts,
     _print_draft_analysis_plan,
+    _queue_code_complete_reviews,
     _scan_injection_signals,
 )
 
@@ -1385,7 +2149,18 @@ class TestAnalyzeDrafts:
         with patch("lanegate.analyze.cmd_analyze") as mock_analyze:
             _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
 
-        mock_analyze.assert_called_once_with("TICK-001", cfg, tmp_path)
+        mock_analyze.assert_called_once_with("TICK-001", cfg, tmp_path, pool_name=None)
+
+    def test_analyze_drafts_includes_open_empty_touches(self, tmp_path, capsys):
+        """_analyze_drafts calls cmd_analyze for status:open tickets with empty touches."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=[])
+
+        with patch("lanegate.analyze.cmd_analyze") as mock_analyze:
+            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
+
+        mock_analyze.assert_called_once_with("TICK-001", cfg, tmp_path, pool_name=None)
 
     def test_milestone_filter_respected(self, tmp_path):
         """_analyze_drafts skips drafts that do not match the active milestone."""
@@ -1396,7 +2171,7 @@ class TestAnalyzeDrafts:
 
         analyzed = []
 
-        def fake_analyze(tid, cfg_, repo_root):
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
             analyzed.append(tid)
 
         with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
@@ -1418,7 +2193,7 @@ class TestAnalyzeDrafts:
 
         analyzed = []
 
-        def fake_analyze(tid, cfg_, repo_root):
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
             analyzed.append(tid)
 
         with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
@@ -1435,7 +2210,7 @@ class TestAnalyzeDrafts:
 
         analyzed = []
 
-        def fake_analyze(tid, cfg_, repo_root):
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
             if tid == "TICK-001":
                 raise RuntimeError("analyze failed")
             analyzed.append(tid)
@@ -1448,7 +2223,39 @@ class TestAnalyzeDrafts:
         assert "TICK-002" in analyzed
         captured = capsys.readouterr()
         assert "WARNING" in captured.err
-        assert "TICK-001" in captured.err
+
+    def test_analyze_drafts_skips_already_resolved_drafts(self, tmp_path):
+        """_analyze_drafts must skip draft tickets that already have 'already resolved' in their body."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        path = _write_draft_ticket(tickets_dir, "TICK-001")
+        path.write_text(path.read_text() + "\n## Needs Review Reason\nanalyze: ticket premise appears already resolved\n")
+
+        analyzed = []
+        with patch("lanegate.analyze.cmd_analyze", side_effect=lambda tid, *a, **k: analyzed.append(tid)):
+            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
+
+        assert analyzed == []
+
+    def test_interrupt_stops_draft_analysis_without_touching_next_draft(self, tmp_path, capsys):
+        """Ctrl-C is a run-level stop, not a failure to skip past."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_draft_ticket(tickets_dir, "TICK-001")
+        _write_draft_ticket(tickets_dir, "TICK-002")
+        analyzed = []
+
+        def interrupted_analyze(tid, cfg_, repo_root, pool_name=None):
+            analyzed.append(tid)
+            raise SystemExit(130)
+
+        with patch("lanegate.analyze.cmd_analyze", side_effect=interrupted_analyze):
+            assert _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir) is True
+
+        assert analyzed == ["TICK-001"]
+        assert parse_ticket(tickets_dir / "TICK-001.md")["status"] == "draft"
+        assert parse_ticket(tickets_dir / "TICK-002.md")["status"] == "draft"
+        assert "stopping further dispatch" in capsys.readouterr().err
 
     def test_repeated_identical_failure_stops_the_pass(self, tmp_path, capsys):
         """A systemic failure (identical stderr on consecutive drafts) must stop
@@ -1463,7 +2270,7 @@ class TestAnalyzeDrafts:
 
         analyzed = []
 
-        def fake_analyze(tid, cfg_, repo_root):
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
             import sys as _sys
 
             analyzed.append(tid)
@@ -1478,6 +2285,82 @@ class TestAnalyzeDrafts:
         captured = capsys.readouterr()
         assert "systemic" in captured.err
 
+    def test_failures_with_different_claude_session_metadata_stop_the_pass(self, tmp_path, capsys):
+        """Volatile Claude metadata does not hide a repeated systemic failure."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_draft_ticket(tickets_dir, "TICK-001")
+        _write_draft_ticket(tickets_dir, "TICK-002")
+        _write_draft_ticket(tickets_dir, "TICK-003")
+
+        metadata = {
+            "TICK-001": {
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "message": '{"id":"22222222-2222-4222-8222-222222222222"}',
+                "uuid": "33333333-3333-4333-8333-333333333333",
+                "timestamp": "2026-08-04T12:00:01.123Z",
+                "total_cost_usd": "0.12",
+                "input_tokens": "123",
+                "output_tokens": "45",
+            },
+            "TICK-002": {
+                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "message": '{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}',
+                "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "timestamp": "2026-08-04T12:01:02.456Z",
+                "total_cost_usd": "0.34",
+                "input_tokens": "678",
+                "output_tokens": "90",
+            },
+        }
+        analyzed = []
+
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
+            import sys as _sys
+
+            analyzed.append(tid)
+            print(
+                "ERROR: Claude CLI unavailable "
+                + " ".join(f"{key}={value}" for key, value in metadata[tid].items()),
+                file=_sys.stderr,
+            )
+            _sys.exit(1)
+
+        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
+            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
+
+        assert analyzed == ["TICK-001", "TICK-002"]
+        assert "systemic" in capsys.readouterr().err
+
+    def test_stops_early_once_a_draft_becomes_dispatchable(self, tmp_path):
+        """Once an analyzed draft is dispatchable, the pass returns immediately
+        instead of draining the rest of the draft backlog first — ready work
+        must not sit idle behind unrelated drafts still waiting their turn.
+        """
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_draft_ticket(tickets_dir, "TICK-001")
+        _write_draft_ticket(tickets_dir, "TICK-002")
+
+        analyzed = []
+
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
+            analyzed.append(tid)
+            # Mirror what real cmd_analyze does: flip the ticket open with
+            # real (empty, unblocked) touches once analysis succeeds.
+            path = tickets_dir / f"{tid}.md"
+            path.write_text(
+                path.read_text()
+                .replace("status: draft", "status: open")
+                .replace("close_criteria: TBD.\n", "close_criteria: TBD.\ntouches: [\"a.py\"]\n")
+            )
+
+        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
+            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
+
+        # TICK-002 is left for the next pass, once TICK-001 has been dispatched.
+        assert analyzed == ["TICK-001"]
+
     def test_different_failures_do_not_stop_the_pass(self, tmp_path, capsys):
         """Distinct per-ticket failure reasons are treated as ticket-specific
         content issues, not a systemic problem — the pass keeps going.
@@ -1490,7 +2373,7 @@ class TestAnalyzeDrafts:
 
         analyzed = []
 
-        def fake_analyze(tid, cfg_, repo_root):
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
             import sys as _sys
 
             analyzed.append(tid)
@@ -1534,6 +2417,18 @@ class TestAnalyzeDrafts:
         assert "TICK-001" not in captured.out
         assert "TICK-002" in captured.out
 
+    def test_print_draft_analysis_plan_includes_open_empty_touches(self, tmp_path, capsys):
+        """_print_draft_analysis_plan includes status:open tickets with empty touches in dry-run mode."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=[])
+
+        _print_draft_analysis_plan(cfg, tmp_path, milestone=None, tickets_dir=tickets_dir)
+
+        captured = capsys.readouterr()
+        assert "TICK-001" in captured.out
+        assert "dry-run" in captured.out
+
     def test_no_auto_analyze_flag_bypasses_analyze(self, tmp_path, capsys):
         """--no-auto-analyze (auto_analyze=False) skips _analyze_drafts entirely."""
         cfg = _default_cfg(tmp_path)
@@ -1570,6 +2465,18 @@ class TestAnalyzeDrafts:
 class TestBoardClearingLoopAutoAnalyze:
     """Integration-level tests: auto-analyze wired into the board-clearing loop."""
 
+    def test_next_batch_skips_open_tickets_without_touches(self, tmp_path):
+        """next_batch skips status:open tickets lacking touches so they are not dispatch candidates prior to auto-analysis."""
+        from lanegate.orchestrate import next_batch
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=[])
+        _write_ticket(tickets_dir, "TICK-002", "open", touches=["a.py"])
+
+        batch = next_batch(cfg, tmp_path, milestone=None)
+        assert [t["id"] for t in batch] == ["TICK-002"]
+
     def test_next_batch_called_before_analyze_drafts(self, tmp_path):
         """next_batch is checked before _analyze_drafts runs each loop iteration —
         ready work must never wait behind draft analysis (TICK-261)."""
@@ -1579,7 +2486,9 @@ class TestBoardClearingLoopAutoAnalyze:
 
         call_order = []
 
-        def fake_analyze_drafts(cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None):
+        def fake_analyze_drafts(
+            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None
+        ):
             call_order.append("analyze_drafts")
 
         def fake_next_batch(cfg_, repo_root, milestone=None, *, exclude_touches=None, ticket_ids=None):
@@ -1602,6 +2511,36 @@ class TestBoardClearingLoopAutoAnalyze:
         # after the (no-op) draft analysis.
         assert call_order == ["next_batch", "analyze_drafts", "next_batch"]
 
+    def test_code_complete_reviews_are_queued_before_draft_analysis(self, tmp_path):
+        """Completed work gets a review-resume attempt before draft capacity."""
+        cfg = _default_cfg(tmp_path)
+        events = []
+
+        def fake_next_batch(cfg_, repo_root, milestone=None, *, exclude_touches=None, ticket_ids=None):
+            events.append("next_batch")
+            return []
+
+        def fake_queue(*args, **kwargs):
+            events.append("queue_review")
+            return ["TICK-001"] if events.count("queue_review") == 1 else []
+
+        def fake_analyze_drafts(*args, **kwargs):
+            events.append("analyze_drafts")
+            return True  # end the loop without dispatching a worker
+
+        with (
+            patch("lanegate.orchestrate.loop.next_batch", side_effect=fake_next_batch),
+            patch("lanegate.orchestrate.loop._queue_code_complete_reviews", side_effect=fake_queue),
+            patch("lanegate.orchestrate.loop._analyze_drafts", side_effect=fake_analyze_drafts),
+        ):
+            from lanegate.orchestrate import _drain_loop
+
+            _drain_loop(
+                cfg, tmp_path, max_parallel=2, dry_run=False, human_review="none", auto_analyze=True
+            )
+
+        assert events[:4] == ["next_batch", "queue_review", "next_batch", "analyze_drafts"]
+
     def test_open_ticket_dispatched_before_draft_analyzed(self, tmp_path):
         """Regression for TICK-261: with both an open and a draft ticket in
         scope, the open ticket is claimed/dispatched before the draft is
@@ -1613,7 +2552,9 @@ class TestBoardClearingLoopAutoAnalyze:
 
         events: list[str] = []
 
-        def fake_analyze_drafts(cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None):
+        def fake_analyze_drafts(
+            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None
+        ):
             events.append("analyze_drafts")
 
         def fake_cmd_start(tid, cfg_, repo_root, **kwargs):
@@ -1638,6 +2579,47 @@ class TestBoardClearingLoopAutoAnalyze:
         assert events, "expected TICK-001 to be started"
         assert events[0] == "start:TICK-001"
         assert "analyze_drafts" not in events[: events.index("start:TICK-001")]
+
+    def test_worker_pool_refill_analyze_drafts_respects_ticket_ids(self, tmp_path):
+        """Worker pool refill call to _analyze_drafts must pass ticket_ids so
+        unrelated status:open tickets with empty touches outside explicit scope
+        are not analyzed during parallel execution."""
+        cfg = _default_cfg(tmp_path)
+        cfg["max_parallel"] = 2
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+        _write_ticket(tickets_dir, "TICK-999", "open", touches=[])
+
+        analyzed_tickets = []
+
+        def fake_cmd_analyze(tid, cfg_, repo_root, **kwargs):
+            analyzed_tickets.append(tid)
+
+        def fake_cmd_start(tid, cfg_, repo_root, **kwargs):
+            p = tickets_dir / f"{tid}.md"
+            text = p.read_text().replace("status: open", "status: in_progress")
+            p.write_text(text)
+
+        with (
+            patch("lanegate.analyze.cmd_analyze", side_effect=fake_cmd_analyze),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.lifecycle.cmd_start", side_effect=fake_cmd_start),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.lifecycle.cmd_complete"),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            cmd_orchestrate(
+                cfg,
+                tmp_path,
+                tickets=["TICK-001"],
+                all_milestones=True,
+                auto_analyze=True,
+            )
+
+        assert "TICK-999" not in analyzed_tickets
 
     def test_dry_run_uses_print_plan_not_analyze(self, tmp_path, capsys):
         """In dry-run mode, _print_draft_analysis_plan is called instead of _analyze_drafts,
@@ -1693,7 +2675,7 @@ class TestCombinedModeReviewAttribution:
 
         cfg = _default_cfg(tmp_path)
         cfg["reviewer"] = cfg["executor"]
-        cfg["models"] = {"implement": "combined-mode-model"}
+        cfg["models"] = {"implement": "claude-combined-mode-model"}
         tickets_dir = tmp_path / "tickets"
         _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
 
@@ -1713,6 +2695,7 @@ class TestCombinedModeReviewAttribution:
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]) as static_analysis,
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_merge") as mock_merge,
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
@@ -1726,7 +2709,7 @@ class TestCombinedModeReviewAttribution:
         t = parse_ticket(tickets_dir / "TICK-001.md")
         assert t["review_verdict"] == "approved"
         assert t["review_driver"] == cfg["executor"]
-        assert t["review_model"] == "combined-mode-model"
+        assert t["review_model"] == "claude-combined-mode-model"
         bundles = sorted((tmp_path / ".lanegate" / "executor-runs" / "TICK-001").iterdir())
         assert json.loads((bundles[-1] / "status.json").read_text())["mode"] == "combined"
 
@@ -1756,6 +2739,7 @@ class TestCombinedModeReviewAttribution:
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]) as static_analysis,
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_merge") as mock_merge,
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
@@ -1823,6 +2807,7 @@ class TestCombinedModeReviewAttribution:
             patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch("lanegate.lifecycle.cmd_review", side_effect=fake_review),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
@@ -1867,8 +2852,112 @@ class TestAutoFixCycleGatesMerge:
         tickets_dir = tmp_path / "tickets"
         return _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
 
+    def test_later_run_resumes_rejected_ticket_through_auto_fix(self, tmp_path):
+        """A prior changes_requested verdict must not deadlock its own touches."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        ticket_path = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        worktree = tmp_path / "preserved-worktree"
+        worktree.mkdir()
+        ticket_path.write_text(
+            ticket_path.read_text().replace(
+                "close_criteria:",
+                "review_verdict: changes_requested\n"
+                f"worktree: {worktree}\n"
+                "close_criteria:",
+            )
+        )
+
+        with (
+            patch("lanegate.orchestrate.loop.run_auto_fix_cycle", return_value=False) as auto_fix,
+            patch("lanegate.lifecycle.cmd_start") as start,
+            patch("lanegate.orchestrate.loop.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.loop.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, human_review="none")
+
+        start.assert_not_called()
+        auto_fix.assert_called_once()
+        assert auto_fix.call_args.args[0]["id"] == "TICK-001"
+        assert auto_fix.call_args.args[3] == worktree
+
+    def test_auto_fix_loop_hibernates_on_rate_limit(self, tmp_path):
+        """run_auto_fix_cycle returning None (rate limit during fix pass) must
+        take the hibernate outcome branch, not the changes_requested escalation
+        branch, and must not increment the attempt counter (no escalation)."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        ticket_path = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        worktree = tmp_path / "preserved-worktree"
+        worktree.mkdir()
+        ticket_path.write_text(
+            ticket_path.read_text().replace(
+                "close_criteria:",
+                "review_verdict: changes_requested\n"
+                f"worktree: {worktree}\n"
+                "close_criteria:",
+            )
+        )
+
+        with (
+            patch("lanegate.orchestrate.loop.run_auto_fix_cycle", return_value=None) as auto_fix,
+            patch("lanegate.orchestrate.loop._append_run_event") as append_event,
+            patch("lanegate.lifecycle.cmd_start") as start,
+            patch("lanegate.orchestrate.loop.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.loop.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, human_review="none")
+
+        start.assert_not_called()
+        auto_fix.assert_called_once()
+        outcome_calls = [
+            c for c in append_event.call_args_list if len(c.args) > 2 and c.args[2] == "ticket_outcome"
+        ]
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0].kwargs["outcome"] == "hibernated"
+        assert "rate limit" in outcome_calls[0].kwargs["reason"]
+
+    def test_auto_fix_loop_increments_attempt_only_on_fix_failed(self, tmp_path):
+        """run_auto_fix_cycle returning False (a genuine fix failure or exhausted
+        attempt budget) must take the changes_requested outcome branch, distinct
+        from the rate-limit hibernate branch above."""
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        ticket_path = _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        worktree = tmp_path / "preserved-worktree"
+        worktree.mkdir()
+        ticket_path.write_text(
+            ticket_path.read_text().replace(
+                "close_criteria:",
+                "review_verdict: changes_requested\n"
+                f"worktree: {worktree}\n"
+                "close_criteria:",
+            )
+        )
+
+        with (
+            patch("lanegate.orchestrate.loop.run_auto_fix_cycle", return_value=False) as auto_fix,
+            patch("lanegate.orchestrate.loop._append_run_event") as append_event,
+            patch("lanegate.lifecycle.cmd_start") as start,
+            patch("lanegate.orchestrate.loop.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.loop.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, human_review="none")
+
+        start.assert_not_called()
+        auto_fix.assert_called_once()
+        outcome_calls = [
+            c for c in append_event.call_args_list if len(c.args) > 2 and c.args[2] == "ticket_outcome"
+        ]
+        assert len(outcome_calls) == 1
+        assert outcome_calls[0].kwargs["outcome"] == "changes_requested"
+        assert outcome_calls[0].kwargs["reason"] == "review requested changes"
+
     def _fake_review_agent_approves_with_findings(self, tickets_dir: Path):
-        def fake_review_agent(ticket, repo_root, worktree_path=None, cfg=None):
+        def fake_review_agent(ticket, repo_root, worktree_path=None, cfg=None, pool_name=None):
             p = tickets_dir / f"{ticket['id']}.md"
             text = p.read_text()
             text = text.replace("status: code_complete", "status: in_review", 1)
@@ -1905,6 +2994,7 @@ class TestAutoFixCycleGatesMerge:
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=True),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.orchestrate.autofix.run_fix_agent", return_value=True),
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="abc123"),
@@ -1946,7 +3036,9 @@ class TestAutoFixCycleGatesMerge:
             p = tickets_dir / f"{tid}.md"
             p.write_text(p.read_text().replace("status: open", "status: code_complete", 1))
 
-        def fake_first_review_requests_changes(ticket, repo_root, worktree_path=None, cfg=None):
+        def fake_first_review_requests_changes(
+            ticket, repo_root, worktree_path=None, cfg=None, pool_name=None
+        ):
             p = tickets_dir / f"{ticket['id']}.md"
             p.write_text(
                 p.read_text().replace(
@@ -1962,6 +3054,7 @@ class TestAutoFixCycleGatesMerge:
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch(
                 "lanegate.orchestrate.run_review_agent",
@@ -1993,6 +3086,50 @@ class TestAutoFixCycleGatesMerge:
         assert "## Review Findings (attempt 2)" in ticket["_body"]
         assert ticket.get("drift_check_result") == {"ok": True, "reason": "in scope"}
 
+    def test_exhausted_auto_fix_moves_rejected_ticket_to_needs_review(self, tmp_path):
+        """A failed bounded retry must release its code_complete touch lock."""
+        from lanegate.ticket import parse_ticket
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        cfg["reviewer"] = "claude-process"
+        tickets_dir = tmp_path / "tickets"
+        self._make_open_ticket(tmp_path)
+
+        def fake_complete(tid, cfg_, repo_root):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: open", "status: code_complete", 1))
+
+        def fake_review_requests_changes(ticket, repo_root, worktree_path=None, cfg=None, pool_name=None):
+            p = tickets_dir / f"{ticket['id']}.md"
+            p.write_text(
+                p.read_text().replace(
+                    "status: code_complete", "status: code_complete\nreview_verdict: changes_requested", 1
+                ) + "\n## Review Findings (attempt 1)\n\nremaining defect\n"
+            )
+            return False
+
+        with (
+            patch("lanegate.lifecycle.cmd_start"),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
+            patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
+            patch("lanegate.orchestrate.run_review_agent", side_effect=fake_review_requests_changes),
+            patch("lanegate.orchestrate.loop.run_auto_fix_cycle", return_value=False),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, human_review="none")
+
+        ticket = parse_ticket(tickets_dir / "TICK-001.md")
+        assert ticket["status"] == "needs_review"
+        assert ticket["review_verdict"] == "changes_requested"
+        assert "auto-fix/re-review did not reach approval" in ticket["_body"]
+
     def test_split_mode_full_autonomy_auto_fix_merges_unattended(self, tmp_path):
         """Companion to the supervised/manual gate above: `autonomy: full`
         still merges unattended on re-review approval, unchanged."""
@@ -2009,7 +3146,9 @@ class TestAutoFixCycleGatesMerge:
             p = tickets_dir / f"{tid}.md"
             p.write_text(p.read_text().replace("status: open", "status: code_complete", 1))
 
-        def fake_first_review_requests_changes(ticket, repo_root, worktree_path=None, cfg=None):
+        def fake_first_review_requests_changes(
+            ticket, repo_root, worktree_path=None, cfg=None, pool_name=None
+        ):
             p = tickets_dir / f"{ticket['id']}.md"
             p.write_text(
                 p.read_text().replace(
@@ -2029,6 +3168,7 @@ class TestAutoFixCycleGatesMerge:
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch(
                 "lanegate.orchestrate.run_review_agent",
@@ -2055,3 +3195,451 @@ class TestAutoFixCycleGatesMerge:
         ticket = parse_ticket(tickets_dir / "TICK-001.md")
         assert ticket["status"] == "merged"
         assert ticket["review_verdict"] == "approved"
+
+
+class TestAutonomyLanesAutoFixAndEscalation:
+    """TICK-467: green/yellow risk lanes stay on the automatic amend/
+    re-analyze -> fix -> re-review -> merge path, exactly like autonomy:
+    full. A red-lane risk signal in the diff always escalates to a human —
+    even for a green/yellow/full ticket — with the branch/worktree
+    preserved and explicit resume instructions recorded on the ticket."""
+
+    def _fake_review_agent_approves_with_findings(self, tickets_dir: Path):
+        def fake_review_agent(ticket, repo_root, worktree_path=None, cfg=None, pool_name=None):
+            p = tickets_dir / f"{ticket['id']}.md"
+            text = p.read_text()
+            text = text.replace("status: code_complete", "status: in_review", 1)
+            text = text.replace(
+                "review_verdict: changes_requested", "review_verdict: approved", 1
+            )
+            text += "\n## Review Findings (attempt 2)\n\nminor nit, approved anyway\n"
+            p.write_text(text)
+            return True
+
+        return fake_review_agent
+
+    def test_autonomy_lanes_auto_fix_loop_and_human_escalation(self, tmp_path):
+        from lanegate.reviewer import DriftCheckResult
+        from lanegate.ticket import parse_ticket
+
+        tickets_dir = tmp_path / "tickets"
+
+        # --- green and yellow lanes: fix -> drift-check -> re-review always
+        # runs on changes_requested (unchanged), and — like autonomy: full —
+        # the approved result merges unattended instead of waiting on a
+        # human merge decision. ---
+        for lane, tid in (("green", "TICK-001"), ("yellow", "TICK-002")):
+
+            def _fake_complete(t, cfg_, repo_root, _tid=tid):
+                p = tickets_dir / f"{_tid}.md"
+                p.write_text(p.read_text().replace("status: open", "status: code_complete", 1))
+
+            def _fake_first_review_requests_changes(
+                ticket, repo_root, worktree_path=None, cfg=None, pool_name=None, _tid=tid
+            ):
+                p = tickets_dir / f"{_tid}.md"
+                p.write_text(
+                    p.read_text().replace(
+                        "status: code_complete",
+                        "status: code_complete\nreview_verdict: changes_requested",
+                        1,
+                    )
+                    + "\n## Review Findings (attempt 1)\n\noriginal finding\n"
+                )
+                return False
+
+            def _fake_merge(t, cfg_, repo_root, _tid=tid):
+                p = tickets_dir / f"{_tid}.md"
+                p.write_text(p.read_text().replace("status: in_review", "status: merged", 1))
+
+            cfg = _default_cfg(tmp_path)
+            cfg["autonomy"] = lane
+            cfg["reviewer"] = "claude-process"
+            _write_ticket(tickets_dir, tid, "open", touches=["a.py"])
+
+            with (
+                patch("lanegate.lifecycle.cmd_start"),
+                patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+                patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+                patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+                patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+                patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+                patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
+                patch("lanegate.lifecycle.cmd_complete", side_effect=_fake_complete),
+                patch(
+                    "lanegate.orchestrate.run_review_agent",
+                    side_effect=_fake_first_review_requests_changes,
+                ),
+                patch("lanegate.orchestrate.autofix.run_fix_agent", return_value=True),
+                patch("lanegate.orchestrate.autofix._git_head_sha", return_value="abc123"),
+                patch(
+                    "lanegate.orchestrate.autofix.run_drift_check",
+                    return_value=DriftCheckResult(ok=True, reason="in scope"),
+                ),
+                patch(
+                    "lanegate.orchestrate.autofix.run_review_agent",
+                    side_effect=self._fake_review_agent_approves_with_findings(tickets_dir),
+                ),
+                patch("lanegate.lifecycle.cmd_merge", side_effect=_fake_merge) as mock_merge,
+                patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+                patch("lanegate.orchestrate.release_orchestrator_lock"),
+            ):
+                cmd_orchestrate(cfg, tmp_path, all_milestones=True, human_review="none")
+
+            mock_merge.assert_called_once()
+            ticket = parse_ticket(tickets_dir / f"{tid}.md")
+            assert ticket["status"] == "merged", f"{lane} lane did not auto-merge unattended"
+            assert ticket["review_verdict"] == "approved"
+
+        # --- red lane: a risk-lane signal in the diff always escalates to a
+        # human, regardless of autonomy — an in-progress ticket moves to
+        # needs_review through the escalation path and records explicit resume
+        # instructions. ---
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        _write_ticket(tickets_dir, "TICK-003", "open", touches=["b.py"])
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
+            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red"),
+            patch("lanegate.lifecycle.cmd_complete") as mock_complete,
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge_red,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_complete.assert_not_called()
+        mock_merge_red.assert_not_called()
+
+        ticket = parse_ticket(tickets_dir / "TICK-003.md")
+        assert ticket["status"] == "needs_review"
+        assert "## Human Escalation" in ticket["_body"]
+        assert "lanegate human-review TICK-003" in ticket["_body"]
+        assert "preserved" in ticket["_body"]
+        assert ticket.get("branch") is None
+        assert ticket.get("worktree") is None
+
+    def test_diff_capture_failure_escalates_to_needs_review(self, tmp_path):
+        from lanegate.ticket import parse_ticket
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-004", "open", touches=["b.py"])
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch(
+                "lanegate.orchestrate.loop._git_text",
+                return_value=GitText("", "unknown revision 'main'"),
+            ),
+            patch("lanegate.orchestrate.loop.scan_risk_lane") as mock_scan,
+            patch("lanegate.lifecycle.cmd_complete") as mock_complete,
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_scan.assert_not_called()
+        mock_complete.assert_not_called()
+        mock_merge.assert_not_called()
+
+        ticket = parse_ticket(tickets_dir / "TICK-004.md")
+        assert ticket["status"] == "needs_review"
+        assert "risk scan unavailable" in ticket["_body"]
+        assert "unknown revision 'main'" in ticket["_body"]
+
+    def test_diff_capture_failure_forces_code_complete_to_needs_review(self, tmp_path):
+        """A combined executor can call `lanegate complete` and then exit
+        before recording a review verdict, leaving the ticket `code_complete`
+        rather than `in_progress`. pause_for_needs_review's fallback for that
+        status used to only log a warning without changing status, so a
+        failed risk scan on a code_complete ticket left it stranded for
+        `_hibernate_orphaned` to queue for review — letting full autonomy
+        auto-merge it without ever repeating the failed scan."""
+        from lanegate.ticket import parse_ticket
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        cfg["reviewer"] = cfg["executor"]
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-005", "open", touches=["b.py"])
+
+        def fake_stream(*_args, **_kwargs):
+            p = tickets_dir / "TICK-005.md"
+            p.write_text(p.read_text().replace("status: open", "status: code_complete", 1))
+            return (0, "", "")
+
+        with (
+            patch("lanegate.lifecycle.cmd_start"),
+            patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_stream),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch(
+                "lanegate.orchestrate.loop._git_text",
+                return_value=GitText("", "unknown revision 'main'"),
+            ),
+            patch("lanegate.orchestrate.loop.scan_risk_lane") as mock_scan,
+            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_scan.assert_not_called()
+        mock_merge.assert_not_called()
+
+        ticket = parse_ticket(tickets_dir / "TICK-005.md")
+        assert ticket["status"] == "needs_review"
+        assert "risk scan unavailable" in ticket["_body"]
+        assert "unknown revision 'main'" in ticket["_body"]
+
+
+def test_orchestrate_startup_recovers_rate_limited_review_harness(tmp_path):
+    """Orchestrate startup recovery pass must automatically restore rate-limited review harness tickets to review_pending."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"])
+
+    bundle_dir = tmp_path / ".lanegate" / "executor-runs" / "TICK-001" / "run1"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "status.json").write_text(json.dumps({"step": "review"}), encoding="utf-8")
+    (bundle_dir / "verdict.json").write_text(
+        json.dumps(
+            {
+                "verdict": "error",
+                "notes": "Review was not performed: reviewer rate limited.",
+                "findings": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (bundle_dir / "captured-output.txt").write_text("429 Too Many Requests", encoding="utf-8")
+
+    with (
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+        patch("lanegate.orchestrate._drain_loop"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    ticket = parse_ticket(tickets_dir / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+    assert ticket.get("review_pending") is True
+
+
+def test_orchestrate_startup_does_not_resume_protected_path_with_stale_429_bundle(tmp_path):
+    """Startup recovery must leave a protected-path escalation out of the resume queue."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    path = _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"])
+    path.write_text(
+        path.read_text()
+        + "\n## Hibernation Reason\n\nrate limit or quota interruption (executor exited 429)\n"
+        + "\n## Needs Review Reason\n\nsecurity_sensitive_paths — human review required\n"
+    )
+
+    bundle_dir = tmp_path / ".lanegate" / "executor-runs" / "TICK-001" / "run1"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "status.json").write_text(json.dumps({"step": "review"}), encoding="utf-8")
+    (bundle_dir / "verdict.json").write_text(
+        json.dumps({"verdict": "error", "findings": ""}), encoding="utf-8"
+    )
+    (bundle_dir / "captured-output.txt").write_text("429 Too Many Requests", encoding="utf-8")
+
+    with (
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    ticket = parse_ticket(path)
+    assert ticket["status"] == "needs_review"
+    assert not ticket.get("review_pending")
+
+
+def test_orchestrate_startup_recovery_respects_milestone_scoping(tmp_path):
+    """Startup rate-limited review recovery must filter by effective milestone."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_milestone_ticket(tickets_dir, "TICK-001", "needs_review", milestone="v1", touches=["a.py"])
+    _write_milestone_ticket(tickets_dir, "TICK-002", "needs_review", milestone="v2", touches=["b.py"])
+
+    for tid in ["TICK-001", "TICK-002"]:
+        bundle_dir = tmp_path / ".lanegate" / "executor-runs" / tid / "run1"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / "status.json").write_text(json.dumps({"step": "review"}), encoding="utf-8")
+        (bundle_dir / "verdict.json").write_text(
+            json.dumps({"verdict": "error", "notes": "Rate limited", "findings": ""}),
+            encoding="utf-8",
+        )
+        (bundle_dir / "captured-output.txt").write_text("429 Too Many Requests", encoding="utf-8")
+
+    with (
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+        patch("lanegate.orchestrate._drain_loop"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, milestone="v1")
+
+    t1 = parse_ticket(tickets_dir / "TICK-001.md")
+    t2 = parse_ticket(tickets_dir / "TICK-002.md")
+    assert t1["status"] == "hibernated"
+    assert t1.get("review_pending") is True
+    assert t2["status"] == "needs_review"
+    assert not t2.get("review_pending")
+
+
+def test_orchestrate_startup_recovery_respects_ticket_ids_scoping(tmp_path):
+    """Startup rate-limited review recovery must filter by effective ticket_ids."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"])
+    _write_ticket(tickets_dir, "TICK-002", "needs_review", touches=["b.py"])
+
+    for tid in ["TICK-001", "TICK-002"]:
+        bundle_dir = tmp_path / ".lanegate" / "executor-runs" / tid / "run1"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        (bundle_dir / "status.json").write_text(json.dumps({"step": "review"}), encoding="utf-8")
+        (bundle_dir / "verdict.json").write_text(
+            json.dumps({"verdict": "error", "notes": "Rate limited", "findings": ""}),
+            encoding="utf-8",
+        )
+        (bundle_dir / "captured-output.txt").write_text("429 Too Many Requests", encoding="utf-8")
+
+    with (
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+        patch("lanegate.orchestrate._drain_loop"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, all_milestones=True, tickets=["TICK-001"])
+
+    t1 = parse_ticket(tickets_dir / "TICK-001.md")
+    t2 = parse_ticket(tickets_dir / "TICK-002.md")
+    assert t1["status"] == "hibernated"
+    assert t1.get("review_pending") is True
+    assert t2["status"] == "needs_review"
+    assert not t2.get("review_pending")
+
+
+def test_orchestrate_startup_recovery_suppresses_output_when_zero_recovered(tmp_path, capsys):
+    """Startup rate-limited review recovery must not print log noise when 0 tickets are recovered."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "needs_review", touches=["a.py"])
+
+    with (
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+        patch("lanegate.orchestrate._drain_loop"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    captured = capsys.readouterr()
+    assert "Recovered 0 rate-limited review ticket(s)" not in captured.out
+    assert "Recovered 0 rate-limited review ticket(s)" not in captured.err
+
+
+class TestHibernateOrphanedReclaimsCodeComplete:
+    def test_stranded_code_complete_becomes_review_pending(self, tmp_path):
+        """A code_complete ticket seen at startup cannot belong to a worker in
+        this run (none have dispatched yet) -- it was left behind by a prior
+        session that ended before review ran. _hibernate_orphaned must queue
+        it for review resume instead of leaving it stuck until someone runs
+        `lanegate review` by hand."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+
+        count = _hibernate_orphaned(cfg, tmp_path)
+
+        assert count == 1
+        ticket = parse_ticket(tickets_dir / "TICK-001.md")
+        assert ticket["status"] == "hibernated"
+        assert ticket.get("review_pending") is True
+
+    def test_in_progress_orphan_handling_is_unaffected(self, tmp_path):
+        """Regression guard: extending _hibernate_orphaned to code_complete
+        must not change its existing in_progress orphan behavior."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "in_progress", touches=["a.py"])
+
+        count = _hibernate_orphaned(cfg, tmp_path)
+
+        assert count == 1
+        ticket = parse_ticket(tickets_dir / "TICK-001.md")
+        assert ticket["status"] == "hibernated"
+        assert not ticket.get("review_pending")
+
+    def test_queue_code_complete_reviews_excludes_changes_requested(self, tmp_path):
+        """A rejected review must remain available to fix, not be re-reviewed."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "code_complete", touches=["a.py"])
+        rejected = _write_ticket(tickets_dir, "TICK-002", "code_complete", touches=["b.py"])
+        rejected.write_text(
+            rejected.read_text().replace(
+                "close_criteria:", "review_verdict: changes_requested\nclose_criteria:"
+            )
+        )
+
+        assert _queue_code_complete_reviews(cfg, tmp_path) == ["TICK-001"]
+
+        queued = parse_ticket(tickets_dir / "TICK-001.md")
+        assert queued["status"] == "hibernated"
+        assert queued.get("review_pending") is True
+        still_rejected = parse_ticket(tickets_dir / "TICK-002.md")
+        assert still_rejected["status"] == "code_complete"
+        assert still_rejected["review_verdict"] == "changes_requested"
+
+    def test_no_orphans_returns_zero(self, tmp_path):
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+        assert _hibernate_orphaned(cfg, tmp_path) == 0
+        assert parse_ticket(tickets_dir / "TICK-001.md")["status"] == "open"
+
+
+def test_run_start_event_records_manual_trigger_by_default(tmp_path, monkeypatch):
+    import json
+    import time
+    from lanegate.orchestrate.loop import cmd_orchestrate
+
+    monkeypatch.delenv("LANEGATE_RUN_TRIGGER", raising=False)
+    monkeypatch.delenv("LANEGATE_RUN_TRIGGER_REASON", raising=False)
+    cfg = _default_cfg(tmp_path)
+    cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    logs_dir = tmp_path / ".lanegate" / "logs"
+    event_files = list(logs_dir.glob("orchestrate-*.events.jsonl"))
+    assert len(event_files) == 1
+    events = [json.loads(line) for line in event_files[0].read_text().splitlines() if line]
+    run_start = next(e for e in events if e.get("event") == "run_start")
+    assert run_start["triggered_by"] == "manual"
+    assert run_start.get("trigger_reason") is None
+
+    time.sleep(1.1)
+    monkeypatch.setenv("LANEGATE_RUN_TRIGGER", "resume-watch")
+    monkeypatch.setenv("LANEGATE_RUN_TRIGGER_REASON", "rate limit on TICK-1")
+    cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    event_files_after = list(logs_dir.glob("orchestrate-*.events.jsonl"))
+    assert len(event_files_after) == 2
+    latest_file = max(event_files_after, key=lambda p: p.stat().st_mtime)
+    events_latest = [json.loads(line) for line in latest_file.read_text().splitlines() if line]
+    run_start_latest = next(e for e in events_latest if e.get("event") == "run_start")
+    assert run_start_latest["triggered_by"] == "resume-watch"
+    assert run_start_latest["trigger_reason"] == "rate limit on TICK-1"

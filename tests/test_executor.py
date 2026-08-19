@@ -14,14 +14,19 @@ from lanegate.executor import (
     build_executor_cmd,
     clear_all_cooldowns,
     clear_cooldown,
+    clear_failure_streak,
     cmd_executor_reset,
     cmd_executor_status,
     dispatch_executor,
     executor_status_rows,
     get_executor_config,
     is_cooling_down,
+    _parse_reset_time,
+    parse_codex_json_result,
     parse_retry_after,
     read_cooldown,
+    record_failure_signature,
+    reject_ollama_for_code_step,
     resolve_executor_env,
     write_cooldown,
 )
@@ -161,6 +166,57 @@ def test_build_executor_cmd_stdin_omits_ollama_prompt():
     assert build_executor_cmd("ollama", "prompt", {}, use_stdin=True) == ["ollama", "run", "llama3"]
 
 
+def test_build_executor_cmd_ollama_flags_land_after_run():
+    """ollama's `run` subcommand flags (e.g. --think=false) are only parsed
+    correctly after `run <model>` -- before it, ollama misparses the model
+    name and tries a registry pull instead."""
+    cfg = {"executors": {"ollama": {"flags": ["--nowordwrap", "--think=false"]}}}
+    cmd = build_executor_cmd("ollama", "prompt", cfg, model="qwen3:27b", use_stdin=True)
+    assert cmd == ["ollama", "run", "qwen3:27b", "--nowordwrap", "--think=false"]
+
+
+def test_build_executor_cmd_agy_session_resume_uses_conversation_flag():
+    cmd = build_executor_cmd(
+        "agy",
+        "implement changes",
+        {},
+        analyze_session_id="conv-12345",
+    )
+    assert "--conversation" in cmd
+    conv_idx = cmd.index("--conversation")
+    assert cmd[conv_idx + 1] == "conv-12345"
+    assert "--resume" not in cmd
+    assert "--output-format" in cmd
+    assert "--print" in cmd
+    assert cmd[-1] == "implement changes"
+
+
+def test_build_implement_prompt_states_working_directory(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    ticket = {"id": "TICK-999", "title": "T", "touches": [], "close_criteria": "ok", "_body": ""}
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+    # Agents that browse for their own cwd instead of reading it here waste
+    # real turns re-discovering it (observed live: TICK-410's agy dispatch
+    # spent several calls locating the worktree before this line existed).
+    assert str(tmp_path) in prompt
+
+
+def test_build_implement_prompt_includes_global_and_per_file_notes(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    notes = tmp_path / ".lanegate" / "notes"
+    notes.mkdir(parents=True)
+    (notes / "global.md").write_text("project-wide constraint")
+    (notes / "src_module.py.md").write_text("module-specific constraint")
+    ticket = {"id": "TICK-999", "title": "T", "touches": ["src/module.py"], "close_criteria": "ok", "_body": ""}
+
+    prompt = build_implement_prompt(ticket, tmp_path)
+
+    assert "project-wide constraint" in prompt
+    assert "module-specific constraint" in prompt
+
+
 def test_build_implement_prompt_truncates_oversized_change_notes(tmp_path):
     from lanegate.executor import build_implement_prompt
 
@@ -172,6 +228,94 @@ def test_build_implement_prompt_truncates_oversized_change_notes(tmp_path):
     prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg=cfg)
     planned = prompt.split("## Planned changes\n", 1)[1].split("<untrusted-data>", 1)[0]
     assert len(("## Planned changes\n" + planned).encode("utf-8")) <= get_payload_budget("implement", cfg) + 2
+
+
+def test_build_implement_prompt_surfaces_overlapping_cross_ticket_change_notes(tmp_path):
+    """A prior *merged* ticket's change_notes for a file the new ticket also
+    touches should be folded into the implement prompt (TICK-481: git-tracked
+    change_notes replaces the dead worktree-vs-repo_root per-file
+    .lanegate/notes/ mechanism)."""
+    from lanegate.executor import build_implement_prompt
+
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    (tickets_dir / "TICK-100.md").write_text(
+        "---\nid: TICK-100\ntitle: Prior work\nstatus: merged\n"
+        "touches:\n  - foo.py\n---\n"
+        "## Change Notes\n**foo.py**: retries silently on timeout, a hang here looks like success\n"
+    )
+
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+    ticket = {
+        "id": "TICK-200", "title": "New work", "touches": ["foo.py"],
+        "close_criteria": "ok", "_body": "",
+    }
+    prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg=cfg)
+
+    assert "Prior Change Notes" in prompt
+    assert "TICK-100" in prompt
+    assert "retries silently on timeout" in prompt
+
+
+def _init_git_repo_with_commit(root, filename="x.py", content="x = 1\n"):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=root, check=True)
+    (root / filename).write_text(content)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=root, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_implement_prompt_trust_plan_when_no_drift(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    sha = _init_git_repo_with_commit(tmp_path)
+    ticket = {
+        "id": "TICK-999", "title": "T", "touches": ["x.py"], "close_criteria": "ok",
+        "analyzed_at_sha": sha, "_body": "",
+    }
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+    assert "Trust the planned changes" in prompt
+    assert "verify exact signatures" not in prompt
+
+
+def test_implement_prompt_verify_files_on_drift(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    sha = _init_git_repo_with_commit(tmp_path)
+    (tmp_path / "x.py").write_text("x = 2\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "drift"], cwd=tmp_path, check=True)
+    ticket = {
+        "id": "TICK-999", "title": "T", "touches": ["x.py"], "close_criteria": "ok",
+        "analyzed_at_sha": sha, "_body": "",
+    }
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+    assert "`x.py`" in prompt
+    assert "Commits have touched" in prompt
+    assert "Trust the planned changes" not in prompt
+
+
+def test_build_executor_cmd_disallowed_tools_adds_flag():
+    cmd = build_executor_cmd(
+        "claude", "do the thing", {"executors": {}}, disallowed_tools=["Bash", "Write", "Edit"]
+    )
+    assert "--disallowedTools" in cmd
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Bash,Write,Edit"
+
+
+def test_build_executor_cmd_no_disallowed_tools_omits_flag():
+    cmd = build_executor_cmd("claude", "do the thing", {"executors": {}})
+    assert "--disallowedTools" not in cmd
+
+
+def test_build_executor_cmd_disallowed_tools_ignored_for_non_claude():
+    """The flag is Claude-CLI-specific; other executor types must not see it."""
+    cmd = build_executor_cmd("ollama", "prompt", {}, disallowed_tools=["Bash"])
+    assert "--disallowedTools" not in cmd
 
 
 def test_build_executor_cmd_claude_subagent_builds_command():
@@ -197,6 +341,66 @@ def test_build_executor_cmd_agy_builds_command(monkeypatch):
     # prompt (google-antigravity/antigravity-cli#76), so nothing may follow
     # the prompt in the argv list.
     assert cmd[-2:] == ["--print", "do the thing"]
+
+
+def test_build_executor_cmd_agy_print_timeout(monkeypatch):
+    # agy's own client-side --print-timeout defaults to a hard 5 minutes,
+    # which kills long implement sessions before lanegate's own outer
+    # timeout ever triggers (TICK-457). lanegate must always pass an
+    # explicit override rather than relying on agy's CLI default.
+    monkeypatch.setattr(
+        "lanegate.executor.shutil.which",
+        lambda bin_name: "/usr/local/bin/agy" if bin_name == "agy" else None,
+    )
+    cmd = build_executor_cmd("agy", "do the thing", {"executors": {}}, step="implement")
+    assert "--print-timeout" in cmd
+    # Must come before --print, since --print swallows the next token as the
+    # prompt and nothing may follow it in argv.
+    assert cmd.index("--print-timeout") < cmd.index("--print")
+    timeout_value = cmd[cmd.index("--print-timeout") + 1]
+    # agy's --print-timeout is a Go time.Duration string and requires a unit
+    # suffix -- a bare integer errors with "missing unit in duration".
+    assert timeout_value.endswith("s")
+    assert timeout_value[:-1].isdigit()
+    assert int(timeout_value[:-1]) > 300  # strictly beyond agy's 5-minute default
+
+    # A project-configured override takes precedence over the built-in default.
+    cfg = {"executors": {}, "print_timeout_seconds": {"implement": 120}}
+    configured_cmd = build_executor_cmd("agy", "do the thing", cfg, step="implement")
+    assert configured_cmd[configured_cmd.index("--print-timeout") + 1] == "120s"
+
+
+def test_aider_missing_no_gitignore_warns_on_real_dispatch(tmp_path, monkeypatch, capsys):
+    """Aider silently modifies .gitignore unless told not to, which
+    LaneGate's own scope-drift check then flags as an unexpected committed
+    file -- a hand-written config missing --no-gitignore should be warned,
+    not silently left to hit that pause later."""
+    monkeypatch.chdir(tmp_path)
+    cfg = {"executors": {"aider": {"flags": ["--yes-always"]}}}
+
+    build_executor_cmd("aider", "add a helper", cfg, read_only=False)
+
+    assert "--no-gitignore" in capsys.readouterr().err
+
+
+def test_aider_with_no_gitignore_flag_does_not_warn(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    cfg = {"executors": {"aider": {"flags": ["--yes-always", "--no-gitignore"]}}}
+
+    build_executor_cmd("aider", "add a helper", cfg, read_only=False)
+
+    assert "--no-gitignore" not in capsys.readouterr().err
+
+
+def test_aider_missing_no_gitignore_does_not_warn_on_read_only_dispatch(tmp_path, monkeypatch, capsys):
+    """analyze runs aider with --dry-run -- no commit ever happens, so the
+    .gitignore side effect this warning exists for cannot occur."""
+    monkeypatch.chdir(tmp_path)
+    cfg = {"executors": {"aider": {"flags": ["--yes-always"]}}}
+
+    build_executor_cmd("aider", "analyze this", cfg, read_only=True)
+
+    assert "--no-gitignore" not in capsys.readouterr().err
 
 
 def test_aider_context_budget_allows_small_prompt_and_file(tmp_path, monkeypatch):
@@ -353,6 +557,100 @@ def test_aider_context_budget_is_opt_in(tmp_path, monkeypatch):
     assert cmd == ["aider", "--message", "implement this", "large.py"]
 
 
+def test_build_executor_cmd_aider_context_tiers_selects_tier_1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x" * 300)
+    cfg = {
+        "executors": {
+            "aider": {
+                "context_tiers": [
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                ]
+            }
+        }
+    }
+    cmd = build_executor_cmd(
+        "aider", "small prompt", cfg, touches=["small.py"], worktree_path=tmp_path
+    )
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen2.5-coder:7b"
+
+
+def test_build_executor_cmd_aider_context_tiers_escalates_to_tier_2(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "large.py").write_text("x" * 60_000)
+    cfg = {
+        "executors": {
+            "aider": {
+                "context_tiers": [
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                ]
+            }
+        }
+    }
+    cmd = build_executor_cmd(
+        "aider", "large prompt", cfg, touches=["large.py"], worktree_path=tmp_path
+    )
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen2.5-coder:32b"
+
+
+def test_build_executor_cmd_aider_context_tiers_unsorted_selects_smallest_fitting_tier(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x" * 300)
+    cfg = {
+        "executors": {
+            "aider": {
+                "context_tiers": [
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                ]
+            }
+        }
+    }
+    cmd = build_executor_cmd(
+        "aider", "small prompt", cfg, touches=["small.py"], worktree_path=tmp_path
+    )
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen2.5-coder:7b"
+
+
+def test_build_executor_cmd_aider_context_tiers_exceeds_max_tier_raises_config_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "huge.py").write_text("x" * 150_000)
+    cfg = {
+        "executors": {
+            "aider": {
+                "context_tiers": [
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                ]
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="exceeds all configured context_tiers") as exc_info:
+        build_executor_cmd(
+            "aider", "huge prompt", cfg, touches=["huge.py"], worktree_path=tmp_path
+        )
+
+    msg = str(exc_info.value)
+    assert "max available tier: 40000 tokens" in msg
+    assert "Route to a larger executor" in msg
+
+
+def test_build_executor_cmd_aider_unconfigured_context_tiers_preserves_standard_behavior(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "file.py").write_text("x" * 300)
+    cfg = {"executors": {"aider": {"context_window_tokens": 15_000}}}
+    cmd = build_executor_cmd(
+        "aider", "test prompt", cfg, model="default-model", touches=["file.py"], worktree_path=tmp_path
+    )
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "default-model"
+
+
 def test_build_executor_cmd_aider_edit_format_adds_flag(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     cfg = {"executors": {"aider": {"edit_format": "diff"}}}
@@ -377,6 +675,69 @@ def test_build_executor_cmd_aider_edit_format_invalid_raises_config_error(tmp_pa
 
     with pytest.raises(ConfigError, match="edit_format must be a non-empty string"):
         build_executor_cmd("aider", "implement this", cfg, touches=["small.py"])
+
+
+@pytest.mark.parametrize(
+    "executor_type,flag,flag_value",
+    [
+        ("aider", "--dry-run", None),
+        ("codex", "--sandbox", "read-only"),
+        ("agy", "--mode", "plan"),
+    ],
+)
+def test_build_executor_cmd_readonly_injects_flag(tmp_path, monkeypatch, executor_type, flag, flag_value):
+    monkeypatch.chdir(tmp_path)
+
+    cmd = build_executor_cmd(executor_type, "analyze this", {}, read_only=True)
+
+    assert flag in cmd
+    if flag_value is not None:
+        assert cmd[cmd.index(flag) + 1] == flag_value
+
+
+def test_build_executor_cmd_aider_readonly_forces_ask_edit_format(tmp_path, monkeypatch):
+    """A read-only aider call (analyze) must use the 'ask' coder, which never
+    tries to produce a diff/whole-file edit, regardless of any configured
+    edit_format (--chat-mode is just an alias for --edit-format, not a
+    distinct safety mode; --dry-run alone doesn't stop aider from framing
+    the request as a code edit)."""
+    monkeypatch.chdir(tmp_path)
+    cfg = {"executors": {"aider": {"edit_format": "whole"}}}
+
+    cmd = build_executor_cmd("aider", "analyze this", cfg, read_only=True)
+
+    assert cmd[cmd.index("--edit-format") + 1] == "ask"
+
+
+@pytest.mark.parametrize(
+    "executor_type,flag",
+    [
+        ("aider", "--dry-run"),
+        ("codex", "--sandbox"),
+        ("agy", "--mode"),
+    ],
+)
+def test_build_executor_cmd_not_readonly_omits_flag(tmp_path, monkeypatch, executor_type, flag):
+    monkeypatch.chdir(tmp_path)
+
+    cmd = build_executor_cmd(executor_type, "implement this", {}, read_only=False)
+
+    assert flag not in cmd
+
+
+class TestRejectOllamaForCodeStep:
+    @pytest.mark.parametrize("step", ["implement", "review", "fix", "drift_check"])
+    def test_raises_for_ollama_code_steps(self, step):
+        with pytest.raises(ConfigError, match="ollama"):
+            reject_ollama_for_code_step(step, "ollama")
+
+    def test_no_raise_for_ollama_analyze(self):
+        reject_ollama_for_code_step("analyze", "ollama")
+
+    @pytest.mark.parametrize("executor_type", ["claude", "aider", "codex"])
+    @pytest.mark.parametrize("step", ["implement", "review", "fix", "drift_check", "analyze"])
+    def test_no_raise_for_non_ollama_executors(self, executor_type, step):
+        reject_ollama_for_code_step(step, executor_type)
 
 
 def _init_git_repo_with_files(root, files):
@@ -449,8 +810,52 @@ def test_build_executor_cmd_aider_does_not_neutralize_touched_files(tmp_path):
     assert "​" not in message
 
 
+def test_build_executor_cmd_aider_neutralize_touches_omits_positional_args_only(tmp_path):
+    _init_git_repo_with_files(tmp_path, ["small.py", "other.py"])
+    cfg = {"executors": {"aider": {"neutralize_touches": True}}}
+
+    cmd = build_executor_cmd(
+        "aider",
+        "Edit small.py and other.py together.",
+        cfg,
+        touches=["small.py", "other.py"],
+        worktree_path=tmp_path,
+    )
+
+    # neutralize_touches only defers the eager positional preload; touches
+    # must stay unmangled in the prompt so Aider's own filename-mention
+    # auto-add can still find and load them by their real names.
+    message = cmd[cmd.index("--message") + 1]
+    assert "small.py" in message
+    assert "other.py" in message
+    assert "​" not in message
+    assert "small.py" not in cmd[cmd.index("--message") + 2:]
+    assert "other.py" not in cmd[cmd.index("--message") + 2:]
+
+
+def test_check_aider_context_budget_neutralize_touches_still_counts_touch_sizes(tmp_path):
+    # A 100,000-byte touch (~33,000 tokens) must still blow a 10,000 token
+    # budget even with neutralize_touches=True: Aider's auto-add will pull
+    # the file in during the run regardless of the deferred positional load,
+    # so skipping it from the preflight estimate would let Aider crash
+    # mid-run instead of failing fast before launch.
+    _init_git_repo_with_files(tmp_path, ["huge.py"])
+    (tmp_path / "huge.py").write_text("x = 1\n" * 20_000)
+
+    cfg = {"executors": {"aider": {"context_window_tokens": 10_000, "neutralize_touches": True}}}
+
+    with pytest.raises(ConfigError, match="context preflight exceeded"):
+        build_executor_cmd(
+            "aider",
+            "Refactor huge.py.",
+            cfg,
+            touches=["huge.py"],
+            worktree_path=tmp_path,
+        )
+
+
 def test_aider_ollama_unconfigured_warning(capsys):
-    cfg = {"executors": {"aider": {"provider": "ollama"}}}
+    cfg = {"executors": {"aider": {"provider": "ollama", "flags": ["--no-gitignore"]}}}
 
     build_executor_cmd("aider", "implement TICK-299", cfg)
 
@@ -464,7 +869,7 @@ def test_aider_ollama_unconfigured_warning(capsys):
 def test_aider_ollama_unconfigured_warning_named_driver(capsys):
     cfg = {
         "drivers": {"local-aider": {"type": "aider", "provider": "ollama"}},
-        "executors": {"local-aider": {"type": "aider"}},
+        "executors": {"local-aider": {"type": "aider", "flags": ["--no-gitignore"]}},
     }
 
     build_executor_cmd("local-aider", "implement TICK-299", cfg)
@@ -478,7 +883,11 @@ def test_aider_ollama_unconfigured_warning_named_driver(capsys):
 def test_aider_ollama_configured_no_warning(capsys):
     cfg = {
         "executors": {
-            "aider": {"provider": "ollama", "context_window_tokens": 10_000}
+            "aider": {
+                "provider": "ollama",
+                "context_window_tokens": 10_000,
+                "flags": ["--no-gitignore"],
+            }
         }
     }
 
@@ -488,7 +897,9 @@ def test_aider_ollama_configured_no_warning(capsys):
 
 
 def test_aider_no_provider_declared_no_warning(capsys):
-    build_executor_cmd("aider", "implement TICK-299", {"executors": {"aider": {}}})
+    build_executor_cmd(
+        "aider", "implement TICK-299", {"executors": {"aider": {"flags": ["--no-gitignore"]}}}
+    )
 
     assert capsys.readouterr().err == ""
 
@@ -771,6 +1182,54 @@ def test_parse_retry_after_resets_at_already_past_rolls_to_tomorrow():
     assert parsed > datetime.datetime.now(datetime.UTC)
 
 
+def test_parse_retry_after_weekly_dated_resets():
+    fixed_now = datetime.datetime(2026, 8, 4, 20, 0, 0, tzinfo=datetime.UTC)
+    with mock.patch("lanegate.executor._utc_now", return_value=fixed_now):
+        until = parse_retry_after("You've hit your weekly limit - resets Aug 7, 6am (America/Los_Angeles)")
+        assert until is not None
+        assert until == "2026-08-07T13:00:00+00:00"
+
+        until = parse_retry_after("resets 7 Aug, 6am (America/Los_Angeles)")
+        assert until is not None
+        assert until == "2026-08-07T13:00:00+00:00"
+
+        until = parse_retry_after("You've hit your Opus weekly limit - resets Aug 7, 6am")
+        assert until is not None
+        assert until == "2026-08-07T06:00:00+00:00"
+
+        until = parse_retry_after("resets 7 Aug, 6am")
+        assert until is not None
+        assert until == "2026-08-07T06:00:00+00:00"
+
+
+def test_parse_retry_after_explicit_date_past_year_rollover():
+    fixed_now = datetime.datetime(2026, 8, 8, 20, 0, 0, tzinfo=datetime.UTC)
+    with mock.patch("lanegate.executor._utc_now", return_value=fixed_now):
+        until = parse_retry_after("resets Aug 7, 6am (America/Los_Angeles)")
+        assert until is not None
+        assert until == "2027-08-07T13:00:00+00:00"
+
+    # A persisted hint is stale rather than a new weekly-limit report: keep
+    # its original year so the resume watcher retries instead of sleeping a year.
+    assert _parse_reset_time(
+        "resets Aug 7, 6am (America/Los_Angeles)",
+        now=fixed_now,
+        allow_rollover=False,
+    ) == datetime.datetime(2026, 8, 7, 13, 0, 0, tzinfo=datetime.UTC)
+
+
+def test_parse_retry_after_session_and_legacy_phrasings():
+    fixed_now = datetime.datetime(2026, 8, 4, 20, 0, 0, tzinfo=datetime.UTC)
+    with mock.patch("lanegate.executor._utc_now", return_value=fixed_now):
+        until = parse_retry_after("You've hit your session limit · resets 4:40pm (America/Los_Angeles)")
+        assert until is not None
+        assert until == "2026-08-04T23:40:00+00:00"
+
+        until = parse_retry_after("usage limit reached, resets 9:00pm")
+        assert until is not None
+        assert until == "2026-08-04T21:00:00+00:00"
+
+
 def test_parse_retry_after_resets_at_unknown_timezone_returns_none():
     assert parse_retry_after("resets 4:40pm (Not/AZone)") is None
 
@@ -926,6 +1385,27 @@ def test_clear_all_cooldowns_removes_every_file(tmp_path):
     assert set(cleared) == {"claude-1", "claude-2"}
     assert is_cooling_down(tmp_path, "claude-1") is False
     assert is_cooling_down(tmp_path, "claude-2") is False
+
+
+class TestFailureSignatureTracking:
+    def test_reaches_threshold_on_matching_signature(self, tmp_path):
+        assert record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=3) is False
+        assert record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=3) is False
+        assert record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=3) is True
+
+    def test_different_signature_resets_streak(self, tmp_path):
+        record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=3)
+        record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=3)
+        assert record_failure_signature(tmp_path, "agy-1", "sig-b", window_s=900, threshold=3) is False
+
+    def test_window_expiry_resets_streak(self, tmp_path):
+        record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=0, threshold=2)
+        assert record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=0, threshold=2) is False
+
+    def test_clear_failure_streak_resets_count(self, tmp_path):
+        record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=1)
+        clear_failure_streak(tmp_path, "agy-1")
+        assert record_failure_signature(tmp_path, "agy-1", "sig-a", window_s=900, threshold=1) is True
 
 
 def test_available_instances_skips_cooling_down(tmp_path):
@@ -1403,7 +1883,7 @@ def test_implement_prompt_bounded_under_configured_budget(tmp_path):
 
     _write_large_arch_doc(tmp_path)
     ticket = _implement_ticket()
-    cfg = {"payload_budgets": {"implement": 500}}
+    cfg = {"reference_docs": ["docs/ARCHITECTURE.md"], "payload_budgets": {"implement": 500}}
 
     prompt = build_implement_prompt(ticket, project_root=tmp_path, cfg=cfg)
 
@@ -1421,7 +1901,7 @@ def test_describe_implement_payload_returns_component_metadata(tmp_path):
     _write_large_arch_doc(tmp_path)
     ticket = _implement_ticket()
 
-    components = describe_implement_payload(ticket, project_root=tmp_path)
+    components = describe_implement_payload(ticket, project_root=tmp_path, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
     assert isinstance(components, list)
     assert components  # non-empty
@@ -1432,7 +1912,7 @@ def test_describe_implement_payload_returns_component_metadata(tmp_path):
         assert component["step"] == "implement"
     labels = {c["label"] for c in components}
     assert "instruction-template" in labels
-    assert "architecture-excerpt:docs/ARCHITECTURE.md" in labels
+    assert "reference-excerpt:docs/ARCHITECTURE.md" in labels
     assert "ticket-body" in labels
 
 
@@ -1463,6 +1943,22 @@ def test_describe_implement_payload_accounting_deterministic(tmp_path):
     assert first == second
 
 
+def test_describe_implement_payload_reports_code_map_notice_size_when_skeletons_exceed_10kb(tmp_path):
+    from unittest.mock import patch
+    from lanegate.executor import describe_implement_payload
+
+    ticket = _implement_ticket(id="TICK-406", touches=["lanegate/big_module.py"])
+    large_skeleton = "def large_func():\n    pass\n" * 750
+    assert len(large_skeleton.encode("utf-8")) > 10240
+
+    with patch("lanegate.executor.load_file_skeletons", return_value={"lanegate/big_module.py": large_skeleton}):
+        components = describe_implement_payload(ticket, project_root=tmp_path)
+
+    skel_comp = next(c for c in components if c["label"] == "file-skeletons")
+    assert skel_comp["bytes"] < 10240
+    assert skel_comp["bytes"] > 0
+
+
 def test_describe_implement_payload_reports_truncated_change_notes(tmp_path):
     """Payload audit must describe the bounded text actually injected."""
     from lanegate.executor import describe_implement_payload
@@ -1487,7 +1983,7 @@ def test_build_executor_cmd_agy_session_resumption():
         model="gemini-3.6-flash-medium",
         analyze_session_id="sess-123",
     )
-    assert "--resume" in cmd
+    assert "--conversation" in cmd
     assert "sess-123" in cmd
     assert "--model" in cmd
     assert "gemini-3.6-flash-medium" in cmd
@@ -1556,5 +2052,150 @@ def test_build_implement_prompt_adaptive_skeletons(tmp_path):
     }
     large_prompt = build_implement_prompt(large_ticket, project_root=tmp_path)
     assert "## Code Map Notice" in large_prompt
-    assert "IMPORTANT: To prevent signature hallucinations" in large_prompt
+    assert "lanegate symbols" in large_prompt
     assert "## File skeletons" not in large_prompt
+    # The sidecar notice must not tell the agent to grep instead of using
+    # `lanegate symbols` -- that contradiction sent TICK-413's implement
+    # dispatch straight to grep, bypassing the discovery-guidance ranking.
+    assert "or grep before making changes" not in large_prompt
+    # Discovery guidance must not claim skeletons are "below" when they were
+    # actually diverted to the sidecar file referenced above.
+    assert "FILE SKELETONS below" not in large_prompt
+
+
+def test_implement_prompt_skeletons(tmp_path):
+    """TICK-412: implement dispatch regenerates skeletons from the current
+    worktree file rather than replaying a stale analyze-time snapshot."""
+    from lanegate.executor import build_implement_prompt
+
+    touched = tmp_path / "lanegate" / "orchestrate.py"
+    touched.parent.mkdir(parents=True)
+    touched.write_text("def run_loop(board, executors):\n    pass\n")
+
+    ticket = _implement_ticket(
+        file_skeletons={"lanegate/orchestrate.py": "lanegate/orchestrate.py  (1 lines)\n  line   1: def stale_signature()"}
+    )
+
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+
+    assert "## File skeletons" in prompt
+    assert "def run_loop(board, executors)" in prompt
+    assert "def stale_signature()" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# parse_codex_json_result — TICK-408: normalize uncached input, num_turns,
+# cost_usd so Codex rows are comparable to Claude rows in step_costs.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_codex_json_result_subtracts_cache_read_from_input_tokens():
+    """A multi-turn Codex session's final turn.completed usage is cumulative
+    across the whole session and its input_tokens includes cache reads --
+    unlike Claude, whose usage.input_tokens is already uncached-only. Without
+    subtracting cache_read out, a heavily-cached Codex session reports a
+    multi-million-token "input" that swamps every Claude row it's averaged
+    against (the real bug: 2,690,615 in / 2,553,856 cache_read logged as-is)."""
+    jsonl = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 2_690_615,
+                "cached_input_tokens": 2_553_856,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 400,
+                "reasoning_output_tokens": 0,
+            },
+        }
+    )
+    parsed = parse_codex_json_result(jsonl)
+    assert parsed["input_tokens"] == 2_690_615 - 2_553_856
+    assert parsed["cache_read_tokens"] == 2_553_856
+
+
+def test_parse_codex_json_result_num_turns_counts_turn_completed_events():
+    jsonl = "\n".join(
+        [
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 1}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 20, "output_tokens": 1}}),
+            json.dumps({"type": "turn.completed", "usage": {"input_tokens": 30, "output_tokens": 1}}),
+        ]
+    )
+    parsed = parse_codex_json_result(jsonl)
+    assert parsed["num_turns"] == 3
+
+
+def test_parse_codex_json_result_num_turns_zero_events_but_present_returns_none():
+    """No turn.completed at all means no usage block either -- the existing
+    'return None for the whole parse' behavior, not num_turns=0."""
+    assert parse_codex_json_result(json.dumps({"type": "thread.started"})) is None
+
+
+def test_parse_codex_json_result_populates_cost_usd_from_normalized_tokens():
+    """Codex's own JSONL never reports a dollar figure -- cost_usd must still
+    come out populated (not 0, not None) so a codex-heavy step doesn't make
+    step_costs' total cost look claude-only while its token average is
+    codex-dominated."""
+    jsonl = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 100_000,
+                "cached_input_tokens": 90_000,
+                "output_tokens": 1_000,
+            },
+        }
+    )
+    parsed = parse_codex_json_result(jsonl)
+    assert parsed["cost_usd"] is not None
+    assert parsed["cost_usd"] > 0
+    # Cost must scale with the *normalized* uncached input (10,000), not the
+    # raw cumulative-including-cache figure (100,000) -- otherwise a heavily
+    # cached session would still be overpriced by the old cumulative bug.
+    cheap_cached_jsonl = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 100_000, "cached_input_tokens": 99_999, "output_tokens": 1_000},
+        }
+    )
+    cheap_parsed = parse_codex_json_result(cheap_cached_jsonl)
+    assert cheap_parsed["cost_usd"] < parsed["cost_usd"]
+
+
+def test_implement_prompt_preserves_matrix_and_preflight(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    ticket = {
+        "id": "TICK-515", "title": "Harden lifecycle", "touches": ["lanegate/lifecycle/__init__.py"],
+        "close_criteria": "Lifecycle remains safe.", "_body": "",
+        "acceptance_matrix": {
+            "invariants": ["Status transitions stay atomic."],
+            "adversarial_cases": ["A stale worktree is blocked."],
+            "compatibility_cases": ["Existing start remains supported."],
+            "regression_tests": ["test_stale_worktree_is_blocked"],
+        },
+        "overlap_review": {"mode": "stacked_review", "ticket_ids": ["TICK-514"]},
+    }
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+    for item in (
+        "Status transitions stay atomic.", "A stale worktree is blocked.",
+        "Existing start remains supported.", "test_stale_worktree_is_blocked", "TICK-514",
+    ):
+        assert item in prompt
+    assert "Map every item below to an exact test before editing." in prompt
+    assert "remove every artifact outside the declared touches" in prompt
+
+
+def test_implement_prompt_omits_invalid_overlap_plan_from_trusted_context(tmp_path):
+    from lanegate.executor import build_implement_prompt
+
+    ticket = {
+        "id": "TICK-001", "title": "Fix README", "touches": ["README.md"],
+        "close_criteria": "README is corrected.", "_body": "",
+        "acceptance_matrix": {"invariants": ["Links remain valid."]},
+        "overlap_review": {"mode": "none", "ticket_ids": ["TICK-001"]},
+    }
+
+    prompt = build_implement_prompt(ticket, project_root=tmp_path)
+
+    assert "Active overlap plan" not in prompt

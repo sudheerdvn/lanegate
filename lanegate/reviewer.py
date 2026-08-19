@@ -9,22 +9,29 @@ the trusted system layer.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from lanegate.config import load_config, resolve_trunk_branch
 from lanegate.executor import matching_verification_groups
+from lanegate.safeguards import effective_safeguards
+from lanegate.ticket import load_acceptance_contract_audit, load_change_notes
 from lanegate.prompts import (
+    _resolve_control_root,
     build_prompt,
     component_for as _component,
-    get_bounded_architecture_excerpt,
+    get_bounded_reference_excerpts,
     get_payload_budget,
     load_project_guidance,
     load_prompt_template,
+    render_discovery_guidance,
     render_prompt,
+    resolve_reference_doc_paths,
     truncate_to_budget,
 )
+from lanegate.ticket import load_file_skeletons
 
 
 class ReviewError(Exception):
@@ -51,13 +58,21 @@ def _trunk_branch(repo_root: Path) -> str:
 def get_worktree_diff(worktree_path: Path, branch: str, base: str | None = None) -> str:
     """Return the git diff between *base* and *branch* from within the worktree.
 
+    Uses the three-dot (``base...branch``) form, which diffs against the
+    merge-base of *base* and *branch* rather than *base*'s current tip. If
+    *base* has advanced since *branch* diverged (e.g. another ticket merged
+    mid-run, the normal parallel case), a two-dot diff would compare tip vs.
+    tip and include every base-side change as spurious reversals on *branch*.
+    Three-dot isolates *branch*'s own changes regardless of how far *base*
+    has moved.
+
     Args:
         worktree_path: Absolute path to the ticket's git worktree directory.
         branch: The ticket's branch name (e.g. ``"tick-042"``).
         base: The base ref to diff against (default: the resolved trunk branch).
 
     Returns:
-        The diff text (stdout of ``git diff base..branch``).
+        The diff text (stdout of ``git diff base...branch``).
 
     Raises:
         ReviewError: If the worktree path does not exist, the git command fails,
@@ -70,14 +85,14 @@ def get_worktree_diff(worktree_path: Path, branch: str, base: str | None = None)
         )
 
     result = subprocess.run(
-        ["git", "diff", f"{base}..{branch}"],
+        ["git", "diff", f"{base}...{branch}"],
         cwd=str(worktree_path),
         capture_output=True,
         text=True, encoding="utf-8",
     )
     if result.returncode != 0:
         raise ReviewError(
-            f"git diff {base}..{branch} failed (exit {result.returncode}): {result.stderr.strip()}"
+            f"git diff {base}...{branch} failed (exit {result.returncode}): {result.stderr.strip()}"
         )
 
     diff_text = result.stdout
@@ -91,27 +106,30 @@ def get_worktree_diff(worktree_path: Path, branch: str, base: str | None = None)
 
 
 def worktree_has_commits(ticket: dict, repo_root: Path, base: str | None = None) -> bool:
-    """True if the ticket's worktree branch has real commits ahead of *base*.
+    """True if the ticket's branch has real commits ahead of *base*.
 
     Distinguishes "an executor actually did work here" from "this ticket's
     worktree/branch fields point somewhere with nothing committed to it" --
     e.g. a pre-flight gate blocked before any executor ran, or a ticket's
     status field was hand-edited without the branch ever being touched.
-    repo_root is unused directly (worktree is always stored as an absolute
-    path) but kept in the signature since callers reason about a ticket in
-    the context of a specific repo.
+
+    A missing ``worktree`` does not mean no commits: ``cmd_hibernate --reset``
+    preserves recovery work by clearing ``ticket["worktree"]`` while
+    deliberately keeping ``ticket["branch"]`` and the branch ref itself
+    (hibernate.py's "preserving branch ... resume with `lanegate start`"
+    path). Checking the branch from *repo_root* -- not requiring a worktree
+    directory to run in -- catches that case; a bare working directory has
+    every branch ref available regardless of which worktrees currently exist.
     """
     base = base or _trunk_branch(repo_root)
-    wt = ticket.get("worktree")
     branch = ticket.get("branch")
-    if not wt or not branch:
+    if not branch:
         return False
-    wt_path = Path(wt)
-    if not wt_path.is_dir():
-        return False
+    wt = ticket.get("worktree")
+    cwd = Path(wt) if wt and Path(wt).is_dir() else Path(repo_root)
     result = subprocess.run(
-        ["git", "rev-list", "--count", f"{base}..{branch}"],
-        cwd=str(wt_path),
+        ["git", "rev-list", "--count", f"{base}..refs/heads/{branch}"],
+        cwd=str(cwd),
         capture_output=True,
         text=True, encoding="utf-8",
     )
@@ -121,6 +139,22 @@ def worktree_has_commits(ticket: dict, repo_root: Path, base: str | None = None)
         return int(result.stdout.strip()) > 0
     except ValueError:
         return False
+
+
+def _current_head_sha(worktree_path: Path) -> str | None:
+    """Return the current HEAD commit sha in *worktree_path*, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True, encoding="utf-8",
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def get_commit_messages(worktree_path: Path, branch: str, base: str | None = None) -> str:
@@ -229,6 +263,27 @@ def parse_drift_check_result(raw: str) -> DriftCheckResult:
         return DriftCheckResult(ok=False, reason=f"Drift check parse error: {exc}")
 
 
+# Matches the built-in test-runner invocations safeguards.py itself
+# special-cases (pytest / npm test / cargo test / go test) so a lint/type-check/
+# deploy-script guard (also valid safeguard entries) is never mistaken for a
+# test having run.
+# Recognizes `make <target>` and `npm run <x>` only when the target
+# is explicitly test-named. Those command forms also run lint, type-check, and
+# build targets, none of which prove tests have run. Qualified test target names
+# such as `test:unit` and `integration-test` count as test-shaped.
+_TEST_TARGET_NAME = r"(?:[A-Za-z0-9]+[-_:./])*tests?(?:[-_:./][A-Za-z0-9]+)*"
+_TEST_GUARD_PATTERN = re.compile(
+    rf"(?:^|[\s;&|])(?:pytest|npm\s+test|cargo\s+test|go\s+test)\b|"
+    rf"(?:^|[\s;&|])(?:npm\s+run|make)\s+{_TEST_TARGET_NAME}(?=$|[\s;&|])",
+    re.IGNORECASE,
+)
+
+
+def _test_shaped_guards(guards: list[str]) -> list[str]:
+    """Return only the entries of *guards* that invoke a built-in test runner."""
+    return [g for g in guards if _TEST_GUARD_PATTERN.search(str(g))]
+
+
 def build_review_prompt(
     ticket: dict,
     commit_messages: str = "",
@@ -236,6 +291,7 @@ def build_review_prompt(
     cfg: dict | None = None,
     *,
     _components: list | None = None,
+    worktree_path: Path | None = None,
 ) -> str:
     """Return a trust-separated prompt for reviewing *ticket*.
 
@@ -262,16 +318,30 @@ def build_review_prompt(
         cfg: Loaded LaneGate config.  When provided, ``project_guidance`` controls
             which repo-local coding/contribution instructions are added to the
             trusted prompt layer.
+        worktree_path: Path to the ticket's git worktree (if distinct from project_root).
 
     Returns:
         A fully-rendered prompt string safe to pass to the review agent.
     """
-    root = project_root if project_root is not None else Path.cwd()
+    raw_root = project_root if project_root is not None else Path.cwd()
+    wt = worktree_path if worktree_path is not None else raw_root
+    root = _resolve_control_root(raw_root)
 
     tid = ticket["id"]
     title = ticket.get("title", tid)
     close_criteria = ticket.get("close_criteria", "")
     touches = ", ".join(ticket.get("touches") or []) or "none"
+
+    # Review previously received no code structure whatsoever — only
+    # guidance prose, reference excerpts, change notes and ticket fields — so a
+    # reviewer had to re-read files just to learn what a changed symbol was.
+    # Regenerated from the worktree rather than replayed from analyze, since the
+    # whole point here is to describe the code as the implementer left it.
+    # Loaded before the template renders: the discovery guidance below needs to
+    # know whether skeletons actually loaded, not just whether the ticket
+    # declares touches — a ticket can declare touches for files that don't
+    # parse (new files, non-code files) and get zero skeletons back.
+    review_skeletons = load_file_skeletons(ticket, wt, regenerate=True)
 
     # Load the instruction text from the configurable template
     template = load_prompt_template("review", root)
@@ -281,6 +351,10 @@ def build_review_prompt(
         title=title,
         close_criteria=close_criteria,
         touches=touches,
+        working_directory=str(wt),
+        discovery_guidance=render_discovery_guidance(
+            cfg, has_skeletons=bool(review_skeletons)
+        ),
     ).strip()
 
     # Build the trusted instruction layer with base instruction + prior findings.
@@ -288,21 +362,102 @@ def build_review_prompt(
     # ticket to the model, so this stays a stable, cacheable prefix across tickets.
     trusted_parts = [instruction]
 
+    # Whether the reviewer should re-run tests depends on the
+    # *effective* pre_complete/pre_merge safeguards for this specific ticket
+    # (project config plus any permitted per-ticket override via
+    # effective_safeguards()) -- a static "check .lanegate.yml" instruction in
+    # the template can't see per-ticket overrides, so this is computed here
+    # instead of left to the model to infer from a config file it may only
+    # partially read.
+    #
+    # A guard list entry is not necessarily a test: safeguards also cover
+    # lint/type-check/deploy scripts (docs/config-reference.md), so only
+    # entries that actually invoke one of the built-in test runners count --
+    # otherwise a lint-only pre_complete guard would wrongly tell the
+    # reviewer tests already ran when nothing tested anything.
+    pre_complete_test_guards = _test_shaped_guards(
+        effective_safeguards("pre_complete", ticket, cfg or {})
+    )
+    pre_merge_test_guards = _test_shaped_guards(
+        effective_safeguards("pre_merge", ticket, cfg or {})
+    )
+    # A "do not re-run" claim is only true if pre_complete last
+    # verified the commit under review right now. The auto-fix cycle
+    # (run_fix_agent -> run_drift_check -> run_review_agent) commits new code
+    # without re-running pre_complete, so without this check a fix commit
+    # that breaks a test would still be told "tests already ran".
+    verified_sha = ticket.get("pre_complete_verified_sha")
+    pre_complete_still_current = bool(verified_sha) and verified_sha == _current_head_sha(wt)
+    if pre_complete_test_guards and pre_complete_still_current:
+        already_ran = ", ".join(pre_complete_test_guards)
+        if pre_merge_test_guards:
+            detail = (
+                f"`{already_ran}` already ran deterministically via `pre_complete` in "
+                "this worktree before this review, and "
+                f"`{', '.join(pre_merge_test_guards)}` will run again via `pre_merge`/"
+                "`post_merge_verify` around the merge."
+            )
+        else:
+            detail = (
+                f"`{already_ran}` already ran deterministically via `pre_complete` in "
+                "this worktree before this review. No `pre_merge` test guard is "
+                "configured, so nothing verifies tests again at merge time."
+            )
+        trusted_parts.append(
+            "## Test execution — do not re-run\n\n"
+            f"{detail} Judge test coverage (see below) by reading the test and the "
+            "diff, not by re-executing it."
+        )
+    else:
+        if pre_merge_test_guards:
+            detail = (
+                f"`pre_merge`/`post_merge_verify` will run `{', '.join(pre_merge_test_guards)}` "
+                "around the merge, but no `pre_complete` test guard is configured, so "
+                "nothing has run tests on this exact commit yet."
+            )
+        else:
+            detail = "No pre_complete or pre_merge test command is configured for this ticket."
+        trusted_parts.append(
+            "## Test execution — not yet verified\n\n"
+            f"{detail} If CLOSE CRITERIA implies behavior that needs verifying by "
+            "running code, running the relevant tests yourself now is the most "
+            "reliable check available before merge."
+        )
+
     declared_touches = ticket.get("touches") or []
 
+    ref_doc_paths = resolve_reference_doc_paths(root, cfg)
     project_guidance = load_project_guidance(
-        root, cfg, step="review", relevant_paths=declared_touches
+        root, cfg, step="review", relevant_paths=declared_touches,
+        exclude_paths=ref_doc_paths or None,
     )
     if project_guidance:
         trusted_parts.append(project_guidance)
 
-    arch_excerpt, arch_component = get_bounded_architecture_excerpt(
+    ref_excerpt, ref_components = get_bounded_reference_excerpts(
         root, declared_touches, cfg=cfg, step="review"
     )
-    if arch_excerpt:
-        trusted_parts.append(arch_excerpt)
+    if ref_excerpt:
+        trusted_parts.append(ref_excerpt)
 
-    change_notes = ticket.get("change_notes") or {}
+    bounded_skeletons = ""
+    if review_skeletons:
+        skeleton_text = "\n".join(review_skeletons.values())
+        bounded_skeletons, _ = truncate_to_budget(
+            skeleton_text, get_payload_budget("review", cfg)
+        )
+    if _components is not None:
+        _components.append(
+            _component(
+                "file-skeletons",
+                "ticket.touches (AST skeleton)",
+                "review",
+                "\n".join(review_skeletons.values()) if review_skeletons else "",
+                reason="regenerated-from-worktree" if review_skeletons else "no-skeletons",
+            )
+        )
+
+    change_notes = load_change_notes(ticket)
     if change_notes:
         planned_changes = "## Planned changes\n" + "\n".join(
             f"**{f}**: {note}" for f, note in change_notes.items()
@@ -326,7 +481,7 @@ def build_review_prompt(
             "with findings referencing the unresolved items."
         )
 
-    contract_audit = ticket.get("acceptance_contract_audit") or {}
+    contract_audit = load_acceptance_contract_audit(ticket)
     contract_findings = []
     if isinstance(contract_audit, dict) and contract_audit.get("ok") is False:
         raw_findings = contract_audit.get("findings") or []
@@ -384,6 +539,8 @@ def build_review_prompt(
         "CLOSE CRITERIA": close_criteria,
         "TOUCHES": touches,
     }
+    if bounded_skeletons:
+        untrusted_sections["FILE SKELETONS"] = bounded_skeletons
     bounded_commit_messages = ""
     bounded_prior_findings = ""
     bounded_contract_findings = ""
@@ -413,7 +570,7 @@ def build_review_prompt(
             "project-guidance", "project_guidance.files", "review", project_guidance,
             reason="matched-and-bounded" if project_guidance else "no-matching-files",
         ))
-        _components.append(arch_component)
+        _components.extend(ref_components)
         _components.append(_component("ticket-title", "ticket.title", "review", title))
         _components.append(_component("ticket-close-criteria", "ticket.close_criteria", "review", close_criteria))
         _components.append(_component("ticket-touches", "ticket.touches", "review", touches))
@@ -452,15 +609,16 @@ def describe_review_payload(
     commit_messages: str = "",
     project_root: Path | None = None,
     cfg: dict | None = None,
+    worktree_path: Path | None = None,
 ) -> list[dict]:
     """Return a machine-readable breakdown of every component in the review
     prompt payload -- byte/token estimate, source, pipeline step, and whether
     it's always injected or selected because of the ticket. Component
-    metadata only; never includes actual ticket/findings text (TICK-306
-    payload audit).
+    metadata only; never includes actual ticket/findings text (payload
+    audit).
     """
     components: list = []
-    build_review_prompt(ticket, commit_messages, project_root, cfg, _components=components)
+    build_review_prompt(ticket, commit_messages, project_root, cfg, _components=components, worktree_path=worktree_path)
     return [c.as_dict() for c in components]
 
 
@@ -472,6 +630,7 @@ def build_fix_prompt(
     cfg: dict | None = None,
     *,
     _components: list | None = None,
+    worktree_path: Path | None = None,
 ) -> str:
     """Return a trust-separated prompt instructing an executor to address
     review findings on ticket's existing diff.
@@ -490,11 +649,14 @@ def build_fix_prompt(
         cfg: Loaded LaneGate config.  When provided, ``project_guidance``
             controls which repo-local coding/contribution instructions are
             added to the trusted prompt layer.
+        worktree_path: Path to the ticket's git worktree (if distinct from project_root).
 
     Returns:
         A fully-rendered prompt string safe to pass to the fix agent.
     """
-    root = project_root if project_root is not None else Path.cwd()
+    raw_root = project_root if project_root is not None else Path.cwd()
+    wt = worktree_path if worktree_path is not None else raw_root
+    root = _resolve_control_root(raw_root)
     diff, _ = truncate_to_budget(diff, get_payload_budget("fix", cfg))
     findings, _ = truncate_to_budget(findings, get_payload_budget("fix", cfg))
 
@@ -511,23 +673,26 @@ def build_fix_prompt(
         close_criteria=close_criteria,
         touches=touches,
         diff=diff,
+        working_directory=str(wt),
     ).strip()
 
     trusted_parts = [instruction]
 
     declared_touches = ticket.get("touches") or []
 
+    ref_doc_paths = resolve_reference_doc_paths(root, cfg)
     project_guidance = load_project_guidance(
-        root, cfg, step="review", relevant_paths=declared_touches
+        root, cfg, step="review", relevant_paths=declared_touches,
+        exclude_paths=ref_doc_paths or None,
     )
     if project_guidance:
         trusted_parts.append(project_guidance)
 
-    arch_excerpt, arch_component = get_bounded_architecture_excerpt(
+    ref_excerpt, ref_components = get_bounded_reference_excerpts(
         root, declared_touches, cfg=cfg, step="fix"
     )
-    if arch_excerpt:
-        trusted_parts.append(arch_excerpt)
+    if ref_excerpt:
+        trusted_parts.append(ref_excerpt)
 
     if findings:
         # Findings text is reviewer-LLM-generated and routinely quotes the diff
@@ -555,7 +720,7 @@ def build_fix_prompt(
             "project-guidance", "project_guidance.files", "fix", project_guidance,
             reason="matched-and-bounded" if project_guidance else "no-matching-files",
         ))
-        _components.append(arch_component)
+        _components.extend(ref_components)
         _components.append(_component("ticket-title", "ticket.title", "fix", title))
         _components.append(_component("ticket-close-criteria", "ticket.close_criteria", "fix", close_criteria))
         _components.append(_component("git-diff", "worktree diff", "fix", diff, reason="selected-by-ticket"))
@@ -575,81 +740,17 @@ def describe_fix_payload(
     findings: str,
     project_root: Path | None = None,
     cfg: dict | None = None,
+    worktree_path: Path | None = None,
 ) -> list[dict]:
     """Return a machine-readable breakdown of every component in the fix
     prompt payload -- byte/token estimate, source, pipeline step, and whether
     it's always injected or selected because of the ticket/diff. Component
-    metadata only; never includes actual ticket/diff/findings text (TICK-306
-    payload audit).
+    metadata only; never includes actual ticket/diff/findings text (payload
+    audit).
     """
     components: list = []
-    build_fix_prompt(ticket, diff, findings, project_root, cfg, _components=components)
+    build_fix_prompt(ticket, diff, findings, project_root, cfg, _components=components, worktree_path=worktree_path)
     return [c.as_dict() for c in components]
-
-
-def run_review_agent(
-    prompt: str,
-    ticket: dict,
-    cfg: dict | None = None,
-) -> ReviewResult:
-    """
-    Run a review agent subprocess with driver resolution.
-
-    When cfg is None, defaults to hardcoded ["claude", "-p", prompt] for
-    backward compatibility. When cfg is provided, uses resolve_driver and
-    expand_driver to determine the review executor and build the command.
-
-    Args:
-        prompt: The review prompt to pass to the agent.
-        ticket: The ticket dict (used for driver resolution).
-        cfg: Loaded LaneGate config dict. When None, defaults to hardcoded claude.
-
-    Returns:
-        A ReviewResult with the parsed verdict, notes, and findings.
-    """
-    import subprocess
-
-    if cfg is None:
-        cmd = ["claude", "-p", prompt]
-        env = None
-    else:
-        from lanegate.executor import build_executor_cmd, get_executor_config, resolve_executor_env
-        from lanegate.orchestrate import _build_env, expand_driver, resolve_driver
-
-        driver_name = resolve_driver("review", ticket, cfg)
-        driver_cfg = expand_driver(driver_name, cfg)
-        executor_type = driver_cfg.get("type", driver_name)
-        effective_cfg = dict(cfg, executor=executor_type) if executor_type != cfg.get("executor") else cfg
-        cmd = build_executor_cmd(executor_type, prompt, effective_cfg)
-        executor_cfg = get_executor_config(executor_type, cfg)
-        env = resolve_executor_env(executor_cfg)
-        env = _build_env(driver_cfg, base_env=env)
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True, encoding="utf-8",
-            timeout=300,
-        )
-        if result.returncode != 0:
-            return ReviewResult(
-                verdict="changes_requested",
-                notes=f"Review subprocess exited with code {result.returncode}",
-            )
-
-        # Extract the last JSON object containing "verdict" from output
-        import re
-
-        output = result.stdout.strip()
-        matches = re.findall(r'\{[^{}]*"verdict"[^{}]*\}', output, re.DOTALL)
-        raw_for_parse = matches[-1] if matches else output
-        return parse_review_result(raw_for_parse)
-    except Exception as exc:
-        return ReviewResult(
-            verdict="changes_requested",
-            notes=f"Review agent failed: {exc}",
-        )
 
 
 def build_drift_check_prompt(
@@ -659,6 +760,7 @@ def build_drift_check_prompt(
     findings: str,
     project_root: Path | None = None,
     cfg: dict | None = None,
+    worktree_path: Path | None = None,
 ) -> str:
     """Return a trust-separated prompt asking a drift-check agent whether a
     fix still matches the ticket's intent.
@@ -675,11 +777,14 @@ def build_drift_check_prompt(
         cfg: Loaded LaneGate config.  When provided, ``project_guidance``
             controls which repo-local coding/contribution instructions are
             added to the trusted prompt layer.
+        worktree_path: Path to the ticket's git worktree (if distinct from project_root).
 
     Returns:
         A fully-rendered prompt string safe to pass to the drift-check agent.
     """
-    root = project_root if project_root is not None else Path.cwd()
+    raw_root = project_root if project_root is not None else Path.cwd()
+    wt = worktree_path if worktree_path is not None else raw_root
+    root = _resolve_control_root(raw_root)
     original_diff, _ = truncate_to_budget(original_diff, get_payload_budget("fix", cfg))
     fix_diff, _ = truncate_to_budget(fix_diff, get_payload_budget("fix", cfg))
     findings, _ = truncate_to_budget(findings, get_payload_budget("fix", cfg))
@@ -694,12 +799,14 @@ def build_drift_check_prompt(
         ticket_id=tid,
         title=title,
         close_criteria=close_criteria,
+        working_directory=str(wt),
     ).strip()
 
     trusted_parts = [instruction]
 
     project_guidance = load_project_guidance(
-        root, cfg, step="review", relevant_paths=ticket.get("touches") or []
+        root, cfg, step="review", relevant_paths=ticket.get("touches") or [],
+        exclude_paths=set(),
     )
     if project_guidance:
         trusted_parts.append(project_guidance)

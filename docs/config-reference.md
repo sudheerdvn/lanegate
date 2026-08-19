@@ -25,7 +25,12 @@ Set `commit_status_changes: false` in `.lanegate.yml` to opt back into fully zer
 | `executor_idle_timeout_seconds` | `75` | Kill only when executor output is quiet *and* its verified heartbeat is stale |
 | `executor_stall_timeout_seconds` | `900` | Kill a live executor only after this long without parsed semantic progress |
 | `executor_absolute_ceiling_seconds` | `1500` | Final hard limit for one executor invocation |
+| `print_timeout_seconds` | `30` | Single-turn terminal output print timeout in seconds |
+| `tree_sitter_languages` | `{}` | Custom file extension to tree-sitter grammar package mapping |
 | `safeguards` | `{}` | Optional pre-complete / pre-merge verification commands |
+| `max_turns` | `null` | Optional executor turn cap; see [Dispatch budget caps](#dispatch-budget-caps) |
+| `max_cumulative_tokens` | `null` | Optional executor token cap; see [Dispatch budget caps](#dispatch-budget-caps) |
+| `max_auto_fix_attempts` | `1` | Fix → drift-check → re-review cycles run when a review returns `changes_requested`, see [Auto-fix attempts](#auto-fix-attempts) |
 | `on_rate_limit` | `resume` | `halt` or `resume`, see [Rate limits and auto-resume](#rate-limits-and-auto-resume) |
 | `notify.ntfy_topic` | `null` | ntfy.sh topic for phone alerts, see [Phone alerts for stuck runs](#phone-alerts-for-stuck-runs-notify-watch) |
 | `notify.poll_seconds` | `60` | How often `notify-watch` checks state |
@@ -49,10 +54,11 @@ executor_idle_timeout_seconds < executor_stall_timeout_seconds < executor_absolu
 .lanegate/*
 !.lanegate/tickets/
 !.lanegate/tickets/*
-.lanegate.yml
 ```
 
-The state directory is ignored while the ticket spec files are carved out and tracked. If you want to commit `.lanegate.yml` to share config with your team, remove it from `.gitignore` manually.
+The state directory is ignored while the ticket spec files are carved out and tracked. `.lanegate.yml` itself is **not** gitignored — commit it. A ticket worktree is created with `git worktree add`, which only ever sees committed content, so an ignored (never-committed) config leaves the very first ticket's worktree with no config at all.
+
+When `aider` is configured as the executor, reviewer, or any `executors:` instance, init also adds `.aider.*` to `.gitignore`. Aider's own default behavior silently modifies `.gitignore` (adding the same pattern) as an uncommitted side effect separate from its own commit; seeding the pattern up front makes that edit a no-op instead of an unexpected diff LaneGate's scope-drift check would otherwise flag. It also covers aider's scratch/cache files (chat history, input history, tags cache) if you pass `--no-gitignore` in `executors.aider.flags` to stop aider from managing `.gitignore` itself — without this entry already present, those scratch files would be swept into the commit and flagged instead. See [aider capabilities](executor-capabilities.md#aider).
 
 ## Opt out of git tracking
 
@@ -98,6 +104,44 @@ executor: claude
 max_parallel: 2
 github_pr: false                  # no auto-push to remote
 trunk_branch: main                # optional; override origin/HEAD detection
+
+core_files:
+  - src/core/auth.py
+core_patterns:
+  - "src/db/**"
+
+verification:
+  groups: []   # see "Visual verification for UI tickets" above — populate for projects with a UI to visually verify
+
+lock_statuses: [in_progress, code_complete, in_review]
+
+safeguards:
+  pre_complete:
+    - pytest
+  pre_merge:
+    - pytest
+  post_merge:
+    - pytest
+
+flag_file: ~/.lanegate/feature_flags.json
+
+environments:
+  - name: staging
+    branch: staging
+    from: main
+    trigger: auto        # lanegate auto-promotes this env during cmd_merge when from matches merge target
+    flag_file: ~/.lanegate/staging.feature_flags.json
+
+  - name: production
+    branch: production
+    from: main
+    trigger: manual      # LaneGate promote production runs the full sequence
+    guard_script: scripts/check-deploy-window.sh
+    pre_promote:
+      - scripts/run-integration-tests.sh
+    post_promote:
+      - scripts/restart-service.sh
+    flag_file: ~/.lanegate/feature_flags.json
 ```
 
 ## Explicit config always wins
@@ -122,6 +166,92 @@ project_guidance:
 ```
 
 Set `project_guidance: false` for projects where convention files are noisy or should not be sent to the executor. Guidance is added as trusted project policy, but LaneGate lifecycle instructions, ticket close criteria, and safety rules still take precedence.
+
+---
+
+## Reference docs
+
+Documents whose relevant sections are excerpted into analyze, implement, and review prompts so agents see architectural boundaries without every ticket restating them. Opt-in: LaneGate never guesses a project's doc filenames, and an unconfigured project gets no reference-doc injection at all.
+
+```yaml
+reference_docs:
+  - docs/ARCHITECTURE.md
+  - docs/adr/0007-storage.md
+```
+
+Prefer this over listing the same file under `project_guidance.files`. Reference docs are scoped to the ticket's touched paths and bounded by the per-step payload budget (12KB analyze/implement, 8KB review/fix); guidance files are bounded only by the looser `project_guidance.max_bytes`. A file listed in both is injected once, via `reference_docs`.
+
+The step budget is shared across all listed docs, so adding a second one cannot silently double the prompt.
+
+---
+
+## Code discovery
+
+LaneGate tells agents how to find code, cheapest route first, because open-ended repo-wide searching is the single most expensive way to answer "where is X defined" and is billed again on every subsequent turn.
+
+The built-in path needs no configuration: `lanegate symbols <file>...` lists declarations straight from the AST (stdlib `ast` for Python and tree-sitter for Go, JS, TS, Rust, Java, Ruby, C, and C++).
+
+Projects already running their own code-intelligence tool can declare it as an optional extra, ranked below the built-in and above raw search:
+
+```yaml
+code_intel:
+  command: 'mytool query "<question>"'
+  description: returns a scoped subgraph rather than raw file dumps
+```
+
+A bare string is accepted as shorthand for `command`. Nothing is required here, and no third-party tool is a LaneGate dependency — omitting the key simply leaves it unmentioned in the prompt.
+
+### Project-declared tree-sitter grammars (`tree_sitter_languages`)
+
+To enable symbol extraction and file skeletons for non-standard file extensions or custom grammars, configure `tree_sitter_languages`:
+
+```yaml
+tree_sitter_languages:
+  .vue: tree_sitter_vue
+  .lua: tree_sitter_lua
+```
+
+LaneGate imports the corresponding Python grammar package dynamically to parse symbols for matching files.
+
+---
+
+## Turn advisories
+
+LaneGate measures what each agent dispatch costs in turns, tokens, and dollars, and reports it after the step. **This never stops or limits a dispatch.** A cap would punish large tickets rather than wasteful ones, and a killed run that is retried starts a fresh conversation that re-explores the repository — costing more than letting the original finish.
+
+When a run exceeds the advisory threshold for its step, LaneGate also attributes the cost from the turn mix: whether the agent spent its turns re-deriving context LaneGate failed to supply, spread changes across enough files that the ticket should be split, or kept re-running failing tests.
+
+```yaml
+turn_advisory:
+  implement: 100    # defaults: analyze 30, implement 100, review 50, fix 50, drift_check 20
+  review: 0         # 0 disables the advisory for that step
+```
+
+Metering requires an executor that streams progress events (Claude and Codex today); others report nothing rather than a misleading count.
+
+---
+
+## Dispatch budget caps
+
+`max_turns` and `max_cumulative_tokens` stop an executor dispatch once its measured turn count or cumulative token count reaches the configured positive-integer cap. Both default to `null`, which leaves the corresponding cap disabled.
+
+Use a scalar to apply a cap to every dispatch:
+
+```yaml
+max_turns: 50
+max_cumulative_tokens: 1000000
+```
+
+Or use a mapping to cap individual execution steps. The allowed step names are `implement`, `review`, `fix`, and `drift_check`; an omitted step has no cap for that key.
+
+```yaml
+max_turns:
+  implement: 60
+  review: 30
+max_cumulative_tokens:
+  implement: 1200000
+  review: 300000
+```
 
 ---
 
@@ -175,9 +305,10 @@ backend:
 ```yaml
 executor: aider
 models:
-  analyze: llama3.1        # any executor works for analyze -- text-only, no file edits
-  implement: qwen2.5-coder # passed to aider as --model ollama/qwen2.5-coder
-  review: qwen2.5-coder
+  analyze: ollama/llama3.1                    # any executor works for analyze -- text-only, no file edits
+  implement: ollama_chat/qwen2.5-coder:14b    # must include ollama/ or ollama_chat/ prefix
+  review: ollama_chat/qwen2.5-coder:14b
+  review_escalation: ollama_chat/qwen2.5-coder:32b # optional escalated model for retried reviews
 ```
 
 This is the validated local/offline path, because Aider has a real read/edit/commit
@@ -187,8 +318,9 @@ loop. See [executor-capabilities.md](executor-capabilities.md#aider) for
 **`executor: ollama` (`type: ollama`) does not itself apply edits or commit.** It posts
 to Ollama's REST API (`{base_url}/api/generate`, default `http://localhost:11434`) and
 returns a single text completion. Ollama is a model server, not a coding agent, so
-`implement`/`review` steps dispatched to it will produce zero commits and fail. It is
-only useful for text-only steps like `analyze`. See
+`implement`/`review`/`fix`/`drift_check` steps dispatched to it now raise a
+configuration error at dispatch time instead of silently producing zero commits and
+failing. It is only useful for the text-only `analyze` step. See
 [executor-capabilities.md](executor-capabilities.md#ollama) for the full caveat.
 
 #### Remote/rented-GPU Ollama (SSH tunnel)
@@ -200,7 +332,7 @@ reads this directly, LaneGate has no separate config field for it):
 ```bash
 ssh -N -L 11435:localhost:11434 <user>@<remote-host>
 export OLLAMA_API_BASE=http://localhost:11435
-lanegate orchestrate
+lanegate run
 ```
 
 `base_url` only takes effect on a **named `type: ollama` instance under `drivers:`**
@@ -227,19 +359,21 @@ executor: claude
 reviewer: human
 ```
 
-For a batch-level human gate, run `lanegate orchestrate --human-review final` without changing the reviewer. For per-ticket human verdicts, set `reviewer: human` and run `lanegate orchestrate --human-review per_ticket`. LaneGate completes the implementation, moves the ticket to `in_review`, and halts before merge. A person must then run `lanegate review <ticket> --verdict approved` or request changes.
+For a batch-level human gate, run `lanegate run --human-review final` without changing the reviewer. For per-ticket human verdicts, set `reviewer: human` and run `lanegate run --human-review per_ticket`. LaneGate completes the implementation, moves the ticket to `in_review`, and halts before merge. A person must then run `lanegate review <ticket> --verdict approved` or request changes.
 
 #### `--human-review` reference
 
-`--human-review` (default: `none`) only controls split-mode behavior (separate implement/review executors). It has no effect on combined mode, where the same executor self-reviews as part of its own prompt, there is no independent second opinion regardless of this flag. Setting `reviewer: human` overrides everything below and always pauses for a human verdict.
+`--human-review` (default: `none`) does **not** control whether a review runs — that's a separate axis, governed by `reviewer`/pool/`executor_steps.review` configuration and [`review_fallback`](#review_fallback) below. A default project never silently skips review and auto-merges: split mode always dispatches a reviewer, and if no independent reviewer is available and `review_fallback` is at its default (`needs_review`), the ticket escalates to `needs_review` and stops for a human instead of falling back to an unreviewed merge. (The only way to get a truly unreviewed auto-approval is to explicitly configure `reviewer: none`/`auto-none` — an opt-out, not something `--human-review` triggers.) Combined mode has the same executor perform both steps in one prompt instead of dispatching a separate reviewer, but it still applies the merge gate below like split mode does. Setting `reviewer: human` overrides everything here and always pauses for a human-recorded verdict, in either mode.
 
-| `--human-review` | Independent agent review runs? | Auto-merge on approval | Human gate |
-|---|---|---|---|
-| `none` (default) | No, auto-approved with zero review | Yes, immediately | None |
-| `per_ticket` | Yes, full review agent per ticket | No, refuses unless `human_review == none` | Stops each ticket at `in_review` for a human verdict |
-| `final` | No, ticket flips to `in_review` with no agent review | No | One human pass over the whole batch at the end |
+What `--human-review` actually controls is whether an *additional* human approval is required to merge once a review verdict already exists (from an agent, from `reviewer: human`, or from a human resolving a `needs_review` escalation):
 
-Only `per_ticket` invokes an independent review agent in split mode. `none` silently auto-approves and merges. `final` defers entirely to the end-of-batch human pass without running agent review first.
+| `--human-review` | Extra human merge gate |
+|---|---|
+| `none` (default) | Only skipped when the ticket's `autonomy` is *also* `full`, `green`, or `yellow` (the auto-fix lanes). The default `autonomy: supervised` still pauses every approved ticket for a human merge decision — merge is fully unattended only when both conditions hold. |
+| `per_ticket` | Always pauses the ticket for a human merge decision after approval, regardless of autonomy. |
+| `final` | Approved tickets aren't merged individually; they wait for one end-of-batch human approval pass instead. |
+
+None of these three values change whether an independent reviewer is dispatched — only `reviewer:`, pool/`executor_steps.review` configuration, and `review_fallback` do.
 
 #### `default_human_review`
 
@@ -249,9 +383,9 @@ Only `per_ticket` invokes an independent review agent in split mode. `none` sile
 default_human_review: per_ticket   # or "final"; falls back to "none" if unset
 ```
 
-`cmd_orchestrate` uses this value only when `--human-review` is not passed explicitly on the CLI. An explicit CLI flag (including `--human-review none`) always wins over this config default. This lets a higher-stakes project set a safe default once, instead of relying on every `lanegate orchestrate` invocation remembering the flag.
+`cmd_orchestrate` uses this value only when `--human-review` is not passed explicitly on the CLI. An explicit CLI flag (including `--human-review none`) always wins over this config default. This lets a higher-stakes project set a safe default once, instead of relying on every `lanegate run` invocation remembering the flag.
 
-**This is unrelated to a ticket's `autonomy` field.** `autonomy: supervised`/`autonomy: full` only governs whether `orchestrate` may auto-fix and retry on `changes_requested`, it does not gate merging. `human_review`/`default_human_review` is the only thing that decides whether an approved ticket merges automatically or waits for a human.
+**This is related to, but separate from, a ticket's `autonomy` field.** Valid autonomy values are `full`, `supervised`, `manual`, `green`, `yellow`, and `red`. `full`, `green`, and `yellow` stay on the automatic fix/merge path (`is_auto_fix_lane`); `supervised` (the default when unset) and `manual` always pause for a human merge decision; `red` always escalates to a human. `human_review`/`default_human_review` and `autonomy` both gate the *merge* step only — either one requiring a pause is enough to pause it — and neither one controls whether the review step itself runs.
 
 ### `executor_steps`
 
@@ -269,6 +403,11 @@ When `executor_steps` is absent (the default), all steps inherit the global `exe
 A ticket-level `executor:` frontmatter value overrides the `implement` step only.
 Review routing is controlled by ticket-level `reviewer:`, top-level `reviewer:`,
 then `executor_steps.review`.
+
+To pin the model for a ticket's routed review, run `lanegate route TICK-NNN --model MODEL`.
+This stores `review_model_pin:` in ticket frontmatter and applies only to review dispatch.
+`review_model:`, by contrast, records the model that actually performed a completed review;
+it is review attribution, not a routing setting.
 
 Multi-executor routing only chooses which CLI LaneGate invokes for each step. It is
 not OS or container sandboxing, and it does not isolate tools from the checkout.
@@ -341,7 +480,7 @@ executors:
     api_key_env: ANTHROPIC_API_KEY_2
     max_parallel: 2
   local-ollama:
-    type: ollama          # text-only (analyze); cannot implement/review, see above
+    type: ollama          # text-only (analyze); implement/review/fix now raise a config error
     max_parallel: 4
   local-aider:
     type: aider
@@ -355,10 +494,13 @@ choose (`claude-1`, `claude-2`, `local-ollama`, ...). Fields:
 | Field | Required | Description |
 | --- | --- | --- |
 | `type` | yes | The underlying executor driver, one of `claude`, `claude-subagent`, `claude-process`, `aider`, `openhands`, `codex`, `ollama`, `gemini` (deprecated), `agy`, `continue`. |
+| `model` | no | Blanket model override for every step dispatched to this instance (implement/review/fix/analyze). Use `models:` (below) instead when different steps need different models. |
 | `api_key_env` | no | Name of the environment variable (already set in your shell) that holds this instance's API key. LaneGate injects its *value* into the subprocess environment under the variable the driver itself expects (e.g. `ANTHROPIC_API_KEY` for `claude`/`claude-process`), the variable name is never written to logs. When absent, the driver's default env var is used unchanged. |
 | `max_parallel` | no | Per-instance concurrency cap, same precedence rules as the legacy per-type `executors:` block below. |
 | `provider` | no | Explicit backing route for provider-specific safeguards. For an Aider route backed by Ollama, use `provider: ollama`. |
 | `context_window_tokens` | no | Usable input-context budget for an Aider route. Required to enable its context preflight. See [Context window tokens](executor-capabilities.md#context-window-tokens). |
+| `print_timeout_seconds` | no | Timeout in seconds for executor print/run execution commands (overrides root `print_timeout_seconds`). |
+| `neutralize_touches` | no | Boolean (default `false`). When `true`, suppresses eager positional arguments for touched files during Aider initialization. |
 
 **Which types support `api_key_env`.** LaneGate only knows the target environment variable to inject into for `claude`, `claude-subagent`, `claude-process` (`ANTHROPIC_API_KEY`) and `codex` (`OPENAI_API_KEY`). `gemini`, `agy`, and `continue` do not currently have a target env var mapping, setting `api_key_env` on one of these instances raises a config error at dispatch time rather than silently doing nothing, since a silent no-op would dispatch under whatever key is already in your shell with no indication anything went wrong. If you need per-account key isolation for `gemini`/`agy`/`continue`, use that driver's own account-switching mechanism outside LaneGate for now.
 
@@ -434,13 +576,23 @@ pools:
   default:
     executors: [claude-1, claude-2]
     strategy: least-loaded   # or round-robin
-default_pool: default        # used by `lanegate orchestrate` when --pool isn't passed
+default_pool: default        # used by `lanegate run` when --pool isn't passed
 ```
 
 ```bash
-lanegate orchestrate --pool default   # explicit
-lanegate orchestrate                  # uses default_pool if set
+lanegate run --pool default   # explicit
+lanegate run                  # uses default_pool if set
 ```
+
+#### Ad-hoc executor selection (`--executors`)
+
+As a lightweight alternative to pre-declaring named pool entries for every combination, you can pass an ad-hoc list of executors directly on the CLI:
+
+```bash
+lanegate run --executors agy,claude-b
+```
+
+This selects `least-loaded` across exactly those named `executors:` entries for one run without declaring a `pools:` block entry for the combination. Note that `--pool` and `--executors` are mutually exclusive (passing both raises a configuration error).
 
 - `least-loaded` (default) picks the instance with the fewest tickets
   currently running under it.
@@ -481,6 +633,11 @@ A too-small pool is degraded through, never blocked on:
 3. **`self`**, same instance, same model. No alternative existed anywhere.
    Review still runs rather than stalling the ticket, and a warning naming
    the pool is printed to explain why.
+4. **`undetermined`**, the ticket was implemented manually (`implement_mode:
+   manual`, TICK-373) and no implementer identity was recorded (no `executor:`
+   pin or `implement_session_executor` from a dispatch run). Independence
+   cannot be verified either way, so it is recorded as undetermined rather than
+   assumed independent, even when a `reviewer:` pin is set.
 
 The independence ladder is consulted by default (TICK-381) even when no explicit
 review route is configured. When both steps fall through to the shared global executor
@@ -489,7 +646,7 @@ default, LaneGate attempts an independent pool instance (rung 1) or a different 
 exists.
 
 Every reviewed ticket records which rung applied in a `review_independence:
-independent|different-model|self` field, so a self-review is always
+independent|different-model|self|undetermined` field, so a self-review is always
 distinguishable from an independent one instead of the two being
 byte-identical in the ticket frontmatter. Combined-mode self-reviews also record
 `review_independence: self`. An explicit per-ticket `reviewer:`
@@ -497,6 +654,52 @@ override still wins outright regardless of this ladder, that is a human
 decision and is never second-guessed, but if it happens to name the same
 executor that implemented the ticket, a warning is printed and
 `review_independence` is recorded as `self`.
+`undetermined` is the one rung that is not a degradation of pool selection but
+a statement that the implementer is simply unknown.
+
+#### `review_fallback`
+
+Controls what happens when the ladder above can't find an independent
+instance (rung 1) or a different model (rung 2) — i.e. what to do about
+rung 3. Three values:
+
+| Value | Behavior |
+|---|---|
+| `needs_review` (default) | Never self-review. The ticket is marked `needs_review` for a human to resolve instead. |
+| `different_model` | Same as `needs_review`, except it also tries rung 2 (a different model on the same instance) before giving up. |
+| `same_model` | Permissive: falls all the way through to rung 3 (`self`) and runs the self-review anyway, with a warning. |
+
+Because the default is `needs_review`, a genuinely single-account,
+single-model install does **not** quietly run in combined self-review mode —
+every review escalates to a human `needs_review` state instead. Combined
+mode's self-review path only actually runs when `review_fallback:
+same_model` is set (or an explicit same-executor `reviewer:`/`steps.review`
+pin is configured).
+
+### `profile`
+
+`profile: strict` (default: `default`) bundles the safer end of the knobs
+above into one name, and closes the `review_fallback` door to self-review —
+but not every door to self-review:
+
+- `acceptance_contract_mode` defaults to `blocker` instead of `advisory`
+  (still overridable explicitly).
+- `review_fallback: same_model` — the fallback that silently self-reviews —
+  is rejected at config-load time with a `ConfigError`. `needs_review` and
+  `different_model` both already refuse to self-review, so both remain legal
+  under `profile: strict`.
+- This does **not** close the separate, explicit route: a `reviewer:` (or
+  `steps.review`) pin that names the same instance as `executor:` still
+  self-reviews under `profile: strict`, emitting a `warnings.warn` rather
+  than being rejected. `profile: strict` only forbids the implicit
+  `same_model` fallback, not a deliberate same-executor pin.
+
+```yaml
+profile: strict
+```
+
+`profile: default` (or omitting the key) preserves every default described
+above unchanged.
 
 ### Complexity-based routing (`routing:`)
 
@@ -538,7 +741,7 @@ to top-level `default_pool` if nothing matches. This is not an error. Running
 when routing rules are configured. Every `executor_pool` named in `routing:`
 must be defined under `pools:`, or config loading fails with a `ConfigError`.
 
-`lanegate next` / `lanegate orchestrate`'s batch selection (`next_batch()`)
+`lanegate next` / `lanegate run`'s batch selection (`next_batch()`)
 resolves and attaches the routed pool to each selected ticket so pool
 dispatch can pick an executor instance from it. `lanegate board` shows the
 resolved pool as a `pool:<name>` flag (or `pool:unrouted` when no rule
@@ -563,7 +766,7 @@ TICK-042 — Add rate limit headers
 
 ```yaml
 executors:
-  local-1: { type: aider, provider: ollama, model: qwen2.5-coder }
+  local-1: { type: aider, provider: ollama, model: ollama_chat/qwen2.5-coder:14b }
   sonnet-1: { type: claude-process, model: claude-sonnet-5 }
   opus-1: { type: claude-process, model: claude-opus-5 }
 
@@ -598,7 +801,9 @@ When both steps resolve to the same executor and the review independence ladder 
 
 The orchestrator then skips the separate `cmd_complete` and review-agent subprocess calls, since the combined executor has already handled them.
 
-**When no explicit review route is configured**, LaneGate checks the review independence ladder (TICK-381) before defaulting to combined mode. An explicit same-executor pin (`reviewer:`, `steps.review.driver`, or `executor_steps.review`) bypasses the ladder and runs combined mode directly.
+**When no explicit review route is configured**, LaneGate checks the review independence ladder (TICK-381) before defaulting to combined mode. An explicit same-executor pin (`reviewer:`, `steps.review.driver`, or `executor_steps.review`) bypasses the ladder and runs combined mode directly — but only for an executor type capable of it: combined mode's prompt instructs the executor to shell out and run the `lanegate complete`/`lanegate review --verdict` commands below itself, which requires real shell/tool-execution capability (`claude`/`claude-subagent`/`claude-process`, `codex`, `agy`). A pure code-editing tool like `aider` has no such capability — an explicit same-executor pin for one of those instead falls through to split mode below, still honoring the pin, dispatched as a separate cold subprocess rather than one combined call.
+
+Combined mode is, by construction, one continuous session across both steps — there's no separate review dispatch to be independent of the implementer's reasoning trail, since it's the same conversation throughout. Split mode's same-executor review dispatch (the ladder's `self` rung, or a same-executor pin on a combined-incapable executor per above) is different: it's a genuinely separate subprocess, and **that dispatch runs as a fresh, independent session by default, not a continuation of the implement session**, even when it's literally the same model. See `session_chaining.chain_review` below (default `false`) for the one opt-in exception, and its cost/independence tradeoff.
 
 **Same-executor combined mode example**
 
@@ -672,6 +877,40 @@ The `_is_combined_mode(cfg, ticket)` predicate in `lanegate/orchestrate/autofix.
 
 ---
 
+## Auto-fix attempts
+
+```yaml
+max_auto_fix_attempts: 1   # default
+```
+
+When `lanegate review` returns `changes_requested`, LaneGate runs up to this many **fix → drift-check → re-review** cycles per continuation pass. The default of `1` means each pass has one re-review.
+
+This cycle always runs regardless of the ticket's `autonomy`. `autonomy` only decides what happens to a successful result: `full`, `green`, and `yellow` merge unattended on re-review approval, while `supervised` (the default) and `manual` land the ticket at `in_review` awaiting an explicit human verdict. `red` always escalates to a human.
+
+Three conditions stop the current cycle early. A **drift-check failure** (the fix diverged from the ticket's intent) is fail-closed and immediate: it does not consume a remaining attempt, is never automatically resumed, and requires a human. A `changes_requested` verdict carrying **no findings** is treated as a harness error rather than a rejection, so no fix is attempted. An **exhausted budget** leaves the ticket eligible for a later bounded continuation pass.
+
+On escalation the ticket stays at `code_complete` / `review_verdict: changes_requested`, with one `## Auto-Fix Attempt N` section per attempt in the body. A later `lanegate run` treats that pair as a resumable auto-fix continuation, so it does not permanently lock overlapping open tickets. Raising this value trades executor spend for fewer scheduler passes. See [Ticket Lifecycle](lifecycle.md#the-auto-fix-sub-loop) for how this fits the wider state machine.
+
+### `human_escalation`
+
+Configure risk signals that force a red-lane human escalation, regardless of a
+ticket's resolved autonomy:
+
+```yaml
+human_escalation:
+  credentials: true       # default: true
+  security_actions: true  # default: true
+  retry_limit: 3          # default: 3; positive integer
+```
+
+`credentials` and `security_actions` are booleans. When enabled, detected
+external credentials/secrets or security-sensitive/irreversible operations
+require human review. `retry_limit` caps automatic fix attempts; LaneGate uses
+the lower of this value and `max_auto_fix_attempts`. Omit the block to use all
+defaults, or set only the keys your project needs to override.
+
+---
+
 ## Safeguards
 
 Safeguards are deterministic commands that run before LaneGate advances lifecycle
@@ -685,6 +924,7 @@ safeguards:
   pre_merge:
     - pytest
     - scripts/pre-deploy-check.sh
+  pre_merge_worktree: true  # optional: run pre_merge before git merge (default)
   post_merge:
     - pytest
   timeout_s: 600         # optional: kill hanging guards after N seconds
@@ -698,15 +938,17 @@ back to `main`. `post_merge` runs from the merged control checkout during
 
 ### `pre_merge` re-verification against the actual merge result
 
-`pre_merge` guards run twice: once in the ticket's own isolated worktree
-before `git merge` (as always), and then, if that passes and the merge succeeds,
-a second time in the primary checkout immediately after, against the real
-merge commit. The first run only proves the ticket's branch passes on top of
-whatever `main` looked like when the branch/worktree was created. It cannot
-catch two independently-developed tickets that are each individually correct
-but break a shared assumption once combined. The second run is what actually
-catches that case, and it runs automatically inside `lanegate merge`, nothing
-extra to configure beyond a `pre_merge` guard list.
+`pre_merge` guards always run against the real merge commit in the primary
+checkout after `git merge` succeeds. This is what catches two
+independently-developed tickets that are each individually correct but break a
+shared assumption once combined.
+
+By default, the same guard list also runs in the ticket's isolated worktree
+before `git merge`. Set `safeguards.pre_merge_worktree: false` when an unchanged
+ticket branch has already passed an equivalent `pre_complete` check and the
+post-merge verification is the only additional check you need. This setting
+skips only the worktree run; it never disables the verification against merged
+`main`.
 
 If the second run fails, `lanegate merge` reports it as a distinct failure (not
 a plain `pre_merge` failure, the merge itself succeeded, but broke `main`),
@@ -775,6 +1017,73 @@ safeguards:
 When both `timeout_s` and `retry_on_failure` are absent (the default), guard
 behavior is unchanged: no timeout, run once, fail on any nonzero exit.
 
+### Multi-Ecosystem Safeguard Recipes (The Two-Pillar Rule)
+
+Every robust autonomous agent project should configure safeguards with **two pillars**:
+1. **Static Analysis & Type Contracts** (e.g. `tsc`, `mypy`, `golangci-lint`, `clippy`, `mvn compile`) to prevent interface drift.
+2. **Behavioral Test Suites** (e.g. `pytest`, `jest`, `cargo test`, `mvn test`) to prevent logic regressions.
+
+#### 1. TypeScript / React / React Native / Angular
+```yaml
+safeguards:
+  pre_complete:
+    - npm run typecheck   # or: npx tsc --noEmit
+    - npm run lint
+    - npm test -- --watchAll=false
+  pre_merge:
+    - npm run build       # verifies production bundling & assets
+```
+
+#### 2. Python
+```yaml
+safeguards:
+  pre_complete:
+    - mypy <package_name>
+    - pytest -q
+  pre_merge:
+    - mypy <package_name>
+    - pytest -q
+```
+
+#### 3. Java / Kotlin / AEM (Maven / Gradle)
+```yaml
+safeguards:
+  pre_complete:
+    - mvn compile test-compile
+    - mvn test -Dtest=*UnitTest
+  pre_merge:
+    - mvn clean verify    # full packaging + checkstyle/spotbugs
+```
+
+#### 4. Monorepos (Turborepo / Nx / Lerna)
+```yaml
+safeguards:
+  pre_complete:
+    - turbo run check-types lint test --filter=...[origin/main]
+  pre_merge:
+    - turbo run build --filter=...[origin/main]
+```
+
+#### 5. Go
+```yaml
+safeguards:
+  pre_complete:
+    - golangci-lint run
+    - go test -race ./...
+  pre_merge:
+    - go build ./...
+```
+
+#### 6. Rust
+```yaml
+safeguards:
+  pre_complete:
+    - cargo clippy -- -D warnings
+    - cargo test
+  pre_merge:
+    - cargo check --all-targets
+```
+
 ---
 
 ## Rate limits and auto-resume
@@ -793,11 +1102,12 @@ rate_limit_resume:
   initial_backoff_s: 300
   max_backoff_s: 7200
   ceiling_s: 86400
+  lock_poll_interval_s: 30
 ```
 
 - **`resume`** (default), hibernates, then spawns a detached `lanegate
   resume-watch` daemon (`.lanegate/resume-watch.pid`, `.lanegate/resume-watch.log`)
-  that waits and re-invokes `lanegate orchestrate` itself each time. It exits as
+  that waits and re-invokes `lanegate run` itself each time. It exits as
   soon as no rate-limited tickets remain hibernated.
 - **`halt`**, prints re-run instructions and stops. You re-run `lanegate
   orchestrate` yourself once you've checked your quota/billing. The hibernated
@@ -818,6 +1128,16 @@ seconds and falls back to manual-resume instructions. It defaults to `86400`
 for a weekly usage-window limit that resets only after days, but understand
 that it removes the only automatic stop on a retry loop.
 
+Before each retry, resume-watch also checks whether the repo's orchestrator
+advisory lock (see `concurrency.py`'s `acquire_orchestrator_lock`) is
+currently held by a live process. If it is — for example the original
+`lanegate run` invocation is still finishing already-in-flight tickets —
+resume-watch polls again after `lock_poll_interval_s` (default `30`) without
+advancing the backoff timer or consuming any of the `ceiling_s` give-up
+budget, since a lock conflict says nothing about whether the rate limit has
+actually cleared. The give-up clock only starts running once the lock is
+free and a retry can meaningfully test the rate limit.
+
 `lanegate resume-watch --status` reports whether a watcher is currently running,
 and `lanegate resume-watch --stop` kills it.
 
@@ -831,7 +1151,7 @@ each with a timestamp), backed by `.lanegate/resume-watch-history.jsonl`.
 A blind retry-on-a-timer has a real failure mode worth knowing: if the
 underlying issue isn't actually a transient rate limit, a billing problem,
 an exhausted monthly quota, or the executor genuinely broken, `resume-watch`
-will keep re-invoking `lanegate orchestrate` on the same backoff schedule rather
+will keep re-invoking `lanegate run` on the same backoff schedule rather
 than recognizing the difference. Two mitigations: `ceiling_s` defaults to 24h so it gives
 up and notifies instead of retrying forever, and remember that a resumed run
 still has to pass the same `pre_complete`/`pre_merge` safeguards and land in
@@ -912,7 +1232,7 @@ notify:
   heartbeat_stale_seconds: 180
 ```
 
-It checks three things, using the same local files `lanegate orchestrate` already
+It checks three things, using the same local files `lanegate run` already
 writes, so it works the same regardless of which executor (Claude, Codex,
 aider, Ollama) is running a given ticket, and regardless of whether
 `orchestrate` was started from a terminal, cron, or an MCP `orchestrate()`
@@ -936,11 +1256,15 @@ single ticket waiting on GitHub PR review (that's `watch.py`), only that
 Setup:
 
 ```bash
-lanegate notify-watch --test    # send one test push, verify your phone gets it
-lanegate notify-watch           # run the poll loop (background it yourself, or via systemd — see below)
-lanegate notify-watch --status  # is a watcher currently running, and its PID
-lanegate notify-watch --stop    # kill it
+lanegate notify-watch --test        # send one test push, verify your phone gets it
+lanegate notify-watch --background  # spawn detached; survives this terminal closing (works on Windows too)
+lanegate notify-watch --status      # is a watcher currently running, and its PID
+lanegate notify-watch --stop        # kill it
 ```
+
+`--background` covers "keep running after I close this terminal" on any
+platform. It does not survive a reboot/logout on its own — for that, see
+systemd below (Linux/macOS) or Task Scheduler (Windows).
 
 **Privacy note:** the public `ntfy.sh` instance is unauthenticated pub/sub by
 topic name, anyone who knows/guesses your `ntfy_topic` can read or post to
@@ -976,6 +1300,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now lanegate-notify-watch.service
 loginctl enable-linger $USER   # keep it running after you log out
 ```
+
+On Windows there is no systemd equivalent; use Task Scheduler with a trigger
+"At log on" running `lanegate notify-watch --background` (the `--background`
+flag itself is what makes the process detach and outlive the launching
+terminal/session — Task Scheduler is only needed for restart-on-boot).
 
 ---
 
@@ -1022,3 +1351,14 @@ executor type, set `default_pool` (or `routing:`), doing so overrides any
 `steps.<step>.driver` pin for that step, so don't set both expecting them to
 combine. `lanegate route TICK-042` dry-runs this whole resolution for one
 ticket without dispatching anything.
+
+## Analytics database environment overrides
+
+LaneGate stores analytics and context-log records in a SQLite database at
+`~/.local/share/lanegate/analytics.db` by default. Set either
+`LANEGATE_CONTEXT_LOG_DB` or `LANEGATE_ANALYTICS_DB` to an absolute or relative
+database path to override that location. These overrides are particularly useful
+for test isolation, so tests do not read from or write to the production
+analytics database.
+
+`LANEGATE_CONTEXT_LOG_DB` takes precedence when both variables are set.

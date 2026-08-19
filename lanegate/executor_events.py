@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from lanegate.timeutil import utc_now_iso as _utc_now_iso
+
 MAX_PATH_LENGTH = 256
 MAX_STRING_LENGTH = 512
 
@@ -28,10 +30,6 @@ _SECRET_PATTERNS = [
     re.compile(r"sk-[a-zA-Z0-9]{20,}"),
     re.compile(r"ghp_[a-zA-Z0-9]{20,}"),
 ]
-
-
-def _utc_now_iso() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def redact_text(text: str | None, max_len: int = MAX_STRING_LENGTH) -> str | None:
@@ -161,6 +159,9 @@ class ExecutorEvent:
     path: str | None = None
     test_summary: dict[str, Any] | None = None
     provider_usage: dict[str, Any] | None = None
+    turns: int | None = None
+    cumulative_tokens: int | None = None
+    current_context_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         # Never serialize provider payloads verbatim.  This boundary is used
@@ -171,19 +172,24 @@ class ExecutorEvent:
     def from_dict(cls, data: dict[str, Any]) -> "ExecutorEvent":
         phase = data.get("phase")
         activity = data.get("activity")
-        known = {
-            "phase": phase if phase in _PHASES else phase_for_step(str(phase or "")),
-            "activity": activity if activity in _ACTIVITIES else "heartbeat",
-            "ts": _safe_timestamp(data.get("ts")),
-            "activity_age": _safe_number(data.get("activity_age")) or 0.0,
-            "executor": _safe_label(data.get("executor"), "unknown"),
-            "model": _safe_label(data.get("model")),
-            "tool_category": data.get("tool_category") if data.get("tool_category") in _TOOL_CATEGORIES else None,
-            "path": bound_path(data.get("path")),
-            "test_summary": _safe_test_summary(data.get("test_summary")),
-            "provider_usage": _safe_provider_usage(data.get("provider_usage")),
-        }
-        return cls(**known)
+        turns_val = _safe_number(data.get("turns"))
+        tokens_val = _safe_number(data.get("cumulative_tokens"))
+        ctx_val = _safe_number(data.get("current_context_tokens"))
+        return cls(
+            phase=phase if phase in _PHASES else phase_for_step(str(phase or "")),
+            activity=activity if activity in _ACTIVITIES else "heartbeat",
+            ts=_safe_timestamp(data.get("ts")),
+            activity_age=_safe_number(data.get("activity_age")) or 0.0,
+            executor=_safe_label(data.get("executor"), "unknown") or "unknown",
+            model=_safe_label(data.get("model")),
+            tool_category=data.get("tool_category") if data.get("tool_category") in _TOOL_CATEGORIES else None,
+            path=bound_path(data.get("path")),
+            test_summary=_safe_test_summary(data.get("test_summary")),
+            provider_usage=_safe_provider_usage(data.get("provider_usage")),
+            turns=int(turns_val) if turns_val is not None else None,
+            cumulative_tokens=int(tokens_val) if tokens_val is not None else None,
+            current_context_tokens=int(ctx_val) if ctx_val is not None else None,
+        )
 
 
 def parse_command_category(cmd_text: str) -> tuple[str, str, dict[str, Any] | None]:
@@ -321,18 +327,21 @@ def normalize_claude_event(
 
     if event_type == "result":
         usage = data.get("usage") or {}
-        provider_usage = {
+        raw_usage = {
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
+            "cache_read_tokens": usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens"),
+            "cache_creation_tokens": usage.get("cache_creation_tokens") or usage.get("cache_creation_input_tokens"),
             "cost_usd": data.get("total_cost_usd"),
         }
+        provider_usage = {k: v for k, v in raw_usage.items() if v is not None}
         return ExecutorEvent(
             phase=phase_for_step(current_phase),
             activity="completed",
             ts=ts,
             executor=executor,
             model=model,
-            provider_usage=provider_usage,
+            provider_usage=provider_usage or None,
         )
 
     if event_type in ("assistant", "text"):
@@ -418,16 +427,20 @@ def normalize_codex_event(
 
     if event_type == "turn.completed":
         usage = data.get("usage") or {}
+        raw_usage = {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_tokens": usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens"),
+            "cache_creation_tokens": usage.get("cache_creation_tokens") or usage.get("cache_creation_input_tokens"),
+        }
+        provider_usage = {k: v for k, v in raw_usage.items() if v is not None}
         return ExecutorEvent(
             phase=current_phase,
             activity="completed",
             ts=ts,
             executor=executor,
             model=model,
-            provider_usage={
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-            },
+            provider_usage=provider_usage or None,
         )
 
     return None

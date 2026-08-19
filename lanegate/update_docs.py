@@ -222,7 +222,7 @@ def cmd_update_docs(
         model = cfg.get("models", {}).get("doc_update") or cfg.get("models", {}).get("implement")
         executor_cfg = get_executor_config(executor, cfg)
         executor_env = resolve_executor_env(executor_cfg)
-        cmd = build_executor_cmd(executor, prompt, cfg, model=model)
+        cmd = build_executor_cmd(executor, prompt, cfg, model=model, step="doc_update")
 
         print(f"Running doc update executor ({executor})...")
         res = subprocess.run(
@@ -270,7 +270,7 @@ def cmd_update_docs(
 
     commit_msg = f"docs: refresh documentation from completed tickets ({ticket_ids_str})"
     commit_res = subprocess.run(
-        ["git", "commit", "-m", commit_msg],
+        ["git", "commit", "-s", "-m", commit_msg],
         cwd=repo_root,
         capture_output=True,
         text=True, encoding="utf-8",

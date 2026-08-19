@@ -26,17 +26,26 @@ from lanegate.config import ConfigError
 from lanegate.prompts import (
     build_prompt,
     component_for as _component,
-    get_bounded_architecture_excerpt,
+    get_bounded_reference_excerpts,
+    get_bounded_shared_notes,
     get_payload_budget,
     load_project_guidance,
     load_prompt_template,
+    render_discovery_guidance,
+    render_drift_guidance,
     render_prompt,
+    resolve_reference_doc_paths,
     truncate_to_budget,
 )
-from lanegate.ticket import load_file_skeletons
+from lanegate.ticket import (
+    collect_cross_ticket_change_notes,
+    load_change_notes,
+    load_file_skeletons,
+    validate_overlap_review,
+)
 
 # Env var each built-in driver reads its API key from by default. Used to
-# inject a named executor instance's api_key_env override (TICK-088) into the
+# inject a named executor instance's api_key_env override into the
 # subprocess environment under the name the driver actually expects.
 _DEFAULT_API_KEY_ENV_VAR = {
     "claude": "ANTHROPIC_API_KEY",
@@ -49,7 +58,7 @@ _DEFAULT_API_KEY_ENV_VAR = {
 def get_executor_config(name: str, cfg: dict) -> dict:
     """Resolve an executor name (bare type or named instance) to its effective settings.
 
-    TICK-088 introduces *named executor instances* — entries under
+    Support for *named executor instances* — entries under
     ``executors:`` that carry an explicit ``type`` field (e.g.::
 
         executors:
@@ -63,7 +72,7 @@ def get_executor_config(name: str, cfg: dict) -> dict:
     Resolution order:
       1. ``name`` is itself a named instance — a key in ``executors:`` whose
          entry has a ``type`` field — used directly.
-      2. Legacy per-type override block (TICK-028 and earlier): ``name`` is a
+      2. Legacy per-type override block (legacy syntax): ``name`` is a
          key in ``executors:`` whose entry has NO ``type`` field — the key
          itself is the type, exactly as before this ticket (e.g.
          ``executors: {aider: {max_parallel: 3}}``). This takes precedence
@@ -93,7 +102,7 @@ def get_executor_config(name: str, cfg: dict) -> dict:
         return resolved
 
     if isinstance(entry, dict):
-        # Legacy per-type override block (TICK-028): an entry keyed by the
+        # Legacy per-type override block: an entry keyed by the
         # bare type name itself with no 'type' field. Must be checked before
         # falling back to "first named instance of that type" below, or a
         # same-type named instance configured elsewhere in executors: would
@@ -131,32 +140,60 @@ def resolved_dispatch_metadata(
     }
 
 
-# --- Executor cooldown state (TICK-090) -------------------------------------
+# --- Executor cooldown state -------------------------------------
 #
 # Quota-aware failover: when an executor instance's account hits a rate limit
 # or session/usage cap, the orchestrator marks that instance "cooling down" by
 # writing a small JSON file to `.lanegate/executors/<name>.cooldown`. Pool
-# dispatch (TICK-089) skips cooling-down instances when picking who runs the
+# dispatch skips cooling-down instances when picking who runs the
 # next ticket, so the rest of the pool keeps working instead of the whole run
 # halting on one exhausted account.
 
 _EXECUTORS_SUBDIR = "executors"
 _COOLDOWN_SUFFIX = ".cooldown"
+_FAILURE_STREAK_SUFFIX = ".failure_streak"
 
 _RETRY_AFTER_RE = re.compile(r"retry-after:\s*(\d+)", re.IGNORECASE)
 
-# Claude's own session-limit message shape, e.g. "You've hit your session
-# limit resets 4:40pm (America/Los_Angeles)" - distinct from the HTTP
-# Retry-After header form above. The parenthesized group is expected to be
-# an IANA zone name.
+_MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+# Claude's session-limit/weekly-limit message shape, e.g. "You've hit your session
+# limit resets 4:40pm (America/Los_Angeles)" or "resets Aug 7, 6am (America/Los_Angeles)".
+# Accepts optional "Mon D" or "D Mon" date prefix and optional (Zone) suffix.
 _RESETS_AT_RE = re.compile(
-    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", re.IGNORECASE
+    r"resets?\s+(?:at\s+)?"
+    r"(?:(?:([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?|(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9}))[,\s]+)?"
+    r"(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)"
+    r"(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE,
 )
 
 # agy/Gemini-style relative countdown, e.g. "Resets in 3h51m9s" or "Resets in 45m".
 _RESETS_IN_RE = re.compile(
     r"resets?\s+in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
     re.IGNORECASE,
+)
+
+# Reset timestamps can be emitted as an absolute ISO value (``try again at
+# 2026-07-28T04:29:00Z``) as well as Claude's clock/date prose above.
+_RESET_CONTEXT_RE = re.compile(
+    r"(?:try again at|resets(?:\s+at)?)\s*[:\-]?\s*(.{0,60})", re.IGNORECASE
+)
+_RESET_ISO_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
 )
 
 # Keep in sync with loop._is_rate_limit's generalized ``* limit`` phrases.
@@ -181,6 +218,10 @@ def _executors_dir(repo_root: Path | str) -> Path:
 
 def _cooldown_path(repo_root: Path | str, name: str) -> Path:
     return _executors_dir(repo_root) / f"{name}{_COOLDOWN_SUFFIX}"
+
+
+def _failure_streak_path(repo_root: Path | str, name: str) -> Path:
+    return _executors_dir(repo_root) / f"{name}{_FAILURE_STREAK_SUFFIX}"
 
 
 def _utc_now() -> datetime.datetime:
@@ -229,39 +270,101 @@ def _cooldown_reason_is_non_retryable_error(reason: str) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _parse_resets_at(text: str) -> datetime.datetime | None:
-    """Resolve Claude's "resets H:MMpm/Hpm (IANA/Zone)" phrasing to UTC.
+def _parse_reset_time(
+    text: str,
+    now: datetime.datetime | None = None,
+    *,
+    allow_rollover: bool = True,
+) -> datetime.datetime | None:
+    """Resolve an executor reset hint to an aware UTC timestamp.
 
-    Builds today's date at the given local time in the given zone, rolling
-    forward one day if that instant has already passed. The message only
-    gives a time, not a date, so "already past" is the only way to tell a
-    same-day reset from an overnight one. Returns ``None`` (rather than
-    raising) for an unrecognized zone name or a malformed time, since this is
-    a best-effort enhancement over the existing text-needle detection, not a
-    hard requirement for cooldown recording.
+    ``allow_rollover`` distinguishes a newly reported reset from a stale hint
+    re-read out of a hibernated ticket. A past bare clock rolls to tomorrow
+    only for a new hint. An explicit month/day is similarly rolled into the
+    next year only for a new hint; for a stale hint, it stays in the current
+    year unless the date crosses a year boundary by more than 180 days.
     """
+    if not text:
+        return None
+    if now is None:
+        now = _utc_now()
+
+    context_match = _RESET_CONTEXT_RE.search(text)
+    if context_match:
+        iso_match = _RESET_ISO_RE.search(context_match.group(1))
+        if iso_match:
+            parsed = _parse_iso8601(iso_match.group(1))
+            if parsed is not None:
+                return parsed.astimezone(datetime.UTC)
+
     match = _RESETS_AT_RE.search(text)
     if not match:
         return None
-    hour, minute, meridiem, zone_name = match.groups()
-    try:
-        zone = zoneinfo.ZoneInfo(zone_name.strip())
-    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
-        return None
-    hour_12 = int(hour)
-    minute_num = int(minute) if minute else 0
+    month1, day1, day2, month2, hour_str, minute_str, meridiem, zone_name = match.groups()
+
+    month_num = None
+    day_num = None
+    if month1 and day1:
+        m_val = _MONTHS.get(month1.lower())
+        if m_val is None:
+            return None
+        month_num = m_val
+        day_num = int(day1)
+    elif month2 and day2:
+        m_val = _MONTHS.get(month2.lower())
+        if m_val is None:
+            return None
+        month_num = m_val
+        day_num = int(day2)
+
+    zone: datetime.tzinfo = datetime.UTC
+    if zone_name:
+        try:
+            zone = zoneinfo.ZoneInfo(zone_name.strip())
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+            return None
+
+    hour_12 = int(hour_str)
+    minute_num = int(minute_str) if minute_str else 0
     if hour_12 < 1 or hour_12 > 12 or minute_num > 59:
         return None
     hour_num = hour_12 % 12
-    if meridiem.lower() == "pm":
+    if meridiem.lower().startswith("p"):
         hour_num += 12
-    now_local = _utc_now().astimezone(zone)
-    candidate = now_local.replace(
-        hour=hour_num, minute=minute_num, second=0, microsecond=0
-    )
-    if candidate <= now_local:
-        candidate += datetime.timedelta(days=1)
+
+    now_local = now.astimezone(zone)
+
+    if month_num is not None and day_num is not None:
+        year = now_local.year
+        try:
+            candidate = now_local.replace(
+                year=year, month=month_num, day=day_num,
+                hour=hour_num, minute=minute_num, second=0, microsecond=0
+            )
+        except ValueError:
+            return None
+        if allow_rollover and candidate < now_local:
+            try:
+                candidate = candidate.replace(year=year + 1)
+            except ValueError:
+                return None
+        elif not allow_rollover and candidate < now_local - datetime.timedelta(days=180):
+            candidate = candidate.replace(year=year + 1)
+        elif not allow_rollover and candidate > now_local + datetime.timedelta(days=180):
+            candidate = candidate.replace(year=year - 1)
+    else:
+        candidate = now_local.replace(
+            hour=hour_num, minute=minute_num, second=0, microsecond=0
+        )
+        if candidate <= now_local and allow_rollover:
+            candidate += datetime.timedelta(days=1)
+
     return candidate.astimezone(datetime.UTC)
+
+
+def _parse_resets_at(text: str) -> datetime.datetime | None:
+    """Resolve Claude reset prose using the standard new-hint semantics."""
+    return _parse_reset_time(text)
 
 
 def _parse_resets_in(text: str) -> datetime.datetime | None:
@@ -315,7 +418,7 @@ def parse_retry_after(value: str | int | float | None) -> str | None:
     match = _RETRY_AFTER_RE.search(text)
     if match:
         return (_utc_now() + datetime.timedelta(seconds=int(match.group(1)))).isoformat()
-    resets_at = _parse_resets_at(text)
+    resets_at = _parse_reset_time(text)
     if resets_at is not None:
         return resets_at.isoformat()
     resets_in = _parse_resets_in(text)
@@ -398,6 +501,52 @@ def clear_cooldown(repo_root: Path | str, name: str) -> bool:
     return False
 
 
+def record_failure_signature(
+    repo_root: Path | str,
+    name: str,
+    signature: str,
+    *,
+    window_s: int,
+    threshold: int,
+) -> bool:
+    """Track consecutive same-signature failures for *name*, pattern-independent.
+
+    Returns True once *threshold* consecutive failures with the same
+    ``signature`` have landed within ``window_s`` seconds of each other.
+    A differing signature, or a gap of ``window_s`` seconds or more, resets
+    the count to 1 instead of raising an error — this is a streak counter,
+    not a rate-limit-pattern classifier. ``window_s=0`` therefore means no
+    gap, however small, ever counts as "within" the window.
+    """
+    path = _failure_streak_path(repo_root, name)
+    now = _utc_now()
+    count = 1
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            data = None
+        if data is not None:
+            last_ts = _parse_iso8601(str(data.get("last_ts") or ""))
+            if (
+                data.get("signature") == signature
+                and last_ts is not None
+                and (now - last_ts).total_seconds() < window_s
+            ):
+                count = int(data.get("count") or 0) + 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"signature": signature, "count": count, "last_ts": now.isoformat()}, indent=2),
+        encoding="utf-8",
+    )
+    return count >= threshold
+
+
+def clear_failure_streak(repo_root: Path | str, name: str) -> None:
+    """Remove *name*'s failure-streak file, if any."""
+    _failure_streak_path(repo_root, name).unlink(missing_ok=True)
+
+
 def clear_all_cooldowns(repo_root: Path | str) -> list[str]:
     """Remove every cooldown file. Returns the cleared instance names."""
     directory = _executors_dir(repo_root)
@@ -416,8 +565,8 @@ def available_instances(repo_root: Path | str, names: list[str]) -> list[str]:
 
 
 def _known_executor_names(cfg: dict) -> list[str]:
-    """Named executor instances configured under `executors:` (TICK-088) or
-    referenced from any `pools:` entry (TICK-089), de-duplicated in
+    """Named executor instances configured under `executors:` or
+    referenced from any `pools:` entry, de-duplicated in
     first-seen order."""
     names: list[str] = []
     seen: set[str] = set()
@@ -656,6 +805,10 @@ _CLAUDE_SUBPROCESS_TYPES = frozenset({"claude", "claude-process", "claude-subage
 _SESSION_RESUME_TYPES = frozenset(_CLAUDE_SUBPROCESS_TYPES | {"agy", "codex"})
 _AIDER_CONTEXT_RESERVE_TOKENS = 8_192
 _AIDER_DEFAULT_MAP_TOKENS = 1024
+# Skeletons above this size move from inline prompt content to a sidecar file;
+# the discovery guidance and the sidecar notice below must agree
+# on which mode is active.
+_SKELETON_INLINE_THRESHOLD_BYTES = 10240
 
 
 def _aider_provider(executor: str, cfg: dict, executor_cfg: dict) -> str | None:
@@ -668,6 +821,33 @@ def _aider_provider(executor: str, cfg: dict, executor_cfg: dict) -> str | None:
     if isinstance(driver_cfg, dict):
         return driver_cfg.get("provider")
     return None
+
+
+def _warn_aider_missing_no_gitignore(
+    executor: str, executor_cfg: dict, extra_flags: list[str]
+) -> None:
+    """Warn on a real (non-dry-run) Aider dispatch missing ``--no-gitignore``.
+
+    Aider's own default behavior silently modifies ``.gitignore`` (adding
+    ``.aider*``) as an uncommitted side effect separate from its own commit.
+    LaneGate's post-executor scope-drift check then flags that stray change
+    as a file committed outside the ticket's ``touches`` list, pausing an
+    otherwise-clean ticket for human review over aider's own housekeeping,
+    not a real problem with the change. ``--no-gitignore`` (aider's own
+    flag) stops it at the source; the interactive init wizard already sets
+    this by default, so this only fires for a hand-written config.
+    """
+    if "--no-gitignore" in extra_flags:
+        return
+    instance = executor_cfg.get("instance", executor)
+    print(
+        f"warning: aider executor '{instance}' is missing --no-gitignore in "
+        "its flags -- aider may silently modify .gitignore as a side effect, "
+        "which LaneGate's scope-drift check will then flag as an unexpected "
+        "committed file and pause the ticket. See "
+        "docs/executor-capabilities.md#aider",
+        file=sys.stderr,
+    )
 
 
 def _warn_unbudgeted_ollama_aider(executor: str, cfg: dict, executor_cfg: dict) -> None:
@@ -683,6 +863,25 @@ def _warn_unbudgeted_ollama_aider(executor: str, cfg: dict, executor_cfg: dict) 
             "dispatching local models. See "
             "docs/executor-capabilities.md#context-window-tokens",
             file=sys.stderr,
+        )
+
+
+def reject_ollama_for_code_step(step: str, executor_type: str) -> None:
+    """Fail closed when a raw ``ollama`` executor is dispatched to a code step.
+
+    Raw ``ollama`` only returns a text completion via ``/api/generate`` — it
+    has no file-editing or commit capability (see ``_invoke_ollama``), so
+    dispatching it to implement/review/fix/drift_check always produces zero
+    commits and silently "succeeds" at nothing. ``analyze`` is text-only and
+    stays permitted. Use ``executor: aider`` with ``provider: ollama`` for a
+    working local-model code-application route (see
+    docs/executor-capabilities.md#ollama).
+    """
+    if executor_type == "ollama" and step != "analyze":
+        raise ConfigError(
+            f"executor 'ollama' has no code-application step and cannot run "
+            f"'{step}' — it only returns a text completion with no file edits "
+            f"or commits. Use executor: aider with provider: ollama instead."
         )
 
 
@@ -901,6 +1100,34 @@ def _estimated_aider_tokens(text: str | bytes) -> int:
     return (len(raw) + 2) // 3
 
 
+def _estimate_aider_request_tokens(
+    prompt: str,
+    touches: list[str] | None,
+    worktree_path: Path | None = None,
+) -> int:
+    """Calculate the estimated token cost for prompt + touches + reserve."""
+    selected_files = list(touches or [])
+    selected_root = worktree_path if worktree_path is not None else Path.cwd()
+    estimated_tokens = _estimated_aider_tokens(prompt) + _AIDER_CONTEXT_RESERVE_TOKENS
+    for touch in selected_files:
+        path = Path(touch)
+        if not path.is_absolute():
+            path = selected_root / path
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise ConfigError(
+                f"aider context preflight requires file touches, got {touch!r}"
+            )
+        try:
+            estimated_tokens += (path.stat().st_size + 2) // 3
+        except OSError as exc:
+            raise ConfigError(
+                f"aider context preflight could not read selected file {touch!r}: {exc}"
+            ) from exc
+    return estimated_tokens
+
+
 def _check_aider_context_budget(
     prompt: str,
     touches: list[str] | None,
@@ -930,33 +1157,8 @@ def _check_aider_context_budget(
             "executors.aider.context_window_tokens must be a positive integer"
         )
 
+    estimated_tokens = _estimate_aider_request_tokens(prompt, touches, worktree_path)
     selected_files = list(touches or [])
-    selected_root = worktree_path if worktree_path is not None else Path.cwd()
-    estimated_tokens = _estimated_aider_tokens(prompt) + _AIDER_CONTEXT_RESERVE_TOKENS
-    # Full per-file byte cost, regardless of repo_map/lazy_context: Aider's
-    # filename-mention auto-add (see build_executor_cmd) injects the full file
-    # content whenever the prompt names a touched file, whether or not it was
-    # also passed positionally, so there is no config that legitimately makes
-    # touched files cheaper than their real size.
-    for touch in selected_files:
-        path = Path(touch)
-        if not path.is_absolute():
-            path = selected_root / path
-        if not path.exists():
-            # Aider is allowed to create a declared new file, which contributes
-            # no source content to its initial request.
-            continue
-        if not path.is_file():
-            raise ConfigError(
-                f"aider context preflight requires file touches, got {touch!r}"
-            )
-        try:
-            estimated_tokens += (path.stat().st_size + 2) // 3
-        except OSError as exc:
-            raise ConfigError(
-                f"aider context preflight could not read selected file {touch!r}: {exc}"
-            ) from exc
-
     if estimated_tokens <= budget:
         # Budget check passed; now try advisory discovery if this is Ollama-backed
         if executor and cfg and model:
@@ -981,6 +1183,44 @@ def _check_aider_context_budget(
     )
 
 
+# agy's own --print-timeout defaults to a hard 5 minutes (300s) client-side,
+# well under lanegate's own executor_timeout_seconds supervision -- a long
+# implement session whose in-session tool-loop history (repeated full test
+# reruns, etc.) piles up cached context can blow that fixed wall clock before
+# lanegate's outer timeout ever triggers (e.g. 18 "timeout waiting for
+# response" failures in one overnight run, one ticket killed at 303s). Pass
+# an explicit timeout, scaled by step, instead of relying on the CLI default.
+# agy's --print-timeout takes a Go time.Duration string (unit required, e.g.
+# "1800s"), not a bare integer -- a bare number errors with "missing unit in
+# duration". Codex's `codex exec` has no --timeout flag at all in current CLI
+# releases, so it isn't passed one; codex's own default wait governs there.
+_DEFAULT_PRINT_TIMEOUT_SECONDS = {
+    "analyze": 600,
+    "implement": 3600,
+}
+_DEFAULT_PRINT_TIMEOUT_FALLBACK_SECONDS = 1800
+
+
+def _effective_print_timeout_seconds(cfg: dict, executor_cfg: dict, step: str) -> int:
+    """Resolve the CLI print/turn timeout (seconds) for agy/codex.
+
+    Checked in order: a per-executor-instance override
+    (``executors.<name>.print_timeout_seconds``), then a project-wide
+    override (``print_timeout_seconds``) -- either may be a flat int or a
+    dict keyed by step -- then a built-in step-scaled default.
+    """
+    configured = executor_cfg.get("print_timeout_seconds")
+    if configured is None:
+        configured = cfg.get("print_timeout_seconds")
+    if isinstance(configured, dict):
+        configured = configured.get(step)
+    if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+        configured = None
+    if configured is not None:
+        return configured
+    return _DEFAULT_PRINT_TIMEOUT_SECONDS.get(step, _DEFAULT_PRINT_TIMEOUT_FALLBACK_SECONDS)
+
+
 def build_executor_cmd(
     executor: str,
     prompt: str,
@@ -990,12 +1230,16 @@ def build_executor_cmd(
     analyze_session_id: str | None = None,
     worktree_path: Path | None = None,
     use_stdin: bool = False,
+    disallowed_tools: list[str] | None = None,
+    read_only: bool = False,
+    max_turns: int | None = None,
+    step: str = "implement",
 ) -> list[str]:
     """Return the subprocess argv list for the given executor and prompt.
 
     ``executor`` may be a bare executor type (e.g. "claude", "aider") or a
     named executor instance configured under ``executors:`` (e.g.
-    "claude-1", see TICK-088) — resolved via :func:`get_executor_config`.
+    "claude-1") — resolved via :func:`get_executor_config`.
     Consults the resolved config for "bin" and "flags" overrides.
 
     Args:
@@ -1016,35 +1260,95 @@ def build_executor_cmd(
             context preflight resolves relative ticket touches from this directory.
         use_stdin: when supported by the resolved CLI, omit the prompt from
             argv and expect the caller to provide it through standard input.
+        disallowed_tools: tool names to deny for this call (Claude subprocess
+            types only, via ``--disallowedTools``) — for steps like analyze
+            that must stay read-only despite the executor's own
+            ``--dangerously-skip-permissions`` flag granting full tool access
+            by default.
+        read_only: when true, deny edit/commit capability for every other
+            executor type (aider, codex, agy) via that type's own read-only
+            flag -- aider's ``--dry-run``, codex's ``--sandbox read-only``,
+            agy's ``--mode plan``. Claude types are covered by
+            ``disallowed_tools`` instead, not this flag.
+        max_turns: optional maximum turn count cap to pass via CLI flag.
+        step: pipeline step used to select a per-step ``max_turns`` cap when
+            ``max_turns`` is not passed explicitly.
     """
-    executor_cfg = get_executor_config(executor, cfg)
+    executor_cfg = dict(get_executor_config(executor, cfg))
     executor_type = executor_cfg.get("type", executor)
     bin_name = executor_cfg.get("bin")
     extra_flags = list(executor_cfg.get("flags") or [])
+
+    effective_max_turns = max_turns if max_turns is not None else cfg.get("max_turns")
+    if isinstance(effective_max_turns, dict):
+        effective_max_turns = effective_max_turns.get(step)
+    if not isinstance(effective_max_turns, int) or isinstance(effective_max_turns, bool) or effective_max_turns <= 0:
+        effective_max_turns = None
 
     if executor_type in _CLAUDE_SUBPROCESS_TYPES:
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "claude")
         model_flags = ["--model", model] if model else []
         resume_flags = ["--resume", analyze_session_id] if analyze_session_id else []
         prompt_args = ["-p"] if use_stdin else ["-p", prompt]
+        tool_flags = ["--disallowedTools", ",".join(disallowed_tools)] if disallowed_tools else []
+        turns_flags = ["--max-turns", str(effective_max_turns)] if effective_max_turns else []
         # Stream JSON one event per line so compact orchestration can expose
         # safe progress metadata while the process is still running.
         return (
             [bin_name] + extra_flags + resume_flags + prompt_args + model_flags
-            + ["--output-format", "stream-json", "--verbose"]
+            + tool_flags + turns_flags + ["--output-format", "stream-json", "--verbose"]
         )
     elif executor_type == "ollama":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "ollama")
         model_arg = model or "llama3"
-        return [bin_name] + extra_flags + ["run", model_arg] + ([] if use_stdin else [prompt])
+        # ollama's `run` subcommand flags (e.g. --think=false) are only
+        # recognized after `run <model>` -- placed before it, ollama
+        # misparses the model name and attempts a registry pull instead
+        # (confirmed live).
+        return [bin_name, "run", model_arg] + extra_flags + ([] if use_stdin else [prompt])
     elif executor_type == "aider":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "aider")
+        # Neutralize mentions of every repo file except the declared touches:
+        # architecture-doc excerpts, project guidance, and ticket prose all
+        # routinely mention real file paths, and Aider's --yes-always-confirmed
+        # mention scan auto-adds any of them, not just declared touches.
+        prompt = _neutralize_aider_file_mentions(prompt, set(touches or []), worktree_path)
+
+        context_tiers = executor_cfg.get("context_tiers")
+        if context_tiers:
+            estimated_tokens = _estimate_aider_request_tokens(prompt, touches, worktree_path)
+            selected_tier = None
+            sorted_tiers = sorted(context_tiers, key=lambda t: t.get("tokens", 0))
+            for tier in sorted_tiers:
+                if tier.get("tokens", 0) >= estimated_tokens:
+                    selected_tier = tier
+                    break
+            if selected_tier is not None:
+                model = selected_tier["model"]
+                executor_cfg["context_window_tokens"] = selected_tier["tokens"]
+            else:
+                max_tier_tokens = max((t.get("tokens", 0) for t in context_tiers), default=0)
+                raise ConfigError(
+                    f"aider context preflight estimated {estimated_tokens} tokens, which exceeds "
+                    f"all configured context_tiers (max available tier: {max_tier_tokens} tokens). "
+                    "Route to a larger executor."
+                )
+
         model_flags = ["--model", model] if model else []
         # ``lazy_context`` existed before repo-map dispatch was implemented:
         # it made the preflight estimate lean, so it must select the same
         # no-positional-files behavior rather than underestimating a full
         # injection. ``repo_map`` is the clearer name for new configuration.
         repo_map = bool(executor_cfg.get("repo_map", False) or executor_cfg.get("lazy_context", False))
+        # neutralize_touches: skip the eager positional preload of touches so
+        # a multi-file ticket doesn't front-load every touched file's full
+        # content before the run starts. Touches stay unmangled in the prompt
+        # (see protect_set below) and still count fully against the context
+        # budget (see _check_aider_context_budget), since Aider's own
+        # filename-mention auto-add will still pull them in on demand as the
+        # agent edits them -- this only defers *when* they're loaded, not
+        # *whether* they're loaded or budgeted for.
+        neutralize_touches = bool(executor_cfg.get("neutralize_touches", False))
         if repo_map:
             map_tokens = executor_cfg.get("map_tokens", _AIDER_DEFAULT_MAP_TOKENS)
             if not isinstance(map_tokens, int) or isinstance(map_tokens, bool) or map_tokens <= 0:
@@ -1055,17 +1359,23 @@ def build_executor_cmd(
             file_args = []
         else:
             repo_map_flags = []
-            file_args = list(touches) if touches else []
+            file_args = [] if neutralize_touches else (list(touches) if touches else [])
         edit_format = executor_cfg.get("edit_format")
         if edit_format is not None and (not isinstance(edit_format, str) or not edit_format):
             raise ConfigError("executors.aider.edit_format must be a non-empty string")
+        # A read-only call (analyze) never edits or commits -- --dry-run
+        # already guarantees that -- so force aider's own "ask" coder
+        # regardless of any configured edit_format. Without this, aider
+        # still frames the request through a code-edit coder (diff/whole)
+        # and tries to answer with a diff/full-file rewrite instead of the
+        # plain JSON analyze asks for (--chat-mode is just an alias for
+        # --edit-format, not a distinct safety mode).
+        if read_only:
+            edit_format = "ask"
         edit_format_flags = ["--edit-format", edit_format] if edit_format else []
         _warn_unbudgeted_ollama_aider(executor, cfg, executor_cfg)
-        # Neutralize mentions of every repo file except the declared touches:
-        # architecture-doc excerpts, project guidance, and ticket prose all
-        # routinely mention real file paths, and Aider's --yes-always-confirmed
-        # mention scan auto-adds any of them, not just declared touches.
-        prompt = _neutralize_aider_file_mentions(prompt, set(touches or []), worktree_path)
+        if not read_only:
+            _warn_aider_missing_no_gitignore(executor, executor_cfg, extra_flags)
         # Budget on the full touches list even in repo_map mode: Aider's
         # --yes-always auto-confirms its own filename-mention scan of the
         # prompt text, so touched files named there get their full contents
@@ -1074,9 +1384,14 @@ def build_executor_cmd(
         _check_aider_context_budget(
             prompt, touches, executor_cfg, model, worktree_path=worktree_path, executor=executor, cfg=cfg
         )
+        # --dry-run: aider's own edit/commit capability (--yes-always included)
+        # must not run at analyze time, before any worktree exists -- this is
+        # the only aider flag that blocks file writes outright rather than
+        # just asking for confirmation, which --yes-always would auto-answer.
+        dry_run_flags = ["--dry-run"] if read_only else []
         return (
             [bin_name] + extra_flags + model_flags + repo_map_flags + edit_format_flags
-            + ["--message", prompt] + file_args
+            + dry_run_flags + ["--message", prompt] + file_args
         )
     elif executor_type == "openhands":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "openhands")
@@ -1089,20 +1404,35 @@ def build_executor_cmd(
         # instead of the default human-readable transcript, so real token
         # usage can be parsed the same way as Claude's --output-format json.
         # Codex uses a `resume` subcommand; `codex exec --resume` is not a
-        # valid invocation in current CLI releases.
+        # valid invocation in current CLI releases. `codex exec` has no
+        # --timeout flag in current CLI releases (see _effective_print_timeout_seconds'
+        # docstring) so none is passed here; only agy's hard client-side
+        # default needs an explicit override.
         prompt_arg = "-" if use_stdin else prompt
+        # --sandbox read-only: analyze must not get shell/file-write access,
+        # even though a ticket's own `executors.codex.flags` may carry
+        # --dangerously-bypass-approvals-and-sandbox for implement/review.
+        # Appended after extra_flags so it takes precedence if codex's CLI
+        # applies later-argv-wins for conflicting sandbox settings; this is
+        # not independently verified against that bypass flag, so treat a
+        # ticket-level bypass override as a known caveat, not a guarantee.
+        sandbox_flags = ["--sandbox", "read-only"] if read_only else []
         if analyze_session_id:
             return (
                 [bin_name, "exec", "resume", "--json"]
                 + extra_flags
                 + model_flags
+                + sandbox_flags
                 + [analyze_session_id, prompt_arg]
             )
-        return [bin_name, "exec", "--json"] + extra_flags + model_flags + [prompt_arg]
+        return [bin_name, "exec", "--json"] + extra_flags + model_flags + sandbox_flags + [prompt_arg]
     elif executor_type == "agy":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "agy")
         model_flags = ["--model", model] if model else []
-        resume_flags = ["--resume", analyze_session_id] if analyze_session_id else []
+        resume_flags = ["--conversation", analyze_session_id] if analyze_session_id else []
+        timeout_flags = [
+            "--print-timeout", f"{_effective_print_timeout_seconds(cfg, executor_cfg, step)}s"
+        ]
         # agy (Antigravity CLI) is Google's successor to the now-deprecated
         # Gemini CLI. --print/-p is not a boolean flag -- it swallows the very
         # next token as the prompt (google-antigravity/antigravity-cli#76), so
@@ -1113,8 +1443,15 @@ def build_executor_cmd(
         # writing to stderr with a nonzero exit -- both fixed in 1.1.1.
         # `agy --help` exposes no file/stdin prompt source compatible with
         # --print, so preserve argv delivery even when callers request stdin.
+        # --print-timeout overrides agy's own hard 5-minute default (see
+        # _effective_print_timeout_seconds) so long implement sessions aren't
+        # killed mid-turn.
+        # --mode plan: analyze must not get edit capability, even though a
+        # ticket's own `executors.agy.flags` may carry
+        # --dangerously-skip-permissions for implement/review.
+        mode_flags = ["--mode", "plan"] if read_only else []
         return (
-            [bin_name] + extra_flags + model_flags + resume_flags
+            [bin_name] + extra_flags + model_flags + resume_flags + timeout_flags + mode_flags
             + ["--output-format", "json", "--print", prompt]
         )
     else:
@@ -1166,20 +1503,40 @@ def parse_claude_json_result(stdout: str) -> dict | None:
     }
 
 
+# Approximate OpenAI Codex CLI (GPT-5 Codex family) pricing, USD per million
+# tokens. Codex's ``--json`` stream carries no dollar figure at all (unlike
+# Claude's total_cost_usd), so lanegate applies its own rate table to keep
+# step_costs cost_usd populated and comparable across executors instead of
+# silently reporting 0 for every Codex row. Cached-input tokens are priced at
+# a 90% discount off the input rate, following OpenAI's general cached-token
+# pricing pattern. These are approximations, not a billing source of truth --
+# update if actual rates diverge materially from what your account is billed.
+_CODEX_INPUT_USD_PER_MILLION = 1.25
+_CODEX_CACHED_INPUT_USD_PER_MILLION = 0.125
+_CODEX_OUTPUT_USD_PER_MILLION = 10.0
+
+
 def parse_codex_json_result(stdout: str) -> dict | None:
     """Parse Codex CLI ``exec --json`` JSONL events into cost/token/text fields.
 
     Codex streams one JSON object per line rather than Claude's single
     envelope: the reply text comes from ``item.completed`` agent_message
     events, and token counts come from the ``turn.completed`` event's usage
-    block. Codex does not report a dollar figure the way Claude's
-    --output-format json does (no total_cost_usd equivalent), so cost_usd is
-    always None here. Returns None if no turn.completed event is found (a
-    non-Codex executor, or a Codex CLI version/flag combo without --json).
+    block. That usage block is cumulative across the whole session (not
+    per-turn) and its ``input_tokens`` includes cached reads, unlike Claude's
+    ``usage.input_tokens`` which is already uncached-only -- so this parser
+    subtracts ``cached_input_tokens`` out of ``input_tokens`` before
+    returning it, keeping the ``input_tokens`` field's meaning ("uncached
+    input") consistent across executors for step_costs aggregation. Codex
+    reports no dollar figure itself, so cost_usd is estimated from the
+    normalized token counts via the approximate rate table above. Returns
+    None if no turn.completed event is found (a non-Codex executor, or a
+    Codex CLI version/flag combo without --json).
     """
     result_text_parts: list[str] = []
     usage: dict | None = None
     session_id: str | None = None
+    num_turns = 0
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1200,6 +1557,7 @@ def parse_codex_json_result(stdout: str) -> dict | None:
                 result_text_parts.append(item["text"])
         elif event_type == "turn.completed":
             usage = event.get("usage") or {}
+            num_turns += 1
     if usage is None:
         return None
     output_tokens = usage.get("output_tokens")
@@ -1207,15 +1565,26 @@ def parse_codex_json_result(stdout: str) -> dict | None:
     total_output_tokens = None
     if output_tokens is not None or reasoning_tokens is not None:
         total_output_tokens = (output_tokens or 0) + (reasoning_tokens or 0)
+    raw_input_tokens = usage.get("input_tokens")
+    cache_read_tokens = usage.get("cached_input_tokens")
+    uncached_input_tokens = None
+    if raw_input_tokens is not None:
+        uncached_input_tokens = raw_input_tokens - (cache_read_tokens or 0)
+    cost_usd = round(
+        (uncached_input_tokens or 0) / 1_000_000 * _CODEX_INPUT_USD_PER_MILLION
+        + (cache_read_tokens or 0) / 1_000_000 * _CODEX_CACHED_INPUT_USD_PER_MILLION
+        + (total_output_tokens or 0) / 1_000_000 * _CODEX_OUTPUT_USD_PER_MILLION,
+        6,
+    )
     return {
         "result_text": "\n".join(result_text_parts),
-        "cost_usd": None,
+        "cost_usd": cost_usd,
         "duration_ms": None,
-        "num_turns": None,
-        "input_tokens": usage.get("input_tokens"),
+        "num_turns": num_turns,
+        "input_tokens": uncached_input_tokens,
         "output_tokens": total_output_tokens,
         "cache_creation_tokens": usage.get("cache_write_input_tokens"),
-        "cache_read_tokens": usage.get("cached_input_tokens"),
+        "cache_read_tokens": cache_read_tokens,
         "is_error": None,
         "session_id": session_id or usage.get("session_id") or usage.get("thread_id") or usage.get("conversation_id"),
     }
@@ -1302,7 +1671,7 @@ def dispatch_executor(
     """Resolve *executor* (bare type or named instance) and run it as a subprocess.
 
     Single call site responsible for injecting a named instance's
-    ``api_key_env`` (TICK-088) into the child process environment — see
+    ``api_key_env`` into the child process environment — see
     :func:`resolve_executor_env` — so callers do not have to duplicate the
     resolution + env-injection logic themselves. The env var name is never
     logged; only its value is copied into the child environment.
@@ -1386,6 +1755,24 @@ def build_implement_prompt(
     close_criteria = ticket.get("close_criteria", "")
     body = ticket.get("_body", "")
     prior_notes = ticket.get("_prior_notes", "")
+    acceptance_matrix = ticket.get("acceptance_matrix")
+    overlap_review = ticket.get("overlap_review")
+
+    # Loaded before the template renders: the discovery guidance has to tell the
+    # agent whether structure is actually present in this prompt, since "use the
+    # skeletons below" is misleading advice on a ticket that has none -- and
+    # equally misleading when skeletons exist but exceeded the inline threshold
+    # below and were pushed to a sidecar file instead.
+    # regenerate=True: implement runs after analyze, so the worktree may already
+    # differ from the snapshot analyze captured.
+    file_skeletons = load_file_skeletons(ticket, root, regenerate=True)
+    total_skel_bytes = sum(len(v.encode("utf-8")) for v in file_skeletons.values())
+    skeletons_inline = bool(file_skeletons) and total_skel_bytes <= _SKELETON_INLINE_THRESHOLD_BYTES
+    skeletons_ref = (
+        (ticket.get("file_skeletons_ref") or f".lanegate/context/{tid}/file_skeletons.json")
+        if file_skeletons and not skeletons_inline
+        else None
+    )
 
     # Load the instruction text from the configurable template
     template = load_prompt_template("implement", root)
@@ -1397,6 +1784,11 @@ def build_implement_prompt(
         close_criteria=close_criteria,
         body=body,
         prior_notes=prior_notes,
+        working_directory=str(root),
+        discovery_guidance=render_discovery_guidance(
+            cfg, has_skeletons=skeletons_inline, skeletons_ref=skeletons_ref
+        ),
+        drift_guidance=render_drift_guidance(ticket, root),
     ).strip()
     if _components is not None:
         _components.append(_component("instruction-template", "prompts/implement.md", "implement", instruction))
@@ -1406,10 +1798,52 @@ def build_implement_prompt(
     # ticket to the model, so this stays a stable, cacheable prefix across tickets.
     trusted_parts = [instruction]
 
+    if isinstance(acceptance_matrix, dict):
+        matrix_lines = ["## Acceptance matrix", "Map every item below to an exact test before editing."]
+        for label, items in (
+            ("Invariants", acceptance_matrix.get("invariants")),
+            ("Adversarial / failure cases", acceptance_matrix.get("adversarial_cases")),
+            ("Compatibility cases", acceptance_matrix.get("compatibility_cases")),
+            ("Exact regression tests", acceptance_matrix.get("regression_tests")),
+        ):
+            matrix_lines.append(f"\n### {label}")
+            matrix_lines.extend(f"- {item}" for item in items or [])
+        matrix_lines.append(
+            "\nBefore finalizing, inspect the branch diff and remove every artifact outside the declared touches."
+        )
+        # The analyzer normalizes this field, but implementation prompt
+        # construction also has to fail closed against hand-edited/stale
+        # metadata: an invalid overlap plan is not trusted guidance.
+        if isinstance(overlap_review, dict) and not validate_overlap_review(overlap_review):
+            matrix_lines.append(
+                f"\n### Active overlap plan\n- {overlap_review.get('mode', 'unknown')}: "
+                + ", ".join(str(ticket_id) for ticket_id in overlap_review.get("ticket_ids") or [])
+            )
+        acceptance_matrix_block = "\n".join(matrix_lines)
+        trusted_parts.append(acceptance_matrix_block)
+    else:
+        acceptance_matrix_block = ""
+    if _components is not None:
+        _components.append(_component(
+            "acceptance-matrix", "ticket.acceptance_matrix", "implement", acceptance_matrix_block,
+            reason="selected-by-ticket" if acceptance_matrix_block else "no-matrix",
+        ))
+
     declared_touches = ticket.get("touches") or []
 
+    shared_notes = get_bounded_shared_notes(root, declared_touches, cfg=cfg, step="implement")
+    if shared_notes:
+        trusted_parts.append(shared_notes)
+    if _components is not None:
+        _components.append(_component(
+            "shared-notes", ".lanegate/notes", "implement", shared_notes,
+            reason="global-and-touch-relevant" if shared_notes else "no-relevant-notes",
+        ))
+
+    ref_doc_paths = resolve_reference_doc_paths(root, cfg)
     project_guidance = load_project_guidance(
-        root, cfg, step="implement", relevant_paths=declared_touches
+        root, cfg, step="implement", relevant_paths=declared_touches,
+        exclude_paths=ref_doc_paths or None,
     )
     if project_guidance:
         trusted_parts.append(project_guidance)
@@ -1419,40 +1853,39 @@ def build_implement_prompt(
             reason="matched-and-bounded" if project_guidance else "no-matching-files",
         ))
 
-    arch_excerpt, arch_component = get_bounded_architecture_excerpt(
+    ref_excerpt, ref_components = get_bounded_reference_excerpts(
         root, declared_touches, cfg=cfg, step="implement"
     )
-    if arch_excerpt:
-        trusted_parts.append(arch_excerpt)
+    if ref_excerpt:
+        trusted_parts.append(ref_excerpt)
     if _components is not None:
-        _components.append(arch_component)
+        _components.extend(ref_components)
 
-    # Add file skeletons section (from TICK-064 & TICK-315 adaptive context optimization)
-    file_skeletons = load_file_skeletons(ticket, root)
+    # Add file skeletons section (adaptive context
+    # optimization). Loaded above, before the instruction template renders.
     if file_skeletons:
-        total_skel_bytes = sum(len(v.encode("utf-8")) for v in file_skeletons.values())
-        # Large skeleton threshold: 10KB (TICK-315)
-        if total_skel_bytes > 10240:
-            ref = ticket.get("file_skeletons_ref") or f".lanegate/context/{tid}/file_skeletons.json"
+        if skeletons_ref:
             skeleton_block = (
                 f"## Code Map Notice\n"
-                f"This ticket touches {len(file_skeletons)} files (~{total_skel_bytes // 1024} KB AST skeletons).\n"
-                f"Full AST skeletons are saved at `{ref}`.\n\n"
-                "IMPORTANT: To prevent signature hallucinations, inspect target files using file reading tools "
-                "or grep before making changes."
+                f"This ticket touches {len(file_skeletons)} files (~{total_skel_bytes // 1024} KB AST skeletons) "
+                f"-- too large to inline. Full skeletons are saved at `{skeletons_ref}`, but "
+                f"`lanegate symbols <file>` (see discovery order above) is the cheaper way to get "
+                f"them per file."
             )
         else:
             skeleton_block = "## File skeletons\n" + "\n".join(file_skeletons.values())
         trusted_parts.append(skeleton_block)
+    else:
+        skeleton_block = ""
     if _components is not None:
         _components.append(_component(
             "file-skeletons", "ticket.touches (AST skeleton)", "implement",
-            "\n".join(file_skeletons.values()) if file_skeletons else "",
+            skeleton_block,
             reason="selected-by-touches" if file_skeletons else "no-skeletons",
         ))
 
     # Add planned changes section (analysis change notes)
-    change_notes = ticket.get("change_notes") or {}
+    change_notes = load_change_notes(ticket)
     if change_notes:
         notes_lines = [f"**{f}**: {note}" for f, note in change_notes.items()]
         notes_block = "## Planned changes\n" + "\n".join(notes_lines)
@@ -1463,6 +1896,20 @@ def build_implement_prompt(
             "change-notes", "ticket.change_notes", "implement",
             notes_block if change_notes else "",
             reason="selected-by-ticket" if change_notes else "no-change-notes",
+        ))
+
+    # Cross-ticket change_notes: surface what prior merged/done tickets recorded
+    # about files this ticket also touches -- the git-tracked replacement for
+    # the dead worktree-vs-repo_root per-file .lanegate/notes/ mechanism.
+    cross_ticket_tickets_dir = root / (cfg or {}).get("tickets_dir", ".lanegate/tickets")
+    cross_ticket_notes = collect_cross_ticket_change_notes(ticket, cross_ticket_tickets_dir, cfg)
+    if cross_ticket_notes:
+        trusted_parts.append(cross_ticket_notes)
+    if _components is not None:
+        _components.append(_component(
+            "cross-ticket-change-notes", "prior tickets.change_notes", "implement",
+            cross_ticket_notes,
+            reason="matched-and-bounded" if cross_ticket_notes else "no-overlap",
         ))
 
     matched_groups = matching_verification_groups(ticket.get("touches") or [], cfg)
@@ -1515,7 +1962,7 @@ def describe_implement_payload(
 
     Component metadata only; never includes the ticket's actual title/body/
     criteria/skeleton/diff text, so this is safe to log or display by default
-    (TICK-306 payload audit).
+    (payload audit).
     """
     components: list = []
     build_implement_prompt(ticket, project_root, cfg, _components=components)

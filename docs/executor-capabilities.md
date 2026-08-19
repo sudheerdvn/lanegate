@@ -1,6 +1,6 @@
 # Executor Capability Matrix
 
-This document compares the executors supported by LaneGate across headless operation, prompt transport, local model support, auto-commit behavior, current sandbox status, recommended use, and known caveats. Read this before choosing an executor for `lanegate orchestrate`.
+This document compares the executors supported by LaneGate across headless operation, prompt transport, local model support, auto-commit behavior, current sandbox status, recommended use, and known caveats. Read this before choosing an executor for `lanegate run`.
 
 ---
 
@@ -16,7 +16,7 @@ outcome metadata rather than an intrinsic executor capability.
 | `claude` / `claude-process` | Yes, with a scoped `--allowedTools` set (default) or `--dangerously-skip-permissions` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process, no LaneGate sandbox | Default executor for most workflows |
 | `claude-subagent` | Yes, same flag options as `claude-process` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process, no LaneGate sandbox | Long-running sessions where context continuity matters |
 | `aider` | Yes, requires `--yes-always` | `--message <prompt>` (argv) | Yes, works with any OpenAI-compatible or Ollama backend | Yes, aider commits each accepted change directly | Host process, no LaneGate sandbox | Code-generation tasks where direct git commit control is useful |
-| `codex` | Yes, requires `--approval-policy=never` | Prompt passed as positional arg after `codex exec` (argv) | No, requires OpenAI API | No, commits via shell tools | Host process, no LaneGate sandbox | Teams already using Codex CLI, otherwise prefer `claude` |
+| `codex` | Yes, requires `--dangerously-bypass-approvals-and-sandbox` | Prompt passed as positional arg after `codex exec` (argv) | No, requires OpenAI API | No, commits via shell tools | Host process, no LaneGate sandbox | Teams already using Codex CLI, otherwise prefer `claude` |
 | `ollama` | Yes, no interactive prompts by design | Prompt passed as positional arg to `ollama run` (argv/stdin equivalent) | Yes, local inference only, no external API calls | No, Ollama itself does not commit | Host process, no LaneGate sandbox | Fully offline or air-gapped operation, privacy-sensitive projects |
 | `agy` | Yes, requires `agy` >= 1.1.1 (see caveats) | `--print <prompt>` (argv, must be the final two tokens) | No, requires Google account/API access | No, commits via shell tools | Host process, no LaneGate sandbox | Teams on Google's Antigravity CLI, supersedes the now-deprecated `gemini` type |
 
@@ -28,15 +28,15 @@ outcome metadata rather than an intrinsic executor capability.
 
 These two executor names both resolve to the `claude` CLI (Claude Code). `claude-process` is an alias that makes split-mode configuration explicit. The executor is validated and is LaneGate's recommended default.
 
-**Headless operation:** Claude Code blocks on interactive approval prompts by default. `lanegate init` writes a scoped `--allowedTools` set to the executor's `flags` list by default, which auto-approves only the tool categories orchestrate needs (editing files, running tests/git via Bash) while leaving everything else gated. You can instead pass `--dangerously-skip-permissions`, which disables Claude Code's per-action confirmation dialogs entirely so the agent can read files, run shell commands, and call MCP tools without pausing. That's a deliberate trade-off for setups like a sandboxed CI runner. See [Security Status](../docs/security-model.md#headless-permission-options-for-the-claude-executor) for the full comparison.
+**Headless operation:** Claude Code blocks on interactive approval prompts by default. `lanegate init` writes a scoped `--allowedTools` set to the executor's `flags` list by default, which auto-approves only the tool categories orchestrate needs (editing files, running tests/git via Bash) while leaving everything else gated. You can instead pass `--dangerously-skip-permissions`, which disables Claude Code's per-action confirmation dialogs entirely so the executor can read files, run shell commands, and call MCP tools without pausing. That's a deliberate trade-off for setups like a sandboxed CI runner. See [Security Status](../docs/security-model.md#headless-permission-options-for-the-claude-executor) for the full comparison.
 
 **Prompt transport:** The rendered prompt is passed as a single string via the `-p` flag (argv). No prompt file or stdin piping is used.
 
 **Local model support:** Not applicable. Claude Code requires a connection to the Anthropic API. There is no offline mode.
 
-**Auto-commit behavior:** Claude Code does not commit on its own unless the agent explicitly runs `git commit` via its shell tool. In combined mode, the agent is instructed to run `lanegate complete && lanegate review --verdict ...` after committing. In split mode, the implement executor is expected to commit and then exit.
+**Auto-commit behavior:** Claude Code does not commit on its own unless the executor explicitly runs `git commit` via its shell tool. In combined mode, the executor is instructed to run `lanegate complete && lanegate review --verdict ...` after committing. In split mode, the implement executor is expected to commit and then exit.
 
-**Sandbox status:** Claude Code runs as a host process under the invoking OS user. LaneGate does not apply any container, namespace, bwrap, or seccomp wrapper. The agent has full read/write access to the filesystem and can make outbound network connections.
+**Sandbox status:** Claude Code runs as a host process under the invoking OS user. LaneGate does not apply any container, namespace, bwrap, or seccomp wrapper. The executor process has full read/write access to the filesystem and can make outbound network connections.
 
 **Recommended use:** Default executor for any project with an Anthropic API key. Combined mode (one subprocess handles implement and self-review) is the default and reduces round-trips.
 
@@ -44,9 +44,9 @@ These two executor names both resolve to the `claude` CLI (Claude Code). `claude
 
 ### `aider`
 
-Aider is an open-source coding agent that manages its own git workflow. It is validated for LaneGate integration, alongside `claude`, `codex`, and `agy`.
+Aider is an open-source coding tool that manages its own git workflow. It is validated for LaneGate integration, alongside `claude`, `codex`, and `agy`.
 
-**Headless operation:** Pass `--yes-always` in the executor's `flags` list. This auto-confirms all of aider's interactive prompts (file additions, diff displays, and commit messages) without blocking on terminal input.
+**Headless operation:** Pass `--yes-always` in the executor's `flags` list. This auto-confirms all of aider's interactive prompts (file additions, diff displays, and commit messages) without blocking on terminal input. Also pass `--no-gitignore`: aider's default behavior silently modifies `.gitignore` (adding `.aider*`) as an uncommitted side effect separate from its own commit, which LaneGate's post-executor scope-drift check then flags as an unexpected committed file and pauses the ticket for human review over aider's own housekeeping. `lane init --interactive` already sets both flags by default; a hand-written config needs both explicitly.
 
 **Prompt transport:** The rendered prompt is passed via `--message <prompt>` (argv). File arguments from the ticket's `touches` list are appended so aider can load the relevant file content directly rather than relying on its repo-map inference.
 
@@ -76,17 +76,17 @@ executors:
 
 Codex refers to the OpenAI Codex CLI.
 
-**Headless operation:** Pass `--approval-policy=never` in the executor's `flags` list to disable per-action approval prompts.
+**Headless operation:** Pass `--dangerously-bypass-approvals-and-sandbox` in the executor's `flags` list to disable per-action approval prompts. Do not combine it (or any other `--sandbox`/`--approve-for-me` flag) with a separate `--sandbox` value — LaneGate already injects `--sandbox read-only` for analyze/review steps, and the real `codex` CLI errors on a duplicated `--sandbox` or on `--approve-for-me` combined with any `--sandbox` flag at all.
 
-**Prompt transport:** The rendered prompt is passed to `codex exec` via stdin, not as a positional argument.
+**Prompt transport:** The rendered prompt is passed to `codex exec` as a positional argument (or `-` to read it from stdin for session resume).
 
 **Local model support:** Not applicable. Codex CLI requires an OpenAI API key and calls OpenAI's API. There is no local inference mode.
 
-**Auto-commit behavior:** Codex does not automatically commit. The agent uses shell tools to run git commands. LaneGate inspects the worktree diff after the process exits.
+**Auto-commit behavior:** Codex does not automatically commit. The executor uses shell tools to run git commands. LaneGate inspects the worktree diff after the process exits.
 
 **Sandbox status:** Codex runs as a host process under the invoking OS user. No container or kernel-level isolation is applied by LaneGate.
 
-**Recommended use:** Teams already using the Codex CLI as their primary coding agent. For new setups, `claude` is better tested and has wider LaneGate test coverage.
+**Recommended use:** Teams already using the Codex CLI as their primary coding executor. For new setups, `claude` is better tested and has wider LaneGate test coverage.
 
 **Known caveats:** Codex integration has lighter test coverage than `claude` or `aider`. The `codex exec` subcommand interface may change between CLI versions. Pin the Codex CLI version in your development environment.
 
@@ -102,11 +102,11 @@ Ollama provides local model inference.
 
 **Local model support:** Yes. This is Ollama's primary purpose. All inference runs on the local machine with no external API calls. Models must be pulled with `ollama pull <model>` before use.
 
-**Auto-commit behavior:** Ollama does not commit. Ollama is a model server, not a coding agent. The text it returns is the entire output. LaneGate currently passes this output back as the executor result but does not automatically apply it to files or commit it. For Ollama to be useful as an implementation executor, either a wrapper script or a future LaneGate integration layer must apply the model's output to the relevant files.
+**Auto-commit behavior:** Ollama does not commit. Ollama is a model server, not a coding tool. The text it returns is the entire output, with no file edits or commits. Rather than silently accepting that and producing zero commits, LaneGate rejects `ollama` at dispatch time with a configuration error for `implement`, `review`, `fix`, and `drift_check`: only `analyze` (text-only) is permitted.
 
 **Sandbox status:** Ollama runs as a host process. No container or kernel-level isolation is applied by LaneGate. Because Ollama makes no external API calls, network egress risk is lower than with cloud-backed executors, but filesystem access is still unrestricted.
 
-**Recommended use:** Fully offline or air-gapped environments, privacy-sensitive projects where code must not leave the local machine, and cost-sensitive workflows where API costs are a constraint. Note that the LaneGate/Ollama integration does not yet have a code-application step, so practical use requires a custom wrapper.
+**Recommended use:** Fully offline or air-gapped environments, privacy-sensitive projects where code must not leave the local machine, and cost-sensitive workflows where API costs are a constraint, for the `analyze` step only. For code-writing steps, raw `ollama` is rejected at dispatch time; use `executor: aider` with `provider: ollama` instead.
 
 **Known caveats:** Ollama models vary significantly in coding quality. `qwen2.5-coder` and `codellama` are the recommended starting points for code-generation tasks. Response format compliance (e.g., the model reliably running `lanegate complete` at the end of a session) is less reliable with smaller local models than with frontier models like Claude.
 
@@ -116,19 +116,21 @@ Ollama provides local model inference.
 
 Antigravity CLI, Google's successor to the Gemini CLI (`gemini` type). Google retired individual-tier Gemini CLI access on 2026-06-18, so new integrations should use `agy`, not `gemini`.
 
-**Headless operation:** `agy` supports `-p`/`--print`/`--prompt` for single-shot non-interactive runs. **Requires `agy` >= 1.1.1.** Earlier versions had two automation-breaking bugs when spawned as a subprocess: hanging while reading stdin (fixed by not reading stdin when a prompt is supplied via flag), and exiting 0 with empty stdout on a server-side error such as a quota rejection instead of writing to stderr with a nonzero exit ([google-antigravity/antigravity-cli#76](https://github.com/google-antigravity/antigravity-cli/issues/76)). LaneGate already runs executors with `stdin=DEVNULL` when the prompt is passed via argv (which it is for `agy`), so the stdin-hang case doesn't reproduce here regardless of version. The swallowed-error behavior on pre-1.1.1 builds, though, can still look like a silently empty or successful ticket run.
+**Headless operation:** `agy` supports `-p`/`--print`/`--prompt` for single-shot non-interactive runs. **Requires `agy` >= 1.1.1.** Earlier versions had two automation-breaking bugs when spawned as a subprocess: hanging while reading stdin (fixed by not reading stdin when a prompt is supplied via flag), and exiting 0 with empty stdout on a server-side error such as a quota rejection instead of writing to stderr with a nonzero exit ([google-antigravity/antigravity-cli#76](https://github.com/google-antigravity/antigravity-cli/issues/76)). LaneGate already runs executors with `stdin=DEVNULL` when the prompt is passed via argv (which it is for `agy`), so the stdin-hang case doesn't reproduce here regardless of version. The swallowed-error behavior on pre-1.1.1 builds, though, can still look like a silently empty or successful ticket run. For unattended runs, pass `--dangerously-skip-permissions` in `executors.agy.flags` so tool executions run without interactive prompts. `lane init --interactive` also adds `--disable-slash-commands` by default so agy doesn't interpret `/`-prefixed content in the rendered prompt (e.g. ticket text mentioning a path or command) as its own CLI slash commands.
+
+**Session continuity & modes:** LaneGate uses `--conversation <id>` to resume an earlier `analyze` or `implement` session during `implement` or `fix`. During `analyze`, LaneGate runs `agy` with `--mode plan` to ensure the analysis phase remains read-only without modifying files on disk.
 
 **Prompt transport:** Passed via `--print <prompt>` (argv). `--print` is not a boolean flag: it consumes the very next token as the prompt. So LaneGate always places it last in the argv list, after `--output-format json` and any `--model` flag.
 
 **Local model support:** No, it requires a signed-in Google Antigravity account or API access, the same trust boundary as `claude` and `codex`.
 
-**Auto-commit behavior:** No automatic commit. The agent uses shell tools to run git commands. LaneGate inspects the worktree diff after the process exits, same as `claude`/`codex`.
+**Auto-commit behavior:** No automatic commit. The executor uses shell tools to run git commands. LaneGate inspects the worktree diff after the process exits, same as `claude`/`codex`.
 
 **Sandbox status:** Host process under the invoking OS user. No container or kernel-level isolation is applied by LaneGate.
 
 **Cost tracking:** `agy --output-format json` reports `input_tokens`, `output_tokens`, `thinking_tokens`, and `cache_read_tokens`, but no dollar cost and no cache-write token count. `cost_usd` and `cache_creation_tokens` are always `None` in LaneGate's parsed step-cost data for this executor (see `parse_agy_json_result` in `lanegate/executor.py`).
 
-**Recommended use:** Teams standardized on Google's Antigravity CLI. Pin `agy` to >= 1.1.1 before relying on it for unattended `lanegate orchestrate` runs.
+**Recommended use:** Teams standardized on Google's Antigravity CLI. Pin `agy` to >= 1.1.1 before relying on it for unattended `lanegate run` runs.
 
 **Known caveats:** New integration with comparatively little LaneGate test coverage. The CLI is actively evolving post-rebrand. Pin the `agy` version in your development environment and watch for JSON envelope changes.
 
@@ -138,13 +140,13 @@ Antigravity CLI, Google's successor to the Gemini CLI (`gemini` type). Google re
 
 No executor is sandboxed by LaneGate itself today. The table below clarifies what isolation exists with the current no-runner execution path:
 
-| Executor | OS-level sandbox | Network egress confined | Notes |
+| Executor | Isolation wrapper | Network egress restricted | Process context |
 |---|---|---|---|
-| `claude` / `claude-process` | None | No | Host process, Anthropic API calls are outbound |
+| `claude` / `claude-process` | None | No | Host process under invoking user |
 | `claude-subagent` | None | No | Same as above |
-| `aider` | None | No | Host process, API calls are outbound |
-| `codex` | None | No | Host process, OpenAI API calls are outbound |
-| `ollama` | None | Yes (no external API, local only) | Local inference, no outbound model API calls |
+| `aider` | None | No (calls configured API or local Ollama) | Host process under invoking user |
+| `codex` | None | No | Host process under invoking user |
+| `ollama` | None | No (runs local server, no external calls) | Host process under invoking user |
 | `agy` | None | No | Host process, Google Antigravity API calls are outbound |
 
 Git-level containment (the `touches` list, hard-blocked files, and diff inspection) applies to all executors regardless of sandbox status. OS-level containment does not.
@@ -153,13 +155,13 @@ If the optional runner/sandbox contract is implemented later, sandbox data shoul
 
 ---
 
-## Selecting an executor
+## Choosing an executor
 
-For most users starting out, use `executor: claude`. `lanegate init` writes a scoped `--allowedTools` default for it, and it is the most thoroughly tested path through LaneGate's orchestration loop.
+For cloud-backed frontier models, start with `executor: claude` (Claude Code). It has the most end-to-end testing in LaneGate and the most reliable structured output parsing.
 
-For fully local operation, use `executor: aider` with a local Ollama model as aider's backend (`provider: ollama`). This is the validated path, since Aider applies and commits edits itself. Raw `executor: ollama` has no code-application step of its own (see above) and is only useful for text-only steps like `analyze`.
+For fully local operation, use `executor: aider` with a local Ollama model as aider's backend (`provider: ollama`). This is the validated path, since Aider applies and commits edits itself (analyze, implement, and review all run through it). Raw `executor: ollama` has no code-application step of its own (see above) and is only useful for text-only steps like `analyze`: dispatching it to `implement`/`review`/`fix`/`drift_check` is now enforced as a configuration error, not just discouraged.
 
-For mixed workflows that pair fast generation with higher-quality review, use `executor_steps` to route implement and review to different executors. See [config-reference.md](config-reference.md) for the resolution order and split-mode behavior.
+For mixed workflows that pair fast generation with higher-quality review, use `executor_steps` to route implement and review to different executors (for example, local Aider for `implement` and `claude` for `review`), keeping day-to-day iteration offline while still getting an independent, higher-quality reviewer pass. See [config-reference.md](config-reference.md) for the resolution order and split-mode behavior.
 
 For the threat model and safe usage recommendations that apply to all executors, see [docs/security-model.md](security-model.md).
 
@@ -172,9 +174,9 @@ When `autonomy: full` enables the auto-fix loop (see [ARCHITECTURE.md §7](ARCHI
 ```yaml
 models:
   implement: claude-sonnet-5
-  review: claude-opus-4-8
-  fix: claude-opus-4-8
-  drift_check: claude-opus-4-8
+  review: claude-opus-5
+  fix: claude-opus-5
+  drift_check: claude-opus-5
 ```
 
 Or per-executor, under `executors.<name>.models`. This is a recommendation, not an enforced default. `resolve_model()` only supplies a built-in default for `analyze`/`implement`/`review` on claude-family executors. `fix` and `drift_check` have no built-in default and fall back to the executor's own default model if left unconfigured.

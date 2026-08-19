@@ -10,6 +10,29 @@ lanegate start $ARGUMENTS
 
 After the worktree is created (`.lanegate/worktrees/<ticket-id>/`), edit files **there** — never edit the main checkout's copies. Reset CWD between tickets.
 
+## Shared notes
+
+`.lanegate/notes/` inside every ticket worktree is a symlink to the control
+checkout's durable notes store. Use `.lanegate/notes/global.md` for factual
+project-wide guidance and `.lanegate/notes/v2/<encoded_path>.md` for facts
+specific to a file. **In this order**, replace `_` with `_u`, then `/` with
+`_s` (for example, `src/app.py` maps to `v2/src_sapp.py.md` and
+`src/foo_bar.py` maps to `v2/src_sfoo_ubar.py.md`; create `v2/` if needed).
+Before updating a v2 note, verify the legacy flat name is unambiguous: inspect
+its provenance and confirm no other tracked repository path maps to it. Only
+then fold that legacy flat note into v2 and remove it. If it is ambiguous,
+preserve it unchanged, do not create a competing correction, and report the
+migration conflict rather than reassigning or deleting another path's facts.
+These notes survive worktree removal and
+are available to later tickets. Do not replace the link or create a private
+notes directory.
+
+Capture only non-obvious durable facts: constraints, edge cases, invariants,
+and lessons that prevent repeat mistakes. Append dated, provenance-labelled
+blocks instead of overwriting useful facts. Consolidate each note to at most
+five factual blocks and roughly forty lines. Do not write summaries that are
+discoverable directly from code, diffs, or tests.
+
 Run tests from within the worktree (use relative paths to your test runner). When tests are green:
 
 ```bash
@@ -33,81 +56,13 @@ For `changes_requested`, do not merge: address the findings and re-review.
 
 ---
 
-## Writing agent notes
+## Project-wide conventions
 
-After completing a ticket (tests green, `lanegate complete` called), write a short notes block for each file in `ticket.touches` so future agents inherit constraints discovered during this implementation.
-
-### Note file location
-
-For each file path in `ticket.touches`, the note file is:
-
-```
-.lanegate/notes/<flat_path>.md
-```
-
-where `<flat_path>` is the file path with every `/` replaced by `_`.
-
-Examples:
-- `src/lanegate/core.py` → `.lanegate/notes/src_lanegate_core.py.md`
-- `.claude/commands/implement.md` → `.lanegate/notes/.claude_commands_implement.md.md`
-
-### How to write notes
-
-For small note files, **append** a tagged block to the note file (create the file if it doesn't exist):
+If you discover a project-wide convention during implementation (not specific to one file), append a proposal to `.lanegate/pending-globals.md` (gitignored) with the ticket ID and rationale:
 
 ```markdown
 ## [TICK-NNN]
-- <factual constraint 1>
-- <factual constraint 2>
+- <proposed convention and why>
 ```
-
-Rules:
-- Write **factual constraints only**: "X fails if Y", "always do Z before W", "field X must be non-null or parser crashes"
-- **Max 5 bullets per ticket per file** — be terse
-- If nothing non-obvious was learned about a file, **write nothing** (omit the block entirely for that file)
-- Do not repeat what the ticket spec already says; write only what surprised you or would trip up the next agent
-- **Exclude anything discoverable by just reading the file.** A note only earns its place if a future agent would still be missing it after opening the file and reading the code and docstrings. If the fact is visible on the page — a function's logic, its documented parameters, an obvious type constraint — it is not a note, it's a summary, and summaries are noise here.
-  - **Keep** (learned by running, debugging, or getting burned): runtime behavior that isn't apparent from the source ("this retries silently on timeout, so a hang here looks like success"), a workaround for a bug in a dependency, an invariant enforced by *another* file or a lock ordering the code doesn't itself explain, a race condition only reproducible under load, a config flag that changes behavior at runtime in a way not visible in this file.
-  - **Exclude** (code-discoverable): restating what a function does or its docstring, naming the fields a class has, describing control flow a reader would see in five seconds, anything the ticket spec already states.
-
-### Consolidating large note files
-
-Consolidation is agent-driven at write time, as part of the normal `/implement` completion flow. It is not a scheduled job, background cleanup, or separate `lanegate` subcommand.
-
-Before appending, check the existing note file. If adding the new note would push it over either threshold — more than 5 `## [TICK-NNN]` blocks or more than about 40 lines — consolidate first instead of appending another per-ticket block:
-
-1. Read every existing `## [TICK-NNN]` block and the new facts you were about to append.
-2. Merge duplicate or overlapping bullets that describe the same current constraint.
-3. Re-verify each surviving bullet against the current code for that file; drop bullets the code no longer supports.
-4. Rewrite the note file as a flat list of current constraints rather than a per-ticket log.
-
-Each surviving bullet must keep a terse trailing ticket tag because `.lanegate/notes/` is gitignored and the tag is the only durable pointer back to the originating ticket:
-
-```markdown
-- <current factual constraint> (TICK-042)
-- <merged current factual constraint> (TICK-042, TICK-071)
-```
-
-If the note file stays at or below both thresholds, behavior is unchanged: append the new `## [TICK-NNN]` block normally.
-
-### Escalation rule
-
-| Type of learning | Where it goes |
-|---|---|
-| File-specific or ephemeral (implementation detail, edge case in one file) | `.lanegate/notes/<flat_path>.md` only |
-| Project-wide convention discovered during implementation | Append a proposal to `.lanegate/pending-globals.md` (also gitignored) with the ticket ID and rationale |
 
 **Never write to `CLAUDE.md` autonomously.** Only a human may promote a proposal from `pending-globals.md` into `CLAUDE.md`.
-
-### Example
-
-After implementing TICK-042 that touched `src/lanegate/concurrency.py` and `.lanegate.yml`:
-
-`.lanegate/notes/src_lanegate_concurrency.py.md`:
-```markdown
-## [TICK-042]
-- flock path must be on the same filesystem as the repo root or acquire silently fails
-- always release lock in a trap, not in normal control flow
-```
-
-`.lanegate/notes/.lanegate.yml.md` — omitted (nothing non-obvious learned about the YAML schema)

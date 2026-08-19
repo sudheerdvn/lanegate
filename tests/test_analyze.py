@@ -18,6 +18,7 @@ from lanegate.analyze import (
     _TS_LANGUAGE_MAP,
     _ast_symbol_hits,
     _build_ast_index,
+    _build_candidate_skeletons,
     _build_file_skeleton,
     _build_prompt,
     _call_model,
@@ -32,13 +33,14 @@ from lanegate.analyze import (
     audit_acceptance_contract,
     cmd_analyze,
     companion_docs_from_criteria,
+    correct_touches_by_basename,
     enrich_context,
     infer_touches_from_criteria,
     validate_touched_paths,
     verify_acceptance_criteria,
 )
 from lanegate.config import ConfigError
-from lanegate.ticket import parse_ticket
+from lanegate.ticket import parse_ticket, validate_ticket
 
 _CFG = {
     "ticket_prefix": "TICK",
@@ -98,6 +100,18 @@ def test_parse_response_strips_markdown_fence():
     assert result["touches"] == ["lanegate/foo.py", "tests/test_foo.py"]
 
 
+def test_parse_response_strips_thinking_tags():
+    thought_response = (
+        "<think>\n"
+        "Let's think about this ticket.\n"
+        "We should touch {example} and make sure {key: val} works.\n"
+        "</think>\n"
+        f"{_GOOD_RESPONSE}"
+    )
+    result = _parse_response(thought_response)
+    assert result["touches"] == ["lanegate/foo.py", "tests/test_foo.py"]
+
+
 def test_parse_response_no_json_raises():
     with pytest.raises(ValueError):
         _parse_response("Sorry, I cannot help with that.")
@@ -106,6 +120,18 @@ def test_parse_response_no_json_raises():
 def test_parse_response_bad_json_raises():
     with pytest.raises(json.JSONDecodeError):
         _parse_response("{bad json ,,}")
+
+
+def test_parse_response_ignores_trailing_braces():
+    trailing = f"{_GOOD_RESPONSE}\n\nNote: also see `{{example}}` for reference."
+    result = _parse_response(trailing)
+    assert result["touches"] == ["lanegate/foo.py", "tests/test_foo.py"]
+
+
+def test_parse_response_ignores_braces_inside_strings():
+    nested = '{"touches": [], "close_criteria": "uses {curly} braces in prose"}'
+    result = _parse_response(nested)
+    assert result["close_criteria"] == "uses {curly} braces in prose"
 
 
 # --- cmd_analyze happy path ---
@@ -198,7 +224,7 @@ def test_analyze_keep_draft_then_reanalyze_opens(repo):
 
 
 def test_analyze_writes_change_notes(repo):
-    """When model returns change_notes, cmd_analyze stores them."""
+    """When model returns change_notes, cmd_analyze stores readable body section and scalar summary."""
     _make_draft(repo / "tickets")
     response_with_notes = json.dumps(
         {
@@ -212,6 +238,12 @@ def test_analyze_writes_change_notes(repo):
         }
     )
     cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda p: response_with_notes)
+    raw = (repo / "tickets" / "TICK-001.md").read_text(encoding="utf-8")
+    assert "change_notes_summary: 2" in raw
+    assert "change_notes:" not in raw.split("---\n")[1]
+    assert "## Change Notes" in raw
+    assert "**lanegate/foo.py**: Add foo() function at line 10." in raw
+
     t = parse_ticket(repo / "tickets" / "TICK-001.md")
     assert t.get("change_notes") is not None
     assert t["change_notes"]["lanegate/foo.py"] == "Add foo() function at line 10."
@@ -293,6 +325,110 @@ def test_analyze_omits_missing_model(repo):
     assert "model" not in t
 
 
+def _init_git_repo(path: Path) -> None:
+    _subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    _subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+
+
+def test_acceptance_contract_audit_blocks_close_criteria_narrowed_since_analyze(repo):
+    """Regression (TICK-545): a later commit that quietly narrows close_criteria to
+    match a reduced implementation must not read as a clean, self-consistent pass."""
+    if shutil.which("git") is None:
+        pytest.skip("git is required for this test")
+    _init_git_repo(repo)
+    ticket_path = repo / "tickets" / "TICK-545.md"
+    ticket_path.parent.mkdir(exist_ok=True)
+    ticket_path.write_text(
+        "---\nid: TICK-545\nclose_criteria: create() wraps cmd_create + cmd_analyze\n---\nbody\n"
+    )
+    _subprocess.run(["git", "add", "tickets/TICK-545.md"], cwd=repo, check=True)
+    _subprocess.run(["git", "commit", "-m", "analyzed"], cwd=repo, check=True, capture_output=True)
+    sha = _subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    ticket = {
+        "id": "TICK-545",
+        "title": "Expose create over MCP",
+        "_body": "wrap create + analyze",
+        "close_criteria": "create() writes a draft ticket",
+        "analyzed_at_sha": sha,
+        "_path": ticket_path,
+    }
+
+    audit = audit_acceptance_contract(ticket, repo)
+
+    assert audit.ok is False
+    assert any("without a recorded human approval" in f for f in audit.findings)
+
+
+def test_acceptance_contract_audit_allows_narrowed_close_criteria_with_human_approval(repo):
+    """Same drift as above, but with an owner-recorded approval — must not block."""
+    if shutil.which("git") is None:
+        pytest.skip("git is required for this test")
+    _init_git_repo(repo)
+    ticket_path = repo / "tickets" / "TICK-545.md"
+    ticket_path.parent.mkdir(exist_ok=True)
+    ticket_path.write_text(
+        "---\nid: TICK-545\nclose_criteria: create() wraps cmd_create + cmd_analyze\n---\nbody\n"
+    )
+    _subprocess.run(["git", "add", "tickets/TICK-545.md"], cwd=repo, check=True)
+    _subprocess.run(["git", "commit", "-m", "analyzed"], cwd=repo, check=True, capture_output=True)
+    sha = _subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    ticket = {
+        "id": "TICK-545",
+        "title": "Expose create over MCP",
+        "_body": "wrap create + analyze",
+        "close_criteria": "create() writes a draft ticket",
+        "analyzed_at_sha": sha,
+        "_path": ticket_path,
+        "close_criteria_drift_approved_at": "2026-08-13T16:00:00Z",
+        "close_criteria_drift_approved_snapshot": "create() writes a draft ticket",
+    }
+
+    audit = audit_acceptance_contract(ticket, repo)
+
+    assert audit.ok is True
+    assert audit.findings == []
+
+
+def test_close_criteria_drift_approval_self_invalidates_on_further_edit(repo):
+    """An approval tied to specific close_criteria text must not cover a later, further edit."""
+    if shutil.which("git") is None:
+        pytest.skip("git is required for this test")
+    _init_git_repo(repo)
+    ticket_path = repo / "tickets" / "TICK-545.md"
+    ticket_path.parent.mkdir(exist_ok=True)
+    ticket_path.write_text(
+        "---\nid: TICK-545\nclose_criteria: create() wraps cmd_create + cmd_analyze\n---\nbody\n"
+    )
+    _subprocess.run(["git", "add", "tickets/TICK-545.md"], cwd=repo, check=True)
+    _subprocess.run(["git", "commit", "-m", "analyzed"], cwd=repo, check=True, capture_output=True)
+    sha = _subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    ticket = {
+        "id": "TICK-545",
+        "title": "Expose create over MCP",
+        "_body": "wrap create + analyze",
+        "close_criteria": "create() only wraps cmd_create",
+        "analyzed_at_sha": sha,
+        "_path": ticket_path,
+        "close_criteria_drift_approved_at": "2026-08-13T16:00:00Z",
+        "close_criteria_drift_approved_snapshot": "create() writes a draft ticket",
+    }
+
+    audit = audit_acceptance_contract(ticket, repo)
+
+    assert audit.ok is False
+    assert any("close_criteria changed" in f for f in audit.findings)
+
+
 def test_acceptance_contract_audit_catches_narrowed_close_criteria(repo):
     """Regression: linked design contract cannot be collapsed to endpoint tests only."""
     (repo / "docs").mkdir()
@@ -300,10 +436,10 @@ def test_acceptance_contract_audit_catches_narrowed_close_criteria(repo):
         """
 | Endpoint | Purpose | Response |
 | --- | --- | --- |
-| `POST /api/orchestrate/start` | Start a run | `{run_id, status}` |
+| `POST /api/runs/start` | Start a run | `{run_id, status}` |
 | `GET /api/runs/current` | Current run state | `{run_id, status, started_at}` |
 | `GET /api/diff/{id}` | Diff for a ticket branch/worktree | `{id, base, branch, files: [{path, status, patch?}]}` |
-| `POST /api/orchestrate/stop` | Request graceful stop/cancel | `{run_id, status, stop_requested: true}` |
+| `POST /api/runs/stop` | Request graceful stop/cancel | `{run_id, status, stop_requested: true}` |
 """
     )
     ticket = {
@@ -330,10 +466,10 @@ def test_acceptance_contract_audit_passes_when_close_criteria_covers_linked_cont
         """
 | Endpoint | Purpose | Response |
 | --- | --- | --- |
-| `POST /api/orchestrate/start` | Start a run | `{run_id, status}` |
+| `POST /api/runs/start` | Start a run | `{run_id, status}` |
 | `GET /api/runs/current` | Current run state | `{run_id, status, started_at}` |
 | `GET /api/diff/{id}` | Diff for a ticket branch/worktree | `{id, base, branch, files: [{path, status, patch?}]}` |
-| `POST /api/orchestrate/stop` | Request graceful stop/cancel | `{run_id, status, stop_requested: true}` |
+| `POST /api/runs/stop` | Request graceful stop/cancel | `{run_id, status, stop_requested: true}` |
 """
     )
     ticket = {
@@ -689,9 +825,58 @@ def test_acceptance_contract_audit_ignores_own_prior_needs_review_reason(repo):
     assert audit.findings == []
 
 
+def test_acceptance_contract_audit_ignores_own_stored_audit_section(repo):
+    """Regression (TICK-481): the '## Acceptance Contract Audit' section that
+    lanegate appends to ticket bodies must not be re-scanned as contract
+    material.  Without this guard, stored findings that mention linked docs
+    (e.g. docs/ARCHITECTURE.md) cause those docs to be pulled in as contract
+    sources on every subsequent audit, and stored 'omitted item' strings are
+    re-extracted as fresh requirements — compounding findings on every cycle."""
+    # Simulate a ticket whose body contains the audit output from a previous run.
+    # The stored text names docs/ARCHITECTURE.md and lanegate/skills/implement.md,
+    # which the audit's linked-doc scanner would normally load as contract sources.
+    # With the fix those references are stripped before scanning, so neither doc
+    # is loaded and no spurious findings are generated.
+    ticket = {
+        "id": "TICK-999",
+        "title": "Fix dead agent-notes mechanism",
+        "_body": (
+            "## Background\n\nBuild the notes mechanism.\n\n"
+            "## Acceptance Contract Audit\n"
+            "**Status**: failed (2 findings)\n\n"
+            "**Findings**:\n"
+            "- close_criteria omits contract items from docs/ARCHITECTURE.md:"
+            " create` | **Code** | Allocate id, write draft, git commit.\n"
+            "- close_criteria omits contract items from lanegate/skills/implement.md:"
+            ' Write **factual constraints only**: "X fails if Y"\n\n'
+            "**Omitted Items**:\n"
+            "- create` | **Code** | Allocate id, write draft, git commit. Mechanical.\n"
+        ),
+        "close_criteria": (
+            "pytest tests/test_ticket.py tests/test_analyze.py tests/test_executor.py passes, "
+            "with test_collect_cross_ticket_change_notes asserting overlapping file "
+            "change_notes are collected across merged tickets and injected into "
+            "analyze/implement prompts."
+        ),
+    }
+
+    audit = audit_acceptance_contract(ticket, repo)
+
+    assert audit.ok is True, (
+        "Stored '## Acceptance Contract Audit' section must not feed back into the audit. "
+        f"Got findings: {audit.findings}"
+    )
+    assert audit.findings == []
+
+
 def test_analyze_records_acceptance_contract_audit_metadata(repo):
     _make_draft(repo / "tickets")
     cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda p: _GOOD_RESPONSE)
+    raw = (repo / "tickets" / "TICK-001.md").read_text(encoding="utf-8")
+    assert "acceptance_contract_audit_summary: ok" in raw
+    assert "acceptance_contract_audit:" not in raw.split("---\n")[1]
+    assert "## Acceptance Contract Audit" in raw
+
     t = parse_ticket(repo / "tickets" / "TICK-001.md")
     assert t["acceptance_contract_audit"]["ok"] is True
     assert isinstance(t["acceptance_contract_audit"]["checked_items"], list)
@@ -854,6 +1039,34 @@ def test_analyze_model_failure_exits(repo):
     assert exc.value.code == 1
 
 
+def test_analyze_already_resolved_flags_needs_review(repo):
+    _make_draft(repo / "tickets")
+    response = json.dumps(
+        {
+            "already_resolved": True,
+            "already_resolved_reason": "cmd_foo already exists at lanegate/foo.py:12 and does this.",
+        }
+    )
+    with pytest.raises(SystemExit) as exc:
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda p: response)
+    assert exc.value.code == 0
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert t["status"] == "needs_review"
+    assert t["touches"] == []
+    assert "## Needs Review Reason" in t["_body"]
+    assert "lanegate/foo.py:12" in t["_body"]
+
+
+def test_analyze_already_resolved_without_reason_errors(repo):
+    _make_draft(repo / "tickets")
+    response = json.dumps({"already_resolved": True})
+    with pytest.raises(SystemExit) as exc:
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda p: response)
+    assert exc.value.code == 1
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert t["status"] == "draft"
+
+
 def test_analyze_empty_touches_exits(repo):
     _make_draft(repo / "tickets")
     bad = json.dumps({"touches": [], "close_criteria": "done.", "depends_on": []})
@@ -906,6 +1119,21 @@ def test_build_prompt_includes_intent(repo):
     ticket = pt(repo / "tickets" / "TICK-001.md")
     prompt = _build_prompt(ticket, repo)
     assert "Build login page" in prompt or "foo command" in prompt
+
+
+def test_analyze_prompt_includes_global_and_file_notes(repo):
+    (repo / "helper.py").write_text("def update_helper(): pass\n")
+    _make_draft(repo / "tickets", title="Update helper")
+    notes = repo / ".lanegate" / "notes"
+    notes.mkdir(parents=True)
+    (notes / "global.md").write_text("global analysis fact")
+    (notes / "helper.py.md").write_text("helper-specific fact")
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    prompt = _build_prompt(ticket, repo)
+
+    assert "global analysis fact" in prompt
+    assert "helper-specific fact" in prompt
 
 
 def test_build_prompt_includes_project_guidance(repo):
@@ -971,7 +1199,7 @@ def test_bounded_architecture_excerpt_for_relevant_symbol_hits(repo):
     _make_draft(repo / "tickets", title="Update the loop behavior")
     ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
 
-    prompt = _build_prompt(ticket, repo)
+    prompt = _build_prompt(ticket, repo, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
     assert "Orchestration Loop" in prompt
     assert "orchestrate.py" in prompt
@@ -985,7 +1213,7 @@ def test_describe_analyze_payload_returns_component_metadata(repo):
     _make_draft(repo / "tickets", title="Build parser")
     ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
 
-    components = describe_analyze_payload(ticket, repo)
+    components = describe_analyze_payload(ticket, repo, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
     assert isinstance(components, list)
     assert components
@@ -995,7 +1223,7 @@ def test_describe_analyze_payload_returns_component_metadata(repo):
         }
         assert component["step"] == "analyze"
     labels = {c["label"] for c in components}
-    assert "architecture-excerpt:docs/ARCHITECTURE.md" in labels
+    assert "reference-excerpt:docs/ARCHITECTURE.md" in labels
     assert "ticket-intent" in labels
 
 
@@ -1005,7 +1233,7 @@ def test_describe_analyze_payload_never_exposes_ticket_content(repo):
     _make_draft(repo / "tickets", title="SECRET_TITLE_MARKER")
     ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
 
-    components = describe_analyze_payload(ticket, repo)
+    components = describe_analyze_payload(ticket, repo, cfg={"reference_docs": ["docs/ARCHITECTURE.md"]})
 
     serialized = json.dumps(components)
     assert "SECRET_TITLE_MARKER" not in serialized
@@ -1060,7 +1288,7 @@ def test_analyze_uses_named_driver_model(repo):
     _make_draft(repo / "tickets")
     cfg = dict(
         _CFG,
-        drivers={"analyzer": {"type": "claude-process", "model": "driver-analyze-model"}},
+        drivers={"analyzer": {"type": "claude-process", "model": "claude-driver-analyze-model"}},
         steps={"analyze": {"driver": "analyzer"}},
     )
 
@@ -1077,7 +1305,7 @@ def test_analyze_uses_named_driver_model(repo):
     assert analyze_calls, "No claude -p call was made"
     cmd = analyze_calls[0]
     assert "--model" in cmd
-    assert cmd[cmd.index("--model") + 1] == "driver-analyze-model"
+    assert cmd[cmd.index("--model") + 1] == "claude-driver-analyze-model"
 
 
 def test_analyze_unwraps_json_envelope_for_named_claude_instance(repo):
@@ -1143,6 +1371,70 @@ def test_analyze_unwraps_codex_jsonl_stream(repo):
     assert ticket["analyze_session_model"] == "gpt-4o"
 
 
+def test_resolve_analyze_driver_passes_pool_name(repo):
+    """resolve_analyze_driver must forward pool_name through to resolve_pool_executor.
+
+    loop.py's _select_pool_instance already does this for implement dispatch
+    (pool_name=name); analyze's driver resolution silently dropped an
+    effective --pool override before this fix.
+    """
+    _make_draft(repo / "tickets")
+    cfg = dict(
+        _CFG,
+        executor="claude-1",
+        executors={
+            "claude-1": {"type": "claude-process"},
+            "claude-2": {"type": "claude-process"},
+        },
+        pools={"default": {"executors": ["claude-1", "claude-2"], "strategy": "round-robin"}},
+        default_pool="default",
+    )
+    captured_kwargs = {}
+
+    def fake_resolve_pool_executor(step, ticket, cfg, repo_root, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "claude-1"
+
+    with (
+        patch(
+            "lanegate.orchestrate.resolve_pool_executor",
+            side_effect=fake_resolve_pool_executor,
+        ),
+        patch("lanegate.analyze._call_model", return_value=(_GOOD_RESPONSE, None)),
+    ):
+        cmd_analyze("TICK-001", cfg, repo)
+
+    assert "pool_name" in captured_kwargs
+    assert captured_kwargs["pool_name"] is None
+
+
+def test_resolve_analyze_driver_error_explains_pool_sibling(repo):
+    """When every pool sibling is cooling down, the raised error must name that
+    condition and point at `lanegate executor status` instead of repeating the old
+    opaque 'no healthy pool sibling' phrase.
+    """
+    _make_draft(repo / "tickets")
+    cfg = dict(
+        _CFG,
+        executor="claude-1",
+        executors={
+            "claude-1": {"type": "claude-process"},
+            "claude-2": {"type": "claude-process"},
+        },
+        pools={"default": {"executors": ["claude-1", "claude-2"], "strategy": "round-robin"}},
+        default_pool="default",
+    )
+
+    with patch("lanegate.orchestrate.resolve_pool_executor", return_value=None):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_analyze("TICK-001", cfg, repo)
+
+    detail = exc_info.value.__cause__
+    assert detail is not None
+    assert "cooling down" in str(detail)
+    assert "lanegate executor status" in str(detail)
+
+
 def test_analyze_retries_rate_limited_pool_instance_on_healthy_sibling(repo):
     """Analyze dispatch fails over instead of reusing a rate-limited pool member."""
     _make_draft(repo / "tickets")
@@ -1170,6 +1462,108 @@ def test_analyze_retries_rate_limited_pool_instance_on_healthy_sibling(repo):
     assert calls == ["claude-1", "claude-2"]
 
 
+def test_analyze_cools_down_executor_after_consecutive_non_rate_limit_failures(repo):
+    """A dead analyzer is removed from the pool after two matching failures."""
+    from lanegate.executor import is_cooling_down
+
+    for ticket_id in ("TICK-001", "TICK-002", "TICK-003"):
+        _make_draft(repo / "tickets", ticket_id=ticket_id)
+    cfg = dict(
+        _CFG,
+        executor="claude-1",
+        executors={
+            "claude-1": {"type": "claude-process"},
+            "claude-2": {"type": "claude-process"},
+        },
+        pools={"default": {"executors": ["claude-1", "claude-2"], "strategy": "round-robin"}},
+        default_pool="default",
+    )
+    calls: list[str] = []
+    failure_session_ids = iter(
+        (
+            "02ce0512-3419-455e-a6eb-e1b2f062178a",
+            "7605b503-d8b2-4706-a6d8-2dcfe47dd6f8",
+        )
+    )
+
+    def fake_call_model(prompt, **kwargs):
+        calls.append(kwargs["executor"])
+        if kwargs["executor"] == "claude-1":
+            raise RuntimeError(
+                "claude-1 failed (exit 1): synthetic executor error "
+                f"session_id={next(failure_session_ids)}"
+            )
+        return _GOOD_RESPONSE, None
+
+    with (
+        patch("lanegate.analyze._active_analyze_run_id", return_value="test-run"),
+        patch("lanegate.analyze._call_model", side_effect=fake_call_model),
+    ):
+        with pytest.raises(SystemExit):
+            cmd_analyze("TICK-001", cfg, repo)
+        with pytest.raises(SystemExit):
+            cmd_analyze("TICK-002", cfg, repo)
+        cmd_analyze("TICK-003", cfg, repo)
+
+    assert calls == ["claude-1", "claude-1", "claude-2"]
+    assert is_cooling_down(repo, "claude-1") is True
+    assert is_cooling_down(repo, "claude-2") is False
+    assert parse_ticket(repo / "tickets" / "TICK-003.md")["status"] == "open"
+
+
+def test_analyze_fails_over_when_quota_notice_is_past_the_summary_clip(repo):
+    """A stream-json quota error still fails over to a healthy sibling.
+
+    The Claude CLI emits its whole transcript as a few enormous single lines,
+    so "Claude AI usage limit reached" sits far past the 240-char clip that
+    _summarize_executor_output applies to the exception message. Classifying
+    off str(exc) missed it entirely and skipped pool failover; classification
+    must run against the raw subprocess output.
+    """
+    _make_draft(repo / "tickets")
+    cfg = dict(
+        _CFG,
+        executor="claude-1",
+        executors={
+            "claude-1": {"type": "claude-process"},
+            "claude-2": {"type": "claude-process"},
+        },
+        pools={"default": {"executors": ["claude-1", "claude-2"], "strategy": "round-robin"}},
+        default_pool="default",
+    )
+    # Shape captured live from a depleted claude-a on 2026-08-04: one 834-byte
+    # line with the quota notice at offset ~680, well past the 240-char clip.
+    quota_line = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "session_id": "2a57b0e1-ff8d-4891-abc1-96f7fe6e4918",
+            "api_error_status": 429,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "padding": "x" * 400},
+            "result": "You've hit your weekly limit · resets Aug 7, 6am (America/Los_Angeles)",
+        }
+    )
+    assert quota_line.index("hit your weekly limit") > 240, "fixture must exceed the clip boundary"
+    # Both pool members resolve to the same `claude` bin, so count model calls
+    # rather than matching on argv: the first is claude-1, the retry claude-2.
+    model_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] != "claude":
+            return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        model_calls.append(list(cmd))
+        if len(model_calls) == 1:
+            return _subprocess.CompletedProcess(cmd, 1, stdout=quota_line, stderr="")
+        return _subprocess.CompletedProcess(cmd, 0, stdout=_GOOD_RESPONSE, stderr="")
+
+    with patch("lanegate.analyze.subprocess.run", side_effect=fake_run):
+        cmd_analyze("TICK-001", cfg, repo)
+
+    assert len(model_calls) == 2, "quota error did not trigger a sibling retry"
+
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "open"
+
+
 def test_analyze_named_driver_bin_flags_and_env_reach_subprocess(repo, monkeypatch):
     """steps.analyze.driver applies command and env overrides to the analyze subprocess."""
     _make_draft(repo / "tickets")
@@ -1178,7 +1572,7 @@ def test_analyze_named_driver_bin_flags_and_env_reach_subprocess(repo, monkeypat
         drivers={
             "analyzer": {
                 "type": "claude-process",
-                "model": "driver-analyze-model",
+                "model": "claude-driver-analyze-model",
                 "bin": "custom-analyze",
                 "flags": ["--driver-flag"],
                 "env": {
@@ -1204,7 +1598,7 @@ def test_analyze_named_driver_bin_flags_and_env_reach_subprocess(repo, monkeypat
     cmd, kwargs = analyze_calls[0]
     assert "--driver-flag" in cmd
     assert "--model" in cmd
-    assert cmd[cmd.index("--model") + 1] == "driver-analyze-model"
+    assert cmd[cmd.index("--model") + 1] == "claude-driver-analyze-model"
     assert kwargs["env"]["ANALYZE_TOKEN"] == "expanded-analyze-token"
     assert kwargs["env"]["ANALYZE_LITERAL"] == "literal"
 
@@ -1255,6 +1649,69 @@ def test_call_model_no_flag_without_model():
     assert "--model" not in captured[0]
 
 
+def test_call_model_claude_denies_mutating_tools():
+    """Analyze must stay read-only: Bash/Write/Edit are denied for Claude-CLI
+    executors even though the executor's own flags (e.g.
+    --dangerously-skip-permissions) would otherwise grant full tool access."""
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    with patch("lanegate.analyze.subprocess.run", side_effect=fake_run):
+        _call_model("hello", executor="claude")
+
+    assert captured
+    cmd = captured[0]
+    assert "--disallowedTools" in cmd
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Bash,Write,Edit"
+
+
+def test_call_model_non_claude_executor_omits_disallowed_tools():
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    with patch("lanegate.analyze.subprocess.run", side_effect=fake_run):
+        _call_model("hello", executor="ollama")
+
+    assert captured
+    assert "--disallowedTools" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "executor,flag,flag_value",
+    [
+        ("aider", "--dry-run", None),
+        ("codex", "--sandbox", "read-only"),
+        ("agy", "--mode", "plan"),
+    ],
+)
+def test_call_model_non_claude_executor_readonly_during_analyze(executor, flag, flag_value):
+    """Analyze must stay read-only for aider/codex/agy too, not just Claude --
+    TICK-573: aider previously ran with full edit/commit capability during
+    analyze, before any worktree exists, against the main checkout."""
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        return _subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    with patch("lanegate.analyze.subprocess.run", side_effect=fake_run):
+        _call_model("hello", executor=executor)
+
+    # aider's build path makes its own preliminary `git` subprocess calls
+    # (context budgeting) through the same patched subprocess.run, so the
+    # executor's own cmd isn't always captured[0] -- find it by bin name.
+    cmd = next(c for c in captured if c and c[0] == executor)
+    assert flag in cmd
+    if flag_value is not None:
+        assert cmd[cmd.index(flag) + 1] == flag_value
+
+
 def test_call_model_missing_executor_bin_raises_before_subprocess(monkeypatch):
     monkeypatch.setenv("PATH", "/restricted/bin")
     monkeypatch.setattr("lanegate.executor.shutil.which", lambda _bin_name: None)
@@ -1292,6 +1749,7 @@ def test_analyze_commit_does_not_use_no_verify(repo):
     assert any(sidecar_path in c for c in git_commits)
     for cmd in git_commits:
         assert "--no-verify" not in cmd, f"cmd_analyze used --no-verify in git commit: {cmd}"
+        assert "-s" in cmd, f"cmd_analyze omitted git commit signoff: {cmd}"
 
 
 def test_analyze_skips_commits_when_commit_status_false(repo):
@@ -1419,6 +1877,28 @@ def test_analyze_commits_sidecar_when_opt_in(repo):
     assert dirty.stdout == "", "sidecar must be committed, not left staged"
 
 
+def test_cmd_analyze_captures_analyzed_at_sha(repo):
+    """cmd_analyze records the repo HEAD SHA on the ticket, so implement can
+    later determine whether any touched file drifted since analyze ran."""
+    if shutil.which("git") is None:
+        pytest.skip("git is required for analyze commit integration test")
+
+    _make_draft(repo / "tickets")
+    _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    _subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    _subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    _subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+    head_sha = _subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda p: _GOOD_RESPONSE)
+
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert t.get("analyzed_at_sha") == head_sha
+
+
 # ---------------------------------------------------------------------------
 # TICK-052: AST symbol index, import graph, enrichment chain
 # ---------------------------------------------------------------------------
@@ -1521,6 +2001,98 @@ def test_build_file_skeleton_non_python_file_is_stub_only(tmp_path):
 def test_build_file_skeleton_missing_file(tmp_path):
     skeleton = _build_file_skeleton(Path("lanegate/missing.py"), tmp_path)
     assert "not found" in skeleton
+
+
+def test_multilang_file_skeletons(tmp_path):
+    """TICK-412: non-Python files with an installed tree-sitter grammar get
+    line-numbered signatures too, not just a bare header."""
+    pytest.importorskip("tree_sitter_go")
+    pytest.importorskip("tree_sitter_typescript")
+    pytest.importorskip("tree_sitter_rust")
+    pytest.importorskip("tree_sitter_java")
+
+    go_file = tmp_path / "service.go"
+    go_file.write_bytes(b"package main\n\nfunc FetchUser(id int) string {\n  return \"\"\n}\n")
+    go_skeleton = _build_file_skeleton(Path("service.go"), tmp_path)
+    assert "service.go  (5 lines)" in go_skeleton
+    assert "line   3:" in go_skeleton
+    assert "FetchUser" in go_skeleton
+
+    ts_file = tmp_path / "repository.ts"
+    ts_file.write_bytes(
+        b"class UserRepository {\n"
+        b'  findUser(id: number): string { return ""; }\n'
+        b"}\n"
+    )
+    ts_skeleton = _build_file_skeleton(Path("repository.ts"), tmp_path)
+    assert "repository.ts  (3 lines)" in ts_skeleton
+    assert "UserRepository" in ts_skeleton
+    assert "findUser" in ts_skeleton
+
+    rs_file = tmp_path / "lib.rs"
+    rs_file.write_bytes(b"fn fetch_user(id: u32) -> String {\n    String::new()\n}\n")
+    rs_skeleton = _build_file_skeleton(Path("lib.rs"), tmp_path)
+    assert "lib.rs  (3 lines)" in rs_skeleton
+    assert "fetch_user" in rs_skeleton
+
+    java_file = tmp_path / "UserService.java"
+    java_file.write_bytes(
+        b"class UserService {\n"
+        b"  String fetchUser(int id) {\n"
+        b"    return \"\";\n"
+        b"  }\n"
+        b"}\n"
+    )
+    java_skeleton = _build_file_skeleton(Path("UserService.java"), tmp_path)
+    assert "UserService.java  (5 lines)" in java_skeleton
+    assert "UserService" in java_skeleton
+    assert "fetchUser" in java_skeleton
+
+
+# --- _build_candidate_skeletons ---
+
+
+def test_build_candidate_skeletons_includes_real_signatures(tmp_path):
+    _write_py(tmp_path / "lanegate" / "foo.py", "def cmd_foo(x, y=1):\n    pass\n")
+    text = _build_candidate_skeletons(["lanegate/foo.py"], tmp_path)
+    assert "## Candidate file skeletons" in text
+    assert "lanegate/foo.py" in text
+    assert "def cmd_foo(x, y=1)" in text
+
+
+def test_build_candidate_skeletons_empty_paths_returns_empty_string(tmp_path):
+    assert _build_candidate_skeletons([], tmp_path) == ""
+
+
+def test_build_candidate_skeletons_dedupes_paths(tmp_path):
+    _write_py(tmp_path / "lanegate" / "foo.py", "def cmd_foo():\n    pass\n")
+    text = _build_candidate_skeletons(["lanegate/foo.py", "lanegate/foo.py"], tmp_path)
+    assert text.count("lanegate/foo.py") == 1
+
+
+def test_build_candidate_skeletons_caps_file_count(tmp_path):
+    paths = []
+    for i in range(30):
+        rel = f"lanegate/mod{i}.py"
+        _write_py(tmp_path / "lanegate" / f"mod{i}.py", f"def f{i}():\n    pass\n")
+        paths.append(rel)
+    text = _build_candidate_skeletons(paths, tmp_path)
+    included = sum(1 for p in paths if p in text)
+    assert included == 25
+
+
+def test_build_candidate_skeletons_caps_total_bytes(tmp_path):
+    # Each file's skeleton is well under the byte budget alone, but many
+    # of them together must stop growing once the budget is hit rather
+    # than ballooning the analyze prompt unboundedly.
+    paths = []
+    for i in range(25):
+        rel = f"lanegate/mod{i}.py"
+        body = "\n".join(f"def f{i}_{j}(a, b, c, d, e, f, g, h):\n    pass\n" for j in range(40))
+        _write_py(tmp_path / "lanegate" / f"mod{i}.py", body)
+        paths.append(rel)
+    text = _build_candidate_skeletons(paths, tmp_path)
+    assert len(text.encode("utf-8")) <= 15000 + 2000  # header/joiner overhead, not per-block
 
 
 # --- _build_ast_index ---
@@ -1703,6 +2275,69 @@ def test_build_prompt_has_symbol_hits_section(tmp_path):
     assert "Importers" in prompt
 
 
+def test_analyze_prompt_surfaces_overlapping_cross_ticket_change_notes(tmp_path):
+    """A prior *merged* ticket's change_notes for a file that analyze's AST
+    symbol-hit scan also flags as a candidate touch should be folded into the
+    analyze prompt (TICK-481: git-tracked change_notes replaces the dead
+    worktree-vs-repo_root per-file .lanegate/notes/ mechanism, and analyze
+    time uses symbol hits as the touches-don't-exist-yet stand-in)."""
+    _write_py(tmp_path / "analyze_module.py", "def analyze_data(): pass\n")
+    td = tmp_path / "tickets"
+    td.mkdir()
+
+    prior_path = td / "TICK-100.md"
+    prior_path.write_text(
+        "---\nid: TICK-100\ntitle: Prior work\nstatus: merged\n"
+        "touches:\n  - analyze_module.py\n---\n"
+        "## Change Notes\n**analyze_module.py**: must not be called with unsanitized input\n"
+    )
+
+    new_path = td / "TICK-001.md"
+    new_path.write_text(
+        "---\nid: TICK-001\ntitle: analyze data\nstatus: draft\npriority: 3\ntouches: []\n---\nAnalyze data.\n"
+    )
+    from lanegate.ticket import parse_ticket as pt
+
+    ticket = pt(new_path)
+    prompt = _build_prompt(ticket, tmp_path, cfg={"ticket_prefix": "TICK", "tickets_dir": "tickets"})
+
+    assert "Prior Change Notes" in prompt
+    assert "TICK-100" in prompt
+    assert "must not be called with unsanitized input" in prompt
+
+
+def test_build_prompt_has_candidate_skeletons_section(tmp_path):
+    _write_py(tmp_path / "analyze_module.py", "def analyze_data(x, y):\n    pass\n")
+    td = tmp_path / "tickets"
+    td.mkdir()
+    path = td / "TICK-001.md"
+    path.write_text(
+        "---\nid: TICK-001\ntitle: analyze data\nstatus: draft\npriority: 3\ntouches: []\n---\nAnalyze data.\n"
+    )
+    from lanegate.ticket import parse_ticket as pt
+
+    ticket = pt(path)
+    prompt = _build_prompt(ticket, tmp_path)
+    assert "## Candidate file skeletons" in prompt
+    assert "def analyze_data(x, y)" in prompt
+
+
+def test_build_prompt_omits_candidate_skeletons_section_when_no_matches(tmp_path):
+    td = tmp_path / "tickets"
+    td.mkdir()
+    path = td / "TICK-001.md"
+    path.write_text(
+        "---\nid: TICK-001\ntitle: zzzznomatch\nstatus: draft\npriority: 3\ntouches: []\n---\nBody.\n"
+    )
+    from lanegate.ticket import parse_ticket as pt
+
+    ticket = pt(path)
+    with patch("lanegate.analyze.subprocess.run") as mock_run:
+        mock_run.return_value = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        prompt = _build_prompt(ticket, tmp_path)
+    assert "## Candidate file skeletons" not in prompt
+
+
 def test_build_prompt_ripgrep_section_present(tmp_path):
     td = tmp_path / "tickets"
     td.mkdir()
@@ -1800,9 +2435,110 @@ def test_ht_has_tree_sitter_flag_is_bool():
 
 def test_ts_language_map_covers_expected_extensions():
     """_TS_LANGUAGE_MAP covers the core set of non-Python extensions."""
-    expected = {".go", ".js", ".jsx", ".ts", ".tsx", ".rs", ".java", ".rb", ".c", ".cpp", ".h"}
+    expected = {
+        ".go", ".js", ".jsx", ".ts", ".tsx", ".rs", ".java", ".rb", ".c", ".cpp", ".h",
+        ".php", ".cs", ".swift", ".kt", ".kts",
+    }
     for ext in expected:
         assert ext in _TS_LANGUAGE_MAP, f"Missing extension {ext} from _TS_LANGUAGE_MAP"
+
+
+def test_index_non_py_php_function_and_class(tmp_path):
+    """_index_non_py_file extracts function/class/method names from a PHP file.
+
+    Regression coverage for the language_php() special case in
+    _ts_load_language -- tree-sitter-php exposes language_php(), not a plain
+    language(), unlike every other grammar in the map.
+    """
+    pytest.importorskip("tree_sitter_php")
+    php_file = tmp_path / "UserService.php"
+    php_file.write_bytes(
+        b"<?php\nclass UserService {\n  function findUser($id) { return null; }\n}\n"
+        b"function fetchData($url) { return null; }\n"
+    )
+    idx = _index_non_py_file(php_file)
+    assert idx is not None
+    assert "UserService" in idx.defs
+    assert "findUser" in idx.defs
+    assert "fetchData" in idx.defs
+
+
+def test_index_non_py_csharp_class_and_interface(tmp_path):
+    """_index_non_py_file extracts class/interface/method names from a C# file."""
+    pytest.importorskip("tree_sitter_c_sharp")
+    cs_file = tmp_path / "UserRepo.cs"
+    cs_file.write_bytes(
+        b"namespace App {\n"
+        b"  public class UserRepo {\n"
+        b"    public string FindById(int id) { return null; }\n"
+        b"  }\n"
+        b"  public interface IFetcher {}\n"
+        b"}\n"
+    )
+    idx = _index_non_py_file(cs_file)
+    assert idx is not None
+    assert "UserRepo" in idx.defs
+    assert "FindById" in idx.defs
+    assert "IFetcher" in idx.defs
+
+
+def test_index_non_py_swift_class_struct_protocol(tmp_path):
+    """_index_non_py_file extracts class/struct/protocol names from a Swift file.
+
+    struct parses under the same class_declaration node as class (no extra
+    node type needed); protocol_declaration is its own node type, added to
+    _TS_SYMBOL_NODE_TYPES alongside Kotlin's object_declaration.
+    """
+    pytest.importorskip("tree_sitter_swift")
+    swift_file = tmp_path / "UserService.swift"
+    swift_file.write_bytes(
+        b"class UserService {\n  func fetchUser(id: Int) -> String { return \"\" }\n}\n"
+        b"struct UserModel {\n  var name: String\n}\n"
+        b"protocol Fetchable {\n  func fetch()\n}\n"
+    )
+    idx = _index_non_py_file(swift_file)
+    assert idx is not None
+    assert "UserService" in idx.defs
+    assert "fetchUser" in idx.defs
+    assert "UserModel" in idx.defs
+    assert "Fetchable" in idx.defs
+
+
+def test_index_non_py_kotlin_class_interface_object(tmp_path):
+    """_index_non_py_file extracts class/interface/object names from a Kotlin file."""
+    pytest.importorskip("tree_sitter_kotlin")
+    kt_file = tmp_path / "UserService.kt"
+    kt_file.write_bytes(
+        b"class UserService {\n  fun fetchUser(id: Int): String { return \"\" }\n}\n"
+        b"interface Fetchable {\n  fun fetch()\n}\n"
+        b"object Singleton {\n  fun instance() {}\n}\n"
+    )
+    idx = _index_non_py_file(kt_file)
+    assert idx is not None
+    assert "UserService" in idx.defs
+    assert "fetchUser" in idx.defs
+    assert "Fetchable" in idx.defs
+    assert "Singleton" in idx.defs
+
+
+def test_register_tree_sitter_languages_extends_map():
+    """register_tree_sitter_languages merges project-declared extensions in place."""
+    from lanegate.analyze import _TS_LANGUAGE_MAP, register_tree_sitter_languages
+
+    assert ".vue" not in _TS_LANGUAGE_MAP
+    try:
+        register_tree_sitter_languages({".vue": "tree_sitter_vue"})
+        assert _TS_LANGUAGE_MAP[".vue"] == "tree_sitter_vue"
+    finally:
+        _TS_LANGUAGE_MAP.pop(".vue", None)
+
+
+def test_register_tree_sitter_languages_noop_on_empty():
+    """register_tree_sitter_languages(None) and ({}) are both safe no-ops."""
+    from lanegate.analyze import register_tree_sitter_languages
+
+    register_tree_sitter_languages(None)
+    register_tree_sitter_languages({})
 
 
 def test_treesitter_hits_returns_empty_when_flag_false(tmp_path):
@@ -2093,10 +2829,36 @@ def test_detect_companion_docs_bare_keyword(tmp_path):
     (tmp_path / "docs" / "security-model.md").write_text("# Security model\n")
 
     result = companion_docs_from_criteria(
-        "The security model doc needs a new section on this threat.", tmp_path
+        "The security model doc needs a new section on this threat.", tmp_path,
+        {"reference_docs": ["docs/security-model.md"]},
     )
 
     assert "docs/security-model.md" in result
+
+
+def test_detect_companion_docs_config_driven(tmp_path):
+    """Keyword matching for companion docs resolves against reference_docs (TICK-414)."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "DESIGN.md").write_text("# Design\n")
+    (tmp_path / "docs" / "ARCHITECTURE.md").write_text("# Architecture\n")
+
+    # Unconfigured project: bare mention of 'architecture' does NOT resolve to docs/ARCHITECTURE.md
+    res_unconfigured = companion_docs_from_criteria(
+        "Update the architecture doc to describe the new pipeline.",
+        tmp_path,
+        cfg={},
+    )
+    assert "docs/ARCHITECTURE.md" not in res_unconfigured
+
+    # Configured project: reference_docs specifies docs/DESIGN.md and docs/ARCHITECTURE.md
+    cfg = {"reference_docs": ["docs/DESIGN.md", "docs/ARCHITECTURE.md"]}
+    res_configured = companion_docs_from_criteria(
+        "Update the design doc and architecture doc to describe the new pipeline.",
+        tmp_path,
+        cfg=cfg,
+    )
+    assert "docs/DESIGN.md" in res_configured
+    assert "docs/ARCHITECTURE.md" in res_configured
 
 
 def test_companion_docs_ignores_nonexistent_doc_mentions(tmp_path):
@@ -2132,6 +2894,67 @@ def test_validate_touched_paths_no_stale_entries(tmp_path):
     (tmp_path / "lanegate").mkdir()
     result = validate_touched_paths(["lanegate/"], tmp_path)
     assert result == []
+
+
+def _git_repo_with_tracked_files(tmp_path, files: dict[str, str]) -> Path:
+    _subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True)
+    _subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    for rel, content in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    _subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    _subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+    return tmp_path
+
+
+def test_correct_touches_by_basename_fixes_flat_guess_for_nested_file(tmp_path):
+    """A model that writes a flat-layout guess (calc.py) for a real nested
+    file (src/calc.py) gets corrected -- reproduces a live fresh-install
+    smoke-test finding where enrich_context's ripgrep tier matched only
+    tests/test_calc.py (the new symbol doesn't exist in source yet), so the
+    full repo listing that would show src/calc.py was never reached."""
+    repo = _git_repo_with_tracked_files(
+        tmp_path,
+        {"src/calc.py": "def add(a, b):\n    return a + b\n", "tests/test_calc.py": "# test\n"},
+    )
+    corrections = correct_touches_by_basename(["calc.py", "tests/test_calc.py"], repo)
+    assert corrections == {"calc.py": "src/calc.py"}
+
+
+def test_correct_touches_by_basename_leaves_genuinely_new_files_alone(tmp_path):
+    """A path that doesn't exist anywhere in the tree is left untouched --
+    it may legitimately be a new file the ticket itself will create."""
+    repo = _git_repo_with_tracked_files(tmp_path, {"src/calc.py": "x = 1\n"})
+    corrections = correct_touches_by_basename(["lanegate/new_module.py"], repo)
+    assert corrections == {}
+
+
+def test_correct_touches_by_basename_skips_ambiguous_matches(tmp_path):
+    """Two files sharing a basename are not guessed between -- left as the
+    model wrote it rather than picking the wrong one."""
+    repo = _git_repo_with_tracked_files(
+        tmp_path, {"a/calc.py": "x = 1\n", "b/calc.py": "x = 2\n"}
+    )
+    corrections = correct_touches_by_basename(["calc.py"], repo)
+    assert corrections == {}
+
+
+def test_correct_touches_by_basename_application_dedupes_collisions(tmp_path):
+    """Two declared paths sharing a basename (or a wrong guess alongside the
+    already-correct path) both correct to the same real file -- applying the
+    correction map must not leave a duplicated touches entry. Mirrors the
+    dict.fromkeys(...) dedup used at the _cmd_analyze_core call site."""
+    repo = _git_repo_with_tracked_files(tmp_path, {"src/calc.py": "x = 1\n"})
+
+    corrections = correct_touches_by_basename(["calc.py", "lib/calc.py"], repo)
+    merged = list(dict.fromkeys(corrections.get(p, p) for p in ["calc.py", "lib/calc.py"]))
+    assert merged == ["src/calc.py"]
+
+    corrections = correct_touches_by_basename(["calc.py", "src/calc.py"], repo)
+    merged = list(dict.fromkeys(corrections.get(p, p) for p in ["calc.py", "src/calc.py"]))
+    assert merged == ["src/calc.py"]
 
 
 def test_cmd_analyze_adds_companion_docs_to_touches(repo):
@@ -2288,6 +3111,7 @@ def test_analyze_status_record(repo):
         time.sleep(0.01)
     assert status_path.exists()
     active = json.loads(status_path.read_text())
+    assert active["ticket_id"] == "TICK-001"
     assert active["phase"] == "model_requested"
     assert active["executor"]
     assert active["model"]
@@ -2308,6 +3132,7 @@ def test_analyze_api_status(repo):
     log_file = analyze_log_path(repo)
     _write_active_analysis(
         repo,
+        ticket_id="TICK-001",
         phase="model_requested",
         executor="claude",
         model="claude-test",
@@ -2327,6 +3152,7 @@ def test_analyze_api_status(repo):
         body = json.loads(response.read().decode())
         connection.close()
         assert response.status == 200
+        assert body["ticket_id"] == "TICK-001"
         assert body["phase"] == "model_requested"
         assert body["executor"] == "claude"
         assert body["model"] == "claude-test"
@@ -2357,3 +3183,446 @@ def test_analyze_cleanup(repo):
     logs = sorted((repo / ".lanegate" / "logs").glob("analyze-*.log"))
     assert len(logs) == 2
     assert all("analysis_failed" in log.read_text() for log in logs)
+
+
+def test_analyze_build_prompt_scopes_relevant_paths_to_symbol_hits(tmp_path):
+    from unittest.mock import MagicMock
+
+    ticket = {"id": "TICK-001", "title": "Test ticket", "_body": "Test body"}
+    mock_ctx = MagicMock()
+    mock_ctx.symbol_hits = ["lanegate/api.py"]
+    mock_ctx.importers = ["lanegate/cli.py"]
+    mock_ctx.ripgrep_hits = ""
+    mock_ctx.repo_structure = ""
+
+    with patch("lanegate.analyze.enrich_context", return_value=mock_ctx), \
+         patch("lanegate.prompts.load_project_guidance") as mock_guidance, \
+         patch("lanegate.prompts.get_bounded_reference_excerpts", return_value=("", [])) as mock_ref, \
+         patch("lanegate.analyze._build_candidate_skeletons", return_value="") as mock_skel:
+        mock_guidance.return_value = ""
+        _build_prompt(ticket, tmp_path)
+
+        mock_guidance.assert_called_once()
+        _, kwargs = mock_guidance.call_args
+        assert kwargs["relevant_paths"] == ["lanegate/api.py"]
+
+        mock_ref.assert_called_once()
+        args, kwargs = mock_ref.call_args
+        assert args[1] == ["lanegate/api.py"]
+
+        mock_skel.assert_called_once_with(["lanegate/api.py"], tmp_path)
+
+
+def test_analyze_warns_on_missing_grammar(repo, capsys, monkeypatch):
+    from lanegate.analyze import _TS_LANG_CACHE, _build_file_skeleton
+
+    _TS_LANG_CACHE.clear()
+    try:
+        go_file = repo / "main.go"
+        go_file.write_text("package main\nfunc main() {}\n")
+
+        import importlib
+        orig_import = importlib.import_module
+
+        def mock_import(name, *args, **kwargs):
+            if name == "tree_sitter_go":
+                raise ImportError("No module named 'tree_sitter_go'")
+            return orig_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("importlib.import_module", mock_import)
+
+        skeleton = _build_file_skeleton(go_file, repo)
+        err = capsys.readouterr().err
+
+        assert "WARNING" in err
+        assert "missing tree-sitter grammar" in err or "tree_sitter_go" in err
+        assert "main.go" in skeleton
+    finally:
+        _TS_LANG_CACHE.clear()
+
+
+def test_analyze_warns_when_tree_sitter_not_installed(repo, capsys, monkeypatch):
+    import lanegate.analyze as analyze_mod
+
+    analyze_mod._TS_LANG_CACHE.clear()
+    monkeypatch.setattr(analyze_mod, "_HAS_TREE_SITTER", False)
+    try:
+        go_file = repo / "main.go"
+        go_file.write_text("package main\nfunc main() {}\n")
+
+        skeleton = analyze_mod._build_file_skeleton(go_file, repo)
+        err = capsys.readouterr().err
+
+        assert "WARNING: tree-sitter is not installed" in err
+        assert "main.go" in skeleton
+    finally:
+        analyze_mod._TS_LANG_CACHE.clear()
+
+
+_HIGH_RISK_MATRIX = {
+    "invariants": ["Configuration loads from the trusted root."],
+    "adversarial_cases": ["A malformed configuration is rejected."],
+    "compatibility_cases": ["Existing valid configuration keeps loading."],
+    "regression_tests": ["test_config_loads_trusted_root"],
+}
+
+
+def test_analyze_persists_complete_high_risk_acceptance_matrix(repo):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    response = json.dumps({
+        "touches": ["lanegate/config.py", "tests/test_config.py"],
+        "close_criteria": "Trusted configuration routing is covered by test_config_loads_trusted_root.",
+        "depends_on": [],
+        "acceptance_matrix": _HIGH_RISK_MATRIX,
+    })
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["acceptance_matrix"] == _HIGH_RISK_MATRIX
+
+
+@pytest.mark.parametrize("missing_field", ["adversarial_cases", "compatibility_cases", "regression_tests"])
+def test_analyze_rejects_missing_high_risk_matrix_category(repo, missing_field):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    incomplete = dict(_HIGH_RISK_MATRIX, **{missing_field: []})
+    response = json.dumps({
+        "touches": ["lanegate/config.py"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": incomplete,
+    })
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "draft"
+
+
+def test_analyze_succeeds_when_inferred_touch_would_otherwise_deadlock(repo):
+    """[BLOCKING] regression test: the overlap gate was evaluated against
+    merged_touches, which includes paths infer_touches_from_criteria/
+    companion_docs_from_criteria add *after* the model responds, from the
+    model's own close_criteria -- paths the model was never shown or asked
+    about. That made the ticket permanently unanalyzable: the model correctly
+    omits overlap_review (it never proposed that path), the gate finds the
+    collision anyway, and every retry regenerates the identical close_criteria
+    and fails identically. The gate must only see touches the model could
+    have known about (existing + model-proposed); an inferred touch alone
+    must not be able to deadlock analysis."""
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(
+        repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing",
+        touches=["src/overlap_target.ext"],
+    )
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/unrelated.ext"],
+        "close_criteria": "new file src/overlap_target.ext is added for X.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "open"
+    assert "src/overlap_target.ext" in ticket["touches"]
+
+
+def test_analyze_existing_touch_overlap_still_enforced_and_surfaced_in_prompt(repo):
+    """existing_touches (carried forward on a re-analyzed ticket) ARE known
+    before the prompt is built, unlike inferred/companion-doc touches, so the
+    gate keeps enforcing them -- and the model is told about the collision
+    directly, since it otherwise has no way to know a path it didn't itself
+    propose is even part of its own touches."""
+    tickets_dir = repo / "tickets"
+    ticket_path = _make_draft(
+        tickets_dir, title="Harden configuration routing", touches=["src/overlap_target.ext"],
+    )
+    ticket_path.write_text(ticket_path.read_text().replace("status: draft", "status: open"))
+    other = _make_draft(
+        tickets_dir, ticket_id="TICK-002", title="Harden configuration routing",
+        touches=["src/overlap_target.ext"],
+    )
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+
+    prompt = _build_prompt(parse_ticket(tickets_dir / "TICK-001.md"), repo, _CFG)
+    assert "Your ticket's existing touches already overlap active tickets" in prompt
+    assert "TICK-002" in prompt
+
+    response = json.dumps({
+        "touches": ["src/unrelated.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+    })
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+
+def test_overlap_error_names_missing_ticket_and_paths(repo, capsys):
+    """[non-blocking, compounding] neither error branch named what was
+    missing even though the ticket ID and paths were already in hand."""
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/configuration.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+    })
+
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    err = capsys.readouterr().err
+    assert "TICK-002" in err
+    assert "src/configuration.ext" in err
+
+
+def test_overlap_error_names_specifically_missing_ticket_when_partially_declared(repo, capsys):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    for tid, path in [("TICK-002", "src/config_a.ext"), ("TICK-003", "src/config_b.ext")]:
+        other = _make_draft(repo / "tickets", ticket_id=tid, title="Harden configuration routing", touches=[path])
+        other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/config_a.ext", "src/config_b.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+        "overlap_review": {"mode": "stacked_review", "ticket_ids": ["TICK-002"]},
+    })
+
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    err = capsys.readouterr().err
+    assert "TICK-003" in err
+    assert "src/config_b.ext" in err
+
+
+def test_low_risk_ticket_prompt_omits_control_plane_overlap_section(repo):
+    """[non-blocking] find_control_plane_touch_overlaps never fires for a
+    non-high-reasoning ticket regardless of its touches, so showing this
+    section to one is pure noise with nothing it could ever need to satisfy."""
+    _make_draft(repo / "tickets", title="Fix README typo")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+
+    prompt = _build_prompt(parse_ticket(repo / "tickets" / "TICK-001.md"), repo, _CFG)
+
+    assert "Active control-plane tickets" not in prompt
+    assert "Required control-plane overlap response contract" not in prompt
+
+
+def test_analyze_rejects_control_plane_overlap_without_plan(repo):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/configuration.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+    })
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+
+@pytest.mark.parametrize(
+    ("mode", "depends_on"),
+    [("dependencies", ["TICK-002"]), ("stacked_review", [])],
+)
+def test_analyze_accepts_and_persists_control_plane_overlap_plan(repo, mode, depends_on):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/configuration.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": depends_on, "acceptance_matrix": _HIGH_RISK_MATRIX,
+        "overlap_review": {"mode": mode, "ticket_ids": ["TICK-002"]},
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["overlap_review"] == {
+        "mode": mode,
+        "ticket_ids": ["TICK-002"],
+        "paths": {"TICK-002": ["src/configuration.ext"]},
+    }
+    assert validate_ticket({k: v for k, v in ticket.items() if not k.startswith("_")}, _CFG) == []
+
+
+def test_analyze_rejects_dependency_overlap_plan_without_depends_on(repo):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/configuration.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+        "overlap_review": {"mode": "dependencies", "ticket_ids": ["TICK-002"]},
+    })
+
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "draft"
+
+
+def test_analyze_rejects_non_mapping_overlap_plan_cleanly(repo, capsys):
+    _make_draft(repo / "tickets", title="Harden configuration routing")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden configuration routing", touches=["src/configuration.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    response = json.dumps({
+        "touches": ["src/configuration.ext"], "close_criteria": "Configuration is safe.",
+        "depends_on": [], "acceptance_matrix": _HIGH_RISK_MATRIX,
+        "overlap_review": ["TICK-002"],
+    })
+
+    with pytest.raises(SystemExit):
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+    assert "overlap_review must be a mapping" in capsys.readouterr().err
+
+
+def test_analyze_accepts_optional_partial_acceptance_matrix(repo):
+    _make_draft(repo / "tickets", title="Fix README typo")
+    optional_matrix = {
+        "invariants": ["Existing links remain valid."],
+        "adversarial_cases": [],
+        "compatibility_cases": [],
+        "regression_tests": [],
+    }
+    response = json.dumps({
+        "touches": ["README.md"], "close_criteria": "README text is corrected.",
+        "depends_on": [], "acceptance_matrix": optional_matrix,
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "open"
+    assert ticket["acceptance_matrix"] == optional_matrix
+
+
+def test_analyze_accepts_optional_matrix_with_omitted_categories(repo):
+    _make_draft(repo / "tickets", title="Fix README typo")
+    optional_matrix = {"invariants": ["Existing links remain valid."]}
+    response = json.dumps({
+        "touches": ["README.md"], "close_criteria": "README lifecycle text is corrected.",
+        "depends_on": [], "acceptance_matrix": optional_matrix,
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["acceptance_matrix"] == optional_matrix
+
+
+def test_analyze_discards_malformed_optional_contract_fields_without_losing_analysis(repo, capsys):
+    _make_draft(repo / "tickets", title="Fix README typo")
+    response = json.dumps({
+        "touches": ["README.md"], "close_criteria": "README text is corrected.",
+        "depends_on": [], "acceptance_matrix": ["not a mapping"],
+        "overlap_review": {"mode": "none", "ticket_ids": []},
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "open"
+    assert "acceptance_matrix" not in ticket
+    assert "overlap_review" not in ticket
+    err = capsys.readouterr().err
+    assert "discarding malformed optional acceptance_matrix" in err
+    assert "discarding overlap_review" in err
+
+
+def test_analyze_discards_self_referential_optional_overlap_plan(repo):
+    _make_draft(repo / "tickets", title="Fix README typo")
+    response = json.dumps({
+        "touches": ["README.md"], "close_criteria": "README text is corrected.",
+        "depends_on": [],
+        "overlap_review": {"mode": "dependencies", "ticket_ids": ["TICK-001"]},
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    assert "overlap_review" not in parse_ticket(repo / "tickets" / "TICK-001.md")
+
+
+def test_high_risk_prompt_override_receives_required_contract(repo):
+    _make_draft(repo / "tickets", title="Fix security regression")
+    prompt_dir = repo / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "analyze.md").write_text("custom analysis prompt\n")
+
+    prompt = _build_prompt(parse_ticket(repo / "tickets" / "TICK-001.md"), repo, _CFG)
+
+    assert "custom analysis prompt" in prompt
+    assert "Required high-risk response contract" in prompt
+    assert "adversarial_cases" in prompt
+
+
+def test_control_plane_overlap_prompt_override_receives_required_contract(repo):
+    """Same portability gap as the acceptance_matrix fallback, for the sibling
+    overlap_review gate: a project analyze.md override predates/omits the
+    contract's shape, but the overlap gate is unconditional whenever this
+    ticket's touches turn out to overlap an active control-plane ticket.
+    Without a fallback, the model never learns overlap_review's shape and
+    every retry fails identically until the other ticket reaches a terminal
+    status (see test_analyze_rejects_control_plane_overlap_without_plan)."""
+    _make_draft(repo / "tickets", title="Harden lifecycle cleanup")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden lifecycle cleanup", touches=["src/lifecycle.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+    prompt_dir = repo / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "analyze.md").write_text("custom analysis prompt\n")
+
+    prompt = _build_prompt(parse_ticket(repo / "tickets" / "TICK-001.md"), repo, _CFG)
+
+    assert "custom analysis prompt" in prompt
+    assert "Active control-plane tickets" in prompt
+    assert "Required control-plane overlap response contract" in prompt
+    assert "overlap_review" in prompt
+    assert "depends_on" in prompt
+
+
+def test_active_control_plane_context_is_bounded_and_says_so_when_truncated(repo, monkeypatch):
+    """This section had no byte budget while every neighbouring context
+    section did (collect_cross_ticket_change_notes, get_bounded_shared_notes,
+    get_bounded_reference_excerpts), so a board with many high-reasoning
+    tickets at several touches each could inject tens of KB into every
+    analyze prompt. Truncation is whole-line (a byte cutoff mid-line could
+    misrepresent a ticket's true touches to the overlap gate) and says so
+    explicitly when it drops tickets, since a silently-partial list would
+    look exhaustive to the model doing overlap detection."""
+    import lanegate.analyze as analyze_module
+    from lanegate.analyze import _active_control_plane_ticket_context
+
+    monkeypatch.setattr(analyze_module, "_ACTIVE_CONTROL_PLANE_BUDGET_BYTES", 120)
+
+    tickets_dir = repo / "tickets"
+    _make_draft(tickets_dir, title="Harden lifecycle cleanup")
+    for i in range(2, 6):
+        other = _make_draft(
+            tickets_dir, ticket_id=f"TICK-00{i}", title="Harden lifecycle cleanup",
+            touches=[f"src/module_{i}.py", f"src/other_{i}.py"],
+        )
+        other.write_text(other.read_text().replace("status: draft", "status: open"))
+
+    result = _active_control_plane_ticket_context(
+        parse_ticket(tickets_dir / "TICK-001.md"), tickets_dir, _CFG
+    )
+
+    assert "TICK-002" in result
+    assert "TICK-005" not in result
+    assert "more active control-plane ticket(s) omitted" in result
+    assert "do not assume this list is exhaustive" in result
+
+
+def test_analyze_does_not_require_matrix_from_model_generated_criteria(repo):
+    _make_draft(repo / "tickets", title="Fix application behavior")
+    response = json.dumps({
+        "touches": ["README.md"], "close_criteria": "Application lifecycle behavior is documented.",
+        "depends_on": [],
+    })
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: response)
+
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "open"
+
+
+def test_analyze_prompt_discloses_active_control_plane_tickets_and_proposed_touch_matrix_rule(repo):
+    _make_draft(repo / "tickets", title="Harden lifecycle cleanup")
+    other = _make_draft(repo / "tickets", ticket_id="TICK-002", title="Harden lifecycle cleanup", touches=["src/lifecycle.ext"])
+    other.write_text(other.read_text().replace("status: draft", "status: open"))
+
+    prompt = _build_prompt(parse_ticket(repo / "tickets" / "TICK-001.md"), repo, _CFG)
+
+    assert "Active control-plane tickets" in prompt
+    assert "TICK-002 (open): src/lifecycle.ext" in prompt
+    assert "every acceptance_matrix list must be non-empty" in prompt

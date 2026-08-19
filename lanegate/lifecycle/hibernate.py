@@ -6,7 +6,6 @@ import datetime
 import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -17,7 +16,7 @@ from lanegate.companion import companion_worktree_cleanup
 from lanegate.config import load_config, resolve_trunk_branch
 from lanegate.git import GitText
 from lanegate.git import git_text as _git_text
-from lanegate.pidutil import pid_alive
+from lanegate.pidutil import pid_alive, terminate_pid
 from lanegate.ticket import (
     append_lifecycle_event,
     branch_name,
@@ -34,18 +33,21 @@ def _stamp_status_changed(ticket: dict) -> None:
 
 
 def _marker_base(repo_root: Path, tid: str) -> Path:
-    state = repo_root / f".{APP_NAME}"
-    state.mkdir(parents=True, exist_ok=True)
-    return state / tid
+    # Canonical implementation lives in orchestrate/status.py as
+    # _executor_marker_base; imported lazily to avoid a circular import
+    # (orchestrate imports lifecycle at module level elsewhere).
+    from lanegate.orchestrate.status import _executor_marker_base
+
+    return _executor_marker_base(repo_root, tid)
 
 
 def _remove_executor_markers(repo_root: Path, tid: str) -> None:
-    base = _marker_base(repo_root, tid)
-    for suffix in (".pid", ".session"):
-        try:
-            base.with_suffix(suffix).unlink()
-        except FileNotFoundError:
-            pass
+    # Canonical implementation lives in orchestrate/status.py; imported
+    # lazily to avoid a circular import (orchestrate imports lifecycle at
+    # module level elsewhere).
+    from lanegate.orchestrate.status import _remove_executor_markers as _impl
+
+    _impl(repo_root, tid)
 
 
 def _write_executor_marker(repo_root: Path, tid: str, executor: str) -> None:
@@ -53,6 +55,8 @@ def _write_executor_marker(repo_root: Path, tid: str, executor: str) -> None:
     _remove_executor_markers(repo_root, tid)
     if executor == "claude-subagent":
         base.with_suffix(".session").write_text(f"{time.time():.6f}\n")
+    elif executor == "mcp":
+        base.with_suffix(".mcp").write_text(f"{time.time():.6f}\n")
     else:
         base.with_suffix(".pid").write_text(f"{os.getpid()}\n")
 
@@ -77,12 +81,7 @@ def _cleanup_ticket_notes(ticket: dict, repo_root: Path) -> None:
         tid_note.unlink()
     except (FileNotFoundError, OSError):
         pass
-    for touched in ticket.get("touches") or []:
-        note_path = notes_dir / f"{str(touched).replace('/', '_')}.md"
-        try:
-            note_path.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+
 
 
 def _render_git_text(capture: GitText) -> str:
@@ -101,6 +100,8 @@ def _control_repo_root(repo_root: Path) -> Path:
     common dir still points back to the primary checkout's ``.git`` directory.
     """
     root = Path(repo_root).resolve()
+    if not (root / ".git").exists():
+        return root
     result = subprocess.run(
         ["git", "rev-parse", "--git-common-dir"],
         cwd=root,
@@ -142,6 +143,7 @@ def _hibernation_note(
     *,
     include_diff: bool = False,
     trunk_branch: str | None = None,
+    escalation: bool = False,
 ) -> tuple[str, bool, bool]:
     """Generate hibernation note.
 
@@ -149,6 +151,11 @@ def _hibernation_note(
 
     ``capture_failed`` is distinct from truncation so reset callers do not
     mistake an unavailable Git capture for an empty successful diff.
+
+    ``escalation=True`` (TICK-467: red-lane risk trigger or exhausted
+    auto-fix retry budget) renders an explicit resume command in addition
+    to the usual git-log/diff pointers, since a human — not the next
+    orchestrate run — is expected to act on this ticket.
     """
     tid = ticket["id"]
     wt = Path(ticket["worktree"]) if ticket.get("worktree") else None
@@ -240,6 +247,20 @@ One or more Git captures failed. The failure diagnostics above are preserved her
 the branch and its metadata must remain available for recovery.
 """
 
+    if escalation:
+        escalation_reason = reason.strip() or "risk-based autonomy lane requires human review"
+        note += f"""
+### Human escalation ({escalation_reason})
+This ticket was escalated for human review rather than continuing the
+automatic fix/re-review loop. The branch `{branch}` is preserved — it was
+not deleted or reset.
+
+To resume after review:
+- Inspect the change: `git log {trunk_branch}..{branch} --oneline` and `git diff {trunk_branch}...{branch}`
+- Make any needed edits directly on `{branch}`, or address the escalation reason
+- Resume orchestration: `lanegate start {tid}` (or `lanegate run` to pick it up with the rest of the board)
+"""
+
     note += f"""
 Implement only what is missing.
 
@@ -258,6 +279,7 @@ def _write_hibernation_notes(
     *,
     include_diff: bool = False,
     trunk_branch: str | None = None,
+    escalation: bool = False,
 ) -> tuple[bool, bool]:
     """Write hibernation notes to recovery file.
 
@@ -271,6 +293,7 @@ def _write_hibernation_notes(
         reason=reason,
         include_diff=include_diff,
         trunk_branch=trunk_branch,
+        escalation=escalation,
     )
     recovery_path.write_text(note.rstrip() + "\n")
     return was_truncated, capture_failed
@@ -377,11 +400,25 @@ def cmd_hibernate(
     *,
     reset: bool = False,
     reason: str = "",
+    escalation: bool = False,
 ) -> None:
-    """Transition in_progress -> hibernated and write resumable context notes.
+    """Transition in_progress|code_complete -> hibernated and write resumable
+    context notes.
+
+    ``code_complete`` is accepted alongside ``in_progress`` because the
+    auto-fix cycle (run_auto_fix_cycle in orchestrate/autofix.py) calls this
+    on a rate-limited fix pass, where the ticket is always code_complete with
+    review_verdict=changes_requested at that point in the loop, never
+    in_progress — rejecting that status here would raise SystemExit out of
+    cmd_orchestrate and abort the rest of the batch.
 
     Preserves the worktree if the ticket has review_verdict=changes_requested,
     even if reset=True, to allow human inspection and fixes.
+
+    ``escalation=True`` (TICK-467: a red-lane risk trigger or an exhausted
+    auto-fix retry budget) always preserves the branch — even under
+    ``reset=True`` — and renders an explicit resume command in the
+    hibernation note, since a human is expected to act on it directly.
     """
     from . import _commit_generated_ticket_write
 
@@ -395,12 +432,15 @@ def cmd_hibernate(
         sys.exit(1)
 
     current = ticket.get("status")
-    if current != "in_progress":
-        print(f"ERROR: {tid} is '{current}', expected in_progress", file=sys.stderr)
+    if current not in ("in_progress", "code_complete"):
+        print(
+            f"ERROR: {tid} is '{current}', expected in_progress or code_complete",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     wt = ticket.get("worktree")
-    branch = ticket.get("branch")
+    branch = ticket.get("branch") or branch_name(tid)
 
     # Skip reset if ticket has review_verdict=changes_requested to preserve for inspection
     skip_reset = reset and ticket.get("review_verdict") == "changes_requested"
@@ -416,6 +456,7 @@ def cmd_hibernate(
         reason=reason,
         include_diff=reset and not skip_reset,
         trunk_branch=resolve_trunk_branch(cfg, repo_root),
+        escalation=escalation,
     )
     if reason:
         _append_ticket_section(ticket, "## Hibernation Reason", reason)
@@ -431,8 +472,10 @@ def cmd_hibernate(
                     remove_worktree(repo_root, wt_path, protected)
                 except PermissionError as e:
                     print(f"WARNING: {e}", file=sys.stderr)
-        # Failed or truncated captures leave recovery evidence only in the branch.
-        preserve_branch = was_diff_truncated or capture_failed
+        # Failed or truncated captures leave recovery evidence only in the
+        # branch; an escalation (red-lane trigger / exhausted retry budget)
+        # always preserves the branch for human review, same as those.
+        preserve_branch = was_diff_truncated or capture_failed or escalation
         if branch and not preserve_branch:
             subprocess.run(
                 ["git", "branch", "-D", branch],
@@ -452,6 +495,12 @@ def cmd_hibernate(
                 f"[lifecycle] preserving branch {branch} for {tid} (Git capture failed) — recovery diagnostics are in the hibernation note",
                 file=sys.stderr,
             )
+        elif branch and escalation:
+            print(
+                f"[lifecycle] preserving branch {branch} for {tid} (escalated for human review) — "
+                f"resume with `lanegate start {tid}`",
+                file=sys.stderr,
+            )
         if not preserve_branch:
             ticket["branch"] = None
         ticket["worktree"] = None
@@ -469,7 +518,7 @@ def cmd_hibernate(
     _remove_executor_markers(repo_root, tid)
     _commit_generated_ticket_write(repo_root, ticket["_path"], tid, "hibernated", cfg)
 
-    print(f"{tid}: in_progress -> hibernated")
+    print(f"{tid}: {current} -> hibernated")
     if reset and not skip_reset:
         print("  worktree and branch reset")
 
@@ -518,16 +567,14 @@ def cmd_stop(
         _remove_executor_markers(repo_root, tid)
         return {"ticket_id": tid, "stopped": False, "pid": pid, "reason": "already_gone"}
 
-    stop_reason = reason or f"stopped by operator: SIGTERM sent to executor PID {pid}"
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    stop_reason = reason or f"stopped by operator: terminated executor PID {pid}"
+    if not terminate_pid(pid):
+        if pid_alive(pid):
+            print(f"ERROR: permission denied terminating executor PID {pid}", file=sys.stderr)
+            sys.exit(1)
         print(f"[lifecycle] {tid}: no live executor (PID {pid} already gone)", file=sys.stderr)
         _remove_executor_markers(repo_root, tid)
         return {"ticket_id": tid, "stopped": False, "pid": pid, "reason": "already_gone"}
-    except PermissionError:
-        print(f"ERROR: permission denied sending SIGTERM to executor PID {pid}", file=sys.stderr)
-        sys.exit(1)
 
     deadline = time.time() + grace_seconds
     while time.time() < deadline and pid_alive(pid):
@@ -539,7 +586,7 @@ def cmd_stop(
 
     exited = not pid_alive(pid)
     state = "exited" if exited else "still running after grace period"
-    print(f"[lifecycle] {tid}: SIGTERM sent to executor PID {pid}; {state}", file=sys.stderr)
+    print(f"[lifecycle] {tid}: terminate signal sent to executor PID {pid}; {state}", file=sys.stderr)
     return {
         "ticket_id": tid,
         "stopped": True,

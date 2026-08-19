@@ -240,7 +240,7 @@ numbered task list or markdown checkboxes.
 
 Mapping:
 
-| Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
+| Artifact content | Import shape | Export shape |
 |---|---|---|
 | Feature directory name | Source grouping and default parent title. | Emit as source reference, not as a LaneGate-owned id. |
 | Requirement headings and acceptance criteria | Copy into untrusted ticket body. Import explicit criteria as close-criteria candidates. | Include ticket close criteria and provenance links in markdown or JSON. |
@@ -282,7 +282,7 @@ strategy. `tasks.md` contains implementation steps.
 
 Mapping:
 
-| Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
+| Artifact content | Import shape | Export shape |
 |---|---|---|
 | `spec.md` title and behavior sections | Ticket title and untrusted body context. | Export as a source summary plus LaneGate ticket title/body excerpt when supported. |
 | Acceptance criteria in `spec.md` | Close-criteria candidates. Preserve original wording in body. | Export validated close criteria as the execution contract. |
@@ -318,7 +318,7 @@ grouping. Checkboxes provide task text but not lifecycle state.
 
 Mapping:
 
-| Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
+| Artifact content | Import shape | Export shape |
 |---|---|---|
 | Document title | Parent ticket title or import batch label. | Export as a generated markdown checklist only when the user requests a low-structure view. |
 | Checkbox text | One ticket per checkbox only when the user chooses a split import. Otherwise one ticket with checklist context. | Export LaneGate ticket status as `[ ]` or `[x]` only as a presentation layer, not as source of truth. |
@@ -351,7 +351,7 @@ iteration names, priorities, and URLs.
 
 Mapping:
 
-| Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
+| Artifact content | Import shape | Export shape |
 |---|---|---|
 | Issue number and URL | Source reference only. Never reused as the LaneGate ticket id. | Export backlink metadata and optional issue comment body. |
 | Title and body | Ticket title and untrusted body context. | Export ticket summary, status, review result, and links back to LaneGate state. |
@@ -369,7 +369,7 @@ comment/update conflict handling, and explicit versioned field mappings.
 Representative artifact:
 
 ```markdown
-# TICK-123: Add deploy dry-run
+# Add deploy dry-run
 
 TOUCHES:
 lanegate/deploy.py, tests/test_deploy.py
@@ -387,7 +387,7 @@ heading names is not enough to trust the values.
 
 Mapping:
 
-| Artifact content | Import shape for TICK-113 | Export shape for TICK-114 |
+| Artifact content | Import shape | Export shape |
 |---|---|---|
 | Ticket-like id in heading | Preserve as external id unless it was allocated by the current LaneGate repo. | Export LaneGate id as authoritative for this repo. |
 | `TOUCHES` block | Path candidates. Validate existence, normalization, and lock eligibility. | Export validated `touches` exactly as LaneGate stores them. |
@@ -430,7 +430,7 @@ Minimum fixture plan:
 | `lanegate_markdown_tickets/` | `ticket_minimal.md`, `ticket_with_dependencies.md`, `ticket_invalid_paths.md`, `expected_export.md`, `expected_export.json` | Exercise LaneGate's own import/export contract, trusted-field validation, dependency validation, and round-trip shape. |
 
 Each family should also include expected output files such as
-`expected/tickets.json` or `expected/export.md` once TICK-113 and TICK-114
+`expected/tickets.json` or `expected/export.md` once import and export
 implement import/export. Expected files should distinguish:
 
 - `body`: untrusted copied source content
@@ -438,8 +438,8 @@ implement import/export. Expected files should distinguish:
 - `validated_metadata`: values LaneGate accepts after schema and lifecycle checks
 - `source`: external family, path, id, URL, and parser version
 
-This gives TICK-113 enough input shape to implement import safely and gives
-TICK-114 enough output shape to export tickets without overstating
+This gives enough input shape to implement import safely and gives
+enough output shape to export tickets without overstating
 compatibility.
 
 ## Positioning

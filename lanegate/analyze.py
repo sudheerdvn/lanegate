@@ -14,7 +14,9 @@ Model strategy:
 from __future__ import annotations
 
 import ast
+import datetime
 import json
+import logging
 import re
 import signal
 import subprocess
@@ -23,13 +25,23 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
+
+logger = logging.getLogger("lanegate.analyze")
 
 from lanegate import APP_NAME
-from lanegate.config import load_config, resolve_trunk_branch
+from lanegate.config import is_high_reasoning_ticket, load_config, resolve_trunk_branch
 from lanegate.ticket import (
+    TERMINAL_STATUSES,
     canonical_id,
+    collect_cross_ticket_change_notes,
+    find_control_plane_touch_overlaps,
+    load_acceptance_contract_audit,
     load_all_tickets,
+    load_change_notes,
     load_file_skeletons,
+    validate_acceptance_matrix,
+    validate_overlap_review,
     validate_ticket,
     write_file_skeletons_sidecar,
     write_ticket,
@@ -40,6 +52,59 @@ _SESSION_EXECUTORS = frozenset({"claude", "claude-process", "claude-subagent", "
 _CLAUDE_MODEL_PREFIXES = ("claude-",)
 _ACTIVE_ANALYSIS_FILE = "analyze-active.json"
 _MAX_LOGGED_EXECUTOR_OUTPUT = 8 * 1024
+# A transient executor failure is worth surfacing to the current ticket, but
+# repeatedly sending later drafts to the same known-bad pool member just burns
+# calls. Keep this deliberately small: a second identical failure during one
+# orchestrate run takes that member out of rotation via the existing cooldown
+# machinery. The tracker is in-memory and keyed by the active run id, so it
+# cannot leak a stale failure into a later run.
+_ANALYZE_FAILURE_COOLDOWN_THRESHOLD = 2
+_ANALYZE_FAILURE_STREAKS: dict[tuple[str, str, str], tuple[str, int]] = {}
+
+
+def _active_analyze_run_id(repo_root: Path) -> str | None:
+    """Return the active orchestrate session id, if analyze runs inside one."""
+    from lanegate.orchestrate.run_report import _resolve_active_run_session_ts
+
+    return _resolve_active_run_session_ts(repo_root)
+
+
+def _analyze_failure_signature(raw_stdout: str, raw_stderr: str) -> str:
+    """Normalize volatile executor metadata before comparing failure streaks."""
+    text = f"{raw_stdout}\n{raw_stderr}".lower()
+    text = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "<uuid>",
+        text,
+    )
+    text = re.sub(
+        r"([\"']?(?:session|message|request)[_-]?id[\"']?\s*[:=]\s*)[\"']?[^\s,\"'}]+",
+        r"\1<id>",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _record_analyze_failure(
+    repo_root: Path, driver_name: str, raw_stdout: str, raw_stderr: str
+) -> int | None:
+    """Record one non-rate-limit failure and return its run-local streak size."""
+    run_id = _active_analyze_run_id(repo_root)
+    if run_id is None:
+        return None
+    key = (str(repo_root.resolve()), run_id, driver_name)
+    signature = _analyze_failure_signature(raw_stdout, raw_stderr)
+    previous = _ANALYZE_FAILURE_STREAKS.get(key)
+    count = previous[1] + 1 if previous and previous[0] == signature else 1
+    _ANALYZE_FAILURE_STREAKS[key] = (signature, count)
+    return count
+
+
+def _clear_analyze_failure_streak(repo_root: Path, driver_name: str) -> None:
+    """A successful model call makes prior failures for this run irrelevant."""
+    run_id = _active_analyze_run_id(repo_root)
+    if run_id is not None:
+        _ANALYZE_FAILURE_STREAKS.pop((str(repo_root.resolve()), run_id, driver_name), None)
 
 # ---------------------------------------------------------------------------
 # Optional tree-sitter import guard
@@ -67,7 +132,30 @@ _TS_LANGUAGE_MAP: dict[str, str] = {
     ".c": "tree_sitter_c",
     ".cpp": "tree_sitter_cpp",
     ".h": "tree_sitter_c",
+    ".php": "tree_sitter_php",
+    ".cs": "tree_sitter_c_sharp",
+    ".swift": "tree_sitter_swift",
+    ".kt": "tree_sitter_kotlin",
+    ".kts": "tree_sitter_kotlin",
 }
+
+# Project-declared additions from .lanegate.yml's tree_sitter_languages key,
+# merged in by register_tree_sitter_languages() -- see config.load_config().
+# A plain dict.update() at a single early chokepoint (config load, once per
+# process) so callers deep in the parse chain (file_symbols, skeleton
+# generation) stay cfg-agnostic; no threading needed.
+def register_tree_sitter_languages(extra: dict[str, str] | None) -> None:
+    """Merge project-declared extension -> tree-sitter module mappings.
+
+    Lets a project support a language LaneGate doesn't ship a built-in
+    mapping for (e.g. Vue, Elixir, Zig) by declaring it in .lanegate.yml and
+    `pip install`-ing the matching tree-sitter grammar package, without
+    waiting on a LaneGate release. Unknown extensions degrade to ripgrep
+    either way (see _ts_load_language), so this is purely additive.
+    """
+    if not extra:
+        return
+    _TS_LANGUAGE_MAP.update(extra)
 
 # Map of lanegate CLI subcommand name → source file (relative path).
 # Used by infer_touches_from_criteria to expand subcommand mentions.
@@ -141,11 +229,17 @@ _TS_SYMBOL_NODE_TYPES: frozenset[str] = frozenset(
         "function_definition",
         "method_declaration",
         "method_definition",
+        "function_item",  # Rust: free functions and impl methods alike
         # Types / classes
         "class_declaration",
         "interface_declaration",
         "type_declaration",
         "struct_type",  # Go: appears inside type_spec
+        "struct_item",  # Rust
+        "trait_item",  # Rust
+        "enum_item",  # Rust
+        "protocol_declaration",  # Swift
+        "object_declaration",  # Kotlin: singleton objects
     }
 )
 
@@ -157,6 +251,7 @@ _TS_NAME_CHILD_TYPES: frozenset[str] = frozenset(
         "field_identifier",
         "property_identifier",
         "name",
+        "simple_identifier",  # Swift: functions/methods (types still use type_identifier)
     }
 )
 
@@ -166,6 +261,13 @@ def _ts_load_language(ext: str) -> _TSLanguage | None:
 
     Returns None if the grammar package is not installed.
     """
+    if not _HAS_TREE_SITTER:
+        if ext not in _TS_LANG_CACHE:
+            msg = f"[analyze] WARNING: tree-sitter is not installed; non-Python symbol indexing degraded for '{ext}' files."
+            print(msg, file=sys.stderr)
+            _TS_LANG_CACHE[ext] = None
+        return None
+
     if ext in _TS_LANG_CACHE:
         return _TS_LANG_CACHE[ext]
 
@@ -177,19 +279,24 @@ def _ts_load_language(ext: str) -> _TSLanguage | None:
     try:
         import importlib
 
-        # mod_name only ever comes from _TS_LANGUAGE_MAP's fixed 11 entries
-        # above, never from ticket/file content or other untrusted input.
+        # mod_name comes from _TS_LANGUAGE_MAP (built-in entries, fixed at
+        # module load) or register_tree_sitter_languages() (project-declared
+        # via .lanegate.yml, trusted config -- never from ticket/file content
+        # or other untrusted input).
         mod = importlib.import_module(mod_name)  # nosemgrep: python.lang.security.audit.non-literal-import.non-literal-import
-        # tree-sitter-typescript exposes language_typescript() / language_tsx()
-        # rather than a single language() function.
+        # A few grammars don't expose a plain language() function.
         if ext in (".ts",):
             lang_fn = getattr(mod, "language_typescript", None) or getattr(mod, "language", None)
         elif ext in (".tsx",):
             lang_fn = getattr(mod, "language_tsx", None) or getattr(mod, "language", None)
+        elif ext in (".php",):
+            lang_fn = getattr(mod, "language_php", None) or getattr(mod, "language", None)
         else:
             lang_fn = getattr(mod, "language", None)
 
         if lang_fn is None:
+            msg = f"[analyze] WARNING: missing tree-sitter grammar '{mod_name}' for extension '{ext}'; non-Python symbol indexing degraded."
+            print(msg, file=sys.stderr)
             _TS_LANG_CACHE[ext] = None
             return None
 
@@ -197,6 +304,8 @@ def _ts_load_language(ext: str) -> _TSLanguage | None:
         _TS_LANG_CACHE[ext] = lang
         return lang
     except Exception:  # ImportError, AttributeError, or grammar init errors
+        msg = f"[analyze] WARNING: missing tree-sitter grammar '{mod_name}' for extension '{ext}'; non-Python symbol indexing degraded."
+        print(msg, file=sys.stderr)
         _TS_LANG_CACHE[ext] = None
         return None
 
@@ -205,7 +314,8 @@ def _ts_extract_symbols(node: object) -> list[str]:
     """Walk a tree-sitter Node and return all symbol names found.
 
     Looks for function/class/method declaration nodes and extracts their name
-    child. Works across Go, JS, TS, Rust, Java, Ruby, C, C++ grammars.
+    child. Works across every grammar in _TS_LANGUAGE_MAP (plus any
+    project-declared via register_tree_sitter_languages).
     """
     symbols: list[str] = []
 
@@ -251,9 +361,60 @@ def _ts_extract_symbols(node: object) -> list[str]:
     return symbols
 
 
+def _ts_symbol_lines(node: object) -> list[tuple[int, str]]:
+    """Return ``(line, declaration text)`` for each symbol, for skeleton output.
+
+    :func:`_ts_extract_symbols` returns bare names, which is enough for the
+    symbol index but not for a skeleton -- a caller needs somewhere to jump to
+    and enough of the declaration to check a signature. The declaration's own
+    first line is used rather than a reconstructed signature, since each grammar
+    spells parameters and return types differently.
+    """
+    entries: list[tuple[int, str]] = []
+
+    def _walk(n: object) -> None:
+        node_type: str = n.type  # type: ignore[attr-defined]
+        if node_type in _TS_SYMBOL_NODE_TYPES and node_type != "struct_type":
+            raw = n.text  # type: ignore[attr-defined]
+            if raw:
+                text = raw.decode("utf-8", errors="replace")
+                first = text.split("\n", 1)[0].strip().rstrip("{").strip()
+                if first:
+                    # start_point is 0-indexed; editors and the Python skeleton
+                    # path both count from 1.
+                    entries.append((n.start_point[0] + 1, first))  # type: ignore[attr-defined]
+        for child in n.children:  # type: ignore[attr-defined]
+            _walk(child)
+
+    _walk(node)
+    # A nested declaration is reached after its parent, so sort to keep the
+    # skeleton in file order.
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Model seam — replace in tests via monkeypatch or dependency injection
 # ---------------------------------------------------------------------------
+
+
+class ExecutorCallError(RuntimeError):
+    """Executor subprocess exited non-zero during analyze.
+
+    Carries the *unclipped* stdout/stderr alongside the display message.
+    The message itself goes through _summarize_executor_output, which clips
+    every line to 240 chars — and stream-json executors (the Claude CLI)
+    emit their whole transcript as a handful of enormous single lines, so a
+    quota notice like "Claude AI usage limit reached" lands far past that
+    boundary. Classifying rate limits off str(exc) therefore silently missed
+    every stream-json quota error and skipped pool failover; callers must
+    classify against these raw fields instead.
+    """
+
+    def __init__(self, message: str, *, raw_stdout: str = "", raw_stderr: str = ""):
+        super().__init__(message)
+        self.raw_stdout = raw_stdout
+        self.raw_stderr = raw_stderr
 
 
 def _summarize_executor_output(text: str, *, max_lines: int = 12, max_line_len: int = 240) -> str:
@@ -294,6 +455,7 @@ def _active_analysis_path(repo_root: Path) -> Path:
 def _write_active_analysis(
     repo_root: Path,
     *,
+    ticket_id: str,
     phase: str,
     executor: str,
     model: str | None,
@@ -308,6 +470,7 @@ def _write_active_analysis(
     except ValueError:
         log_path = str(log_file)
     payload = {
+        "ticket_id": ticket_id,
         "phase": phase,
         "executor": executor,
         "model": model or "default",
@@ -328,6 +491,7 @@ def get_active_analysis_status(repo_root: Path) -> dict | None:
     except (FileNotFoundError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
     return {
+        "ticket_id": str(data.get("ticket_id", "")),
         "phase": str(data.get("phase", "unknown")),
         "executor": str(data.get("executor", "unknown")),
         "model": str(data.get("model", "default")),
@@ -373,10 +537,11 @@ class _WaitingReporter:
 class _AnalysisVisibility:
     """Keep terminal, log, and active-status lifecycle views in lockstep."""
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path, ticket_id: str) -> None:
         from lanegate.logs import analyze_log_path, write_analysis_event
 
         self.repo_root = repo_root
+        self.ticket_id = ticket_id
         self.started_at = time.time()
         self.log_file = analyze_log_path(repo_root)
         self._write_event = write_analysis_event
@@ -388,6 +553,7 @@ class _AnalysisVisibility:
     def _update(self, phase: str) -> None:
         _write_active_analysis(
             self.repo_root,
+            ticket_id=self.ticket_id,
             phase=phase,
             executor=self.executor,
             model=self.model,
@@ -417,6 +583,8 @@ def _call_model(
     executor: str = "claude",
     cfg: dict | None = None,
     driver_cfg: dict | None = None,
+    repo_root: Path | None = None,
+    tid: str | None = None,
 ) -> tuple[str, str | None]:
     """Call the configured executor with prompt; return (raw text response, session_id or None).
 
@@ -430,6 +598,14 @@ def _call_model(
     executor.py; nothing here needs to change. Executors with no registered
     parser (aider, ollama, openhands, plain) get None back and raw stdout is
     used as-is.
+
+    ``repo_root``/``tid`` are optional purely so this can still be called
+    without them (e.g. a future non-ticket caller); when both are supplied
+    and the executor's output parsed to a structured envelope, the dispatch
+    cost is recorded the same way review/implement/fix already do -- analyze
+    previously parsed this same envelope only to read session_id/result_text
+    and threw the usage/cost fields away, leaving it the one step invisible
+    to ``context-stats``.
     """
     from lanegate.executor import (
         _CLAUDE_SUBPROCESS_TYPES,
@@ -449,20 +625,42 @@ def _call_model(
     resolved_executor_type = resolved_executor_cfg.get("type", executor)
 
     use_stdin = resolved_executor_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"})
-    cmd = build_executor_cmd(executor, prompt, command_cfg, model=model, use_stdin=use_stdin)
+    # Analyze must stay read-only: the prompt carries candidate-file skeletons
+    # (see _build_prompt) so touches/change_notes precision doesn't depend on
+    # the model reading real files itself, and denying edit capability here
+    # closes the gap where the executor's own default full-access flags
+    # (--dangerously-skip-permissions, --yes-always, --dangerously-bypass-
+    # approvals-and-sandbox) would otherwise leave analyze free to write --
+    # at a draft ticket, before any worktree exists, directly against the
+    # main checkout. disallowed_tools is Claude's own mechanism
+    # (--disallowedTools); read_only=True covers every other executor type
+    # via build_executor_cmd's per-type read-only flag (aider --dry-run,
+    # codex --sandbox read-only, agy --mode plan).
+    disallowed_tools = ["Bash", "Write", "Edit"] if resolved_executor_type in _CLAUDE_SUBPROCESS_TYPES else None
+    cmd = build_executor_cmd(
+        executor, prompt, command_cfg, model=model, use_stdin=use_stdin,
+        disallowed_tools=disallowed_tools,
+        read_only=True,
+        step="analyze",
+    )
 
+    start_time = time.time()
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True, encoding="utf-8",
         env=executor_env,
-        **({"input": prompt} if use_stdin else {}),
+        input=prompt if use_stdin else None,
     )
     if result.returncode != 0:
         cmd_label = " ".join(cmd[:2]) if len(cmd) > 1 and cmd[1] == "exec" else cmd[0]
         details = _summarize_executor_output(result.stderr or result.stdout)
         suffix = f": {details}" if details else ""
-        raise RuntimeError(f"{cmd_label} failed (exit {result.returncode}){suffix}")
+        raise ExecutorCallError(
+            f"{cmd_label} failed (exit {result.returncode}){suffix}",
+            raw_stdout=result.stdout or "",
+            raw_stderr=result.stderr or "",
+        )
 
     raw = result.stdout.strip()
     session_id: str | None = None
@@ -470,6 +668,13 @@ def _call_model(
     if parsed is not None:
         session_id = parsed.get("session_id") or None
         raw = parsed.get("result_text", raw)
+        if repo_root is not None and tid is not None:
+            from lanegate.context_log import record_step_cost
+
+            record_step_cost(
+                repo_root, tid, "analyze", executor, model, parsed,
+                dispatch_start_time=start_time,
+            )
 
     return raw, session_id
 
@@ -631,11 +836,33 @@ def _build_ast_index(repo_root: Path) -> list[_FileIndex]:
     return indices
 
 
+def file_symbols(path: Path, repo_root: Path) -> list[str]:
+    """Return the symbol names declared in *path*, or ``[]`` if none can be read.
+
+    Python is parsed with stdlib ``ast``; other languages use tree-sitter when
+    the matching grammar is installed. Public so callers outside ``analyze``
+    (the ``symbols`` command, prompt building) can reuse the same index.
+
+    Returns ``[]`` rather than raising when a file is unreadable, unparseable,
+    or has no installed grammar, so callers fall back to searching.
+    """
+    abs_path = path if path.is_absolute() else repo_root / path
+    if abs_path.suffix == ".py":
+        idx = _index_py_file(abs_path)
+        return [info.signature for info in idx.def_infos] if idx else []
+    idx = _index_non_py_file(abs_path)
+    return list(idx.defs) if idx else []
+
+
 def _build_file_skeleton(path: Path, repo_root: Path) -> str:
     """Return a compact text block for one file: a header line (name + line
-    count) plus one 'line N: signature' entry per top-level/class-level def
-    for Python files. Non-Python files (or unparseable ones) get just the
-    header. Computed entirely from stdlib ast — never LLM-generated."""
+    count) plus one 'line N: signature' entry per declaration.
+
+    Python uses stdlib ast; the languages in ``_TS_LANGUAGE_MAP`` use
+    tree-sitter when their grammar is installed (previously every
+    non-Python file returned a bare header, so Go/TS/Rust tickets reached the
+    agent with no structure at all). Files with no available parser still get
+    the header. Never LLM-generated."""
     abs_path = path if path.is_absolute() else repo_root / path
     try:
         rel = abs_path.relative_to(repo_root).as_posix()
@@ -648,15 +875,62 @@ def _build_file_skeleton(path: Path, repo_root: Path) -> str:
         return f"{rel}  (file not found)"
 
     header = f"{rel}  ({line_count} lines)"
-    if abs_path.suffix != ".py":
-        return header
 
-    idx = _index_py_file(abs_path)
-    if idx is None or not idx.def_infos:
-        return header
+    if abs_path.suffix == ".py":
+        idx = _index_py_file(abs_path)
+        if idx is None or not idx.def_infos:
+            return header
+        body = "\n".join(
+            f"  line {info.line:>3}: {info.signature}" for info in idx.def_infos
+        )
+        return f"{header}\n{body}"
 
-    body = "\n".join(f"  line {info.line:>3}: {info.signature}" for info in idx.def_infos)
+    entries = _ts_file_symbol_lines(abs_path)
+    if not entries:
+        return header
+    body = "\n".join(f"  line {line:>3}: {text}" for line, text in entries)
     return f"{header}\n{body}"
+
+
+# Analyze-time candidate skeletons are a speed/precision tradeoff, not a
+# completeness guarantee: bounded to the top symbol/importer matches (already
+# relevance-ranked by enrich_context) so the prompt stays a fixed size
+# regardless of how big the matched set is, rather than growing per repo.
+_CANDIDATE_SKELETON_MAX_FILES = 25
+_CANDIDATE_SKELETON_MAX_BYTES = 15000
+
+
+def _build_candidate_skeletons(paths: list[str], repo_root: Path) -> str:
+    """Return real per-file signatures (line numbers included) for the files
+    analyze's context search matched, so the model can write precise
+    ``change_notes`` from the prompt alone instead of using Read tool calls
+    to fetch the same information one file at a time."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+
+    blocks: list[str] = []
+    total_bytes = 0
+    for p in ordered[:_CANDIDATE_SKELETON_MAX_FILES]:
+        block = _build_file_skeleton(Path(p), repo_root)
+        block_bytes = len(block.encode("utf-8"))
+        if total_bytes + block_bytes > _CANDIDATE_SKELETON_MAX_BYTES:
+            break
+        blocks.append(block)
+        total_bytes += block_bytes
+
+    if not blocks:
+        return ""
+
+    return (
+        "## Candidate file skeletons (stdlib ast — real signatures, not a summary)\n"
+        "Line-numbered defs for the files matched above. Prefer these over reading "
+        "the files again; only Read/Grep a file if it's missing here or you need "
+        "content beyond a signature.\n\n" + "\n\n".join(blocks)
+    )
 
 
 def _intent_keywords(intent: str) -> list[str]:
@@ -733,9 +1007,6 @@ def _index_non_py_file(path: Path) -> _FileIndex | None:
     Per-language graceful degradation: each extension is tried independently
     using the cached grammar loaded by _ts_load_language.
     """
-    if not _HAS_TREE_SITTER:
-        return None
-
     ext = path.suffix.lower()
     lang = _ts_load_language(ext)
     if lang is None:
@@ -755,6 +1026,26 @@ def _index_non_py_file(path: Path) -> _FileIndex | None:
     symbols = _ts_extract_symbols(tree.root_node)
     # _FileIndex.defs holds symbol names; imports is unused for non-Python files
     return _FileIndex(path=path, defs=symbols, imports=[])
+
+
+def _ts_file_symbol_lines(path: Path) -> list[tuple[int, str]]:
+    """Parse *path* with tree-sitter and return ``(line, declaration)`` entries.
+
+    Returns ``[]`` when tree-sitter or the file's grammar is unavailable, so
+    callers degrade to a header-only skeleton instead of failing.
+    """
+    lang = _ts_load_language(path.suffix.lower())
+    if lang is None:
+        return []
+    try:
+        source = path.read_bytes()
+    except OSError:
+        return []
+    try:
+        tree = _TSParser(lang).parse(source)
+    except Exception:
+        return []
+    return _ts_symbol_lines(tree.root_node)
 
 
 def _treesitter_hits(intent: str, repo_root: Path) -> list[str]:
@@ -949,28 +1240,54 @@ def infer_touches_from_criteria(
 
 
 # Bare doc keywords (no explicit path/extension in the text) mapped to the
-# repo-relative path they refer to. Only known project docs — a keyword
-# match alone must not invent a path that doesn't already exist.
-_DOC_KEYWORD_MAP: dict[str, str] = {
+# repo-relative path they refer to. Only README is hardcoded, because it is the
+# one filename that is genuinely universal across ecosystems. Everything else is
+# derived from what the project itself declares -- LaneGate used to
+# map 'architecture'/'config-reference'/'security-model' to its *own* docs/
+# layout, so a user ticket saying "update the architecture doc" resolved against
+# LaneGate's directory structure rather than the user's.
+_UNIVERSAL_DOC_KEYWORDS: dict[str, str] = {
     "readme": "README.md",
-    "architecture": "docs/ARCHITECTURE.md",
-    "config-reference": "docs/config-reference.md",
-    "config reference": "docs/config-reference.md",
-    "security-model": "docs/security-model.md",
-    "security model": "docs/security-model.md",
 }
 
 
-def companion_docs_from_criteria(text: str, repo_root: Path) -> list[str]:
-    """Return companion documentation paths implied by *text* (TICK-253).
+def _doc_keyword_map(cfg: dict | None = None) -> dict[str, str]:
+    """Return the keyword -> repo-relative doc path map for this project.
+
+    Built from the universal names, plus an explicit ``doc_keywords`` mapping in
+    ``.lanegate.yml``, plus every ``reference_docs`` entry keyed by its own file
+    stem -- so a project declaring ``docs/DESIGN.md`` gets "design" recognised
+    against *its* path, with no filename assumptions from LaneGate.
+    """
+    from lanegate.prompts import resolve_reference_docs
+
+    mapping = dict(_UNIVERSAL_DOC_KEYWORDS)
+    for rel in resolve_reference_docs(cfg):
+        stem = Path(rel).stem.strip().lower()
+        if len(stem) >= 3:
+            mapping.setdefault(stem, rel)
+            mapping.setdefault(stem.replace("-", " "), rel)
+    configured = (cfg or {}).get("doc_keywords")
+    if isinstance(configured, dict):
+        for keyword, path in configured.items():
+            if isinstance(keyword, str) and isinstance(path, str):
+                if keyword.strip() and path.strip():
+                    mapping[keyword.strip().lower()] = path.strip()
+    return mapping
+
+
+def companion_docs_from_criteria(
+    text: str, repo_root: Path, cfg: dict | None = None
+) -> list[str]:
+    """Return companion documentation paths implied by *text*.
 
     Close criteria and background prose often imply a doc update ("update
-    README and ARCHITECTURE.md to describe the new behavior") without the
-    model reliably carrying that into ``touches``. Scans for explicit
-    ``*.md`` path mentions and known doc keywords (README, ARCHITECTURE,
-    config-reference, security-model), then keeps only paths that actually
-    exist in *repo_root* — prose mentioning documentation in the abstract
-    must not inject a nonexistent path.
+    README and DESIGN.md to describe the new behavior") without the model
+    reliably carrying that into ``touches``. Scans for explicit ``*.md`` path
+    mentions and for doc keywords drawn from this project's own config (see
+    :func:`_doc_keyword_map`), then keeps only paths that actually exist in
+    *repo_root* — prose mentioning documentation in the abstract must not
+    inject a nonexistent path.
     """
     found: set[str] = set()
 
@@ -978,7 +1295,7 @@ def companion_docs_from_criteria(text: str, repo_root: Path) -> list[str]:
         found.add(m.group(0))
 
     lowered = text.lower()
-    for keyword, path in _DOC_KEYWORD_MAP.items():
+    for keyword, path in _doc_keyword_map(cfg).items():
         if keyword in lowered:
             found.add(path)
 
@@ -986,11 +1303,11 @@ def companion_docs_from_criteria(text: str, repo_root: Path) -> list[str]:
 
 
 def validate_touched_paths(paths: list[str], repo_root: Path) -> list[str]:
-    """Return entries in *paths* that reference a directory no longer present (TICK-269).
+    """Return entries in *paths* that reference a directory no longer present.
 
     A touches entry carried forward from an earlier draft/analyze pass can
     reference a directory that a since-merged ticket has renamed, moved, or
-    promoted (e.g. TICK-157 promoted ``tui_spike/`` to ``tui/internal/``).
+    promoted (e.g. when ``tui_spike/`` was moved to ``tui/internal/``).
     Carrying such a stale entry forward is worse than useless: the executor
     ends up implementing under the real current path, which was never
     declared, and the touches-guard blocks legitimate work after the fact.
@@ -1000,6 +1317,41 @@ def validate_touched_paths(paths: list[str], repo_root: Path) -> list[str]:
     will create).
     """
     return [p for p in paths if p.endswith("/") and not (repo_root / p).is_dir()]
+
+
+def correct_touches_by_basename(paths: list[str], repo_root: Path) -> dict[str, str]:
+    """Return {declared_path: real_path} for any *paths* entry that doesn't
+    exist on disk but uniquely matches a tracked file's basename elsewhere.
+
+    ``enrich_context``'s tiers stop at the first provider with any hit, even
+    a partial one (e.g. ripgrep matching only the test file for a brand-new
+    symbol that doesn't exist in source yet) -- the full repo file listing
+    (the last-resort tier) is then never shown, so the model has no way to
+    notice a nested layout and can write a flat-looking path straight from
+    the ticket text (``calc.py`` instead of the real ``src/calc.py``).
+
+    A path that doesn't exist anywhere is left alone -- it may legitimately
+    be a new file the ticket itself will create. Only an unambiguous
+    same-basename match against a real tracked file gets corrected;
+    multiple same-named files anywhere in the tree are left as the model
+    wrote them rather than guessing which one it meant.
+    """
+    missing = [p for p in paths if p and not p.endswith("/") and not (repo_root / p).exists()]
+    if not missing:
+        return {}
+
+    from lanegate.executor import _repo_tracked_files
+
+    by_basename: dict[str, list[str]] = {}
+    for f in _repo_tracked_files(repo_root):
+        by_basename.setdefault(Path(f).name, []).append(f)
+
+    corrections: dict[str, str] = {}
+    for path in missing:
+        candidates = by_basename.get(Path(path).name)
+        if candidates and len(candidates) == 1 and candidates[0] != path:
+            corrections[path] = candidates[0]
+    return corrections
 
 
 # ---------------------------------------------------------------------------
@@ -1035,13 +1387,19 @@ class _ContractItem:
 
 
 # Headings lanegate itself appends to a ticket's body as operational notes (needs_review
-# reason, hibernation notes, auto-fix attempt logs, review findings) rather than
-# authored requirements. Left in, these feed the audit's own prior output back into
-# itself on the next attempt — a ticket flagged for omitting an item quotes that
-# same finding in its "Needs Review Reason" section, which then gets re-scanned as
-# a fresh unmet requirement, compounding on every reopen/re-audit cycle.
+# reason, hibernation notes, auto-fix attempt logs, review findings, and the audit's own
+# stored output) rather than authored requirements.  Left in, these feed the audit's
+# own prior output back into itself on the next attempt:
+#   - A ticket flagged for omitting an item quotes that finding in its "Needs Review
+#     Reason" or "Acceptance Contract Audit" section, which then gets re-scanned as a
+#     fresh unmet requirement, compounding on every reopen/re-audit cycle.
+#   - The "Acceptance Contract Audit" section references linked docs (e.g.
+#     docs/ARCHITECTURE.md) by name, causing those docs to be pulled in as contract
+#     sources on the next run even when the ticket text itself never mentioned them.
 _OPERATIONAL_SECTION_RE = re.compile(
-    r"\n##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+|Review Findings)"
+    r"\n##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+"
+    r"|Review Findings|Acceptance Contract Audit|Status History|Lifecycle Timeline"
+    r"|Post-Merge Verification Diagnostic)"
     r".*?(?=\n##\s|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1402,12 +1760,15 @@ def _local_context_for_path(text: str, path: str) -> str:
 
 def _linked_context_refs(ticket: dict, repo_root: Path) -> list[tuple[str, str]]:
     """Return (label, text) pairs for repo docs or prior tickets named by the ticket."""
+    close_criteria = ticket.get("close_criteria") or ""
+    if isinstance(close_criteria, list):
+        close_criteria = "\n".join(str(item) for item in close_criteria)
     text = "\n".join(
         [
             ticket.get("title", "") or "",
             _strip_operational_sections(ticket.get("_body", "") or ""),
-            ticket.get("close_criteria", "") or "",
-            _flatten_change_notes(ticket.get("change_notes")),
+            close_criteria,
+            _flatten_change_notes(load_change_notes(ticket)),
         ]
     )
     refs: list[tuple[str, str]] = []
@@ -1430,16 +1791,56 @@ def _linked_context_refs(ticket: dict, repo_root: Path) -> list[tuple[str, str]]
         if scoped.strip():
             refs.append((rel, scoped))
 
-    # Deliberately does not cross-reference other tickets found by ID mention
-    # anywhere in the text (e.g. background prose like "TICK-029 adds X"):
-    # a ticket incidentally naming a prior/dependency ticket for context does
-    # not mean it must independently restate that other ticket's own close
-    # criteria. Doing so previously caused false-positive audit failures on
-    # docs-only and narrowly-scoped tickets that merely referenced earlier
-    # work. Linked *docs* (above) remain in scope since a ticket's own body
-    # explicitly pointing at a design/contract doc is a real signal.
-
     return refs
+
+
+def _close_criteria_drift_finding(ticket: dict, repo_root: Path) -> str | None:
+    """Flag close_criteria that changed since ``analyzed_at_sha`` without a
+    recorded human approval.
+
+    The rest of this audit only checks internal consistency of the *current*
+    ticket text, so a commit that narrows close_criteria to match a reduced
+    implementation (rather than the owner approving a scope change) reads as
+    perfectly self-consistent and passes with 0 findings. This
+    check compares against the committed baseline instead.
+    """
+    sha = ticket.get("analyzed_at_sha")
+    path = ticket.get("_path")
+    if not sha or not path:
+        return None
+    try:
+        rel = Path(path).relative_to(repo_root)
+    except ValueError:
+        return None
+
+    from lanegate.reconciliation import _split_frontmatter
+
+    result = subprocess.run(
+        ["git", "show", f"{sha}:{rel.as_posix()}"],
+        cwd=repo_root, capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return None
+    baseline_meta, _ = _split_frontmatter(result.stdout)
+
+    def _flatten(val: object) -> str:
+        return "\n".join(str(x) for x in val).strip() if isinstance(val, list) else str(val or "").strip()
+
+    baseline_close = _flatten(baseline_meta.get("close_criteria"))
+    current_close = _flatten(ticket.get("close_criteria"))
+    if not baseline_close or baseline_close == current_close:
+        return None
+
+    approved_snapshot = _flatten(ticket.get("close_criteria_drift_approved_snapshot"))
+    if approved_snapshot and approved_snapshot == current_close:
+        return None
+
+    return (
+        f"close_criteria changed since it was analyzed (commit {sha[:8]}) without a "
+        "recorded human approval — if this scope change was intentional, run "
+        "`lanegate human-review-approve <id> --rationale ...`; otherwise restore the "
+        "original close_criteria or implement it as written"
+    )
 
 
 def audit_acceptance_contract(
@@ -1454,7 +1855,9 @@ def audit_acceptance_contract(
     effective_close = (
         close_criteria if close_criteria is not None else ticket.get("close_criteria", "")
     )
-    effective_notes = change_notes if change_notes is not None else ticket.get("change_notes") or {}
+    if isinstance(effective_close, list):
+        effective_close = "\n".join(str(item) for item in effective_close)
+    effective_notes = change_notes if change_notes is not None else load_change_notes(ticket)
 
     clean_body = _strip_operational_sections(ticket.get("_body", "") or "")
     non_goals = _extract_non_goals(ticket.get("_body", "") or "")
@@ -1503,6 +1906,10 @@ def audit_acceptance_contract(
                 + suffix
             )
 
+    drift_finding = _close_criteria_drift_finding(ticket, repo_root)
+    if drift_finding:
+        findings.append(drift_finding)
+
     return AcceptanceContractAudit(
         ok=not findings,
         findings=findings,
@@ -1513,7 +1920,7 @@ def audit_acceptance_contract(
 
 
 # ---------------------------------------------------------------------------
-# Per-criterion verification (TICK-283)
+# Per-criterion verification
 # ---------------------------------------------------------------------------
 #
 # Distinct from AcceptanceContractAudit above: that audit checks whether a
@@ -1703,15 +2110,65 @@ def verify_acceptance_criteria(
 # ---------------------------------------------------------------------------
 
 
+_ACTIVE_CONTROL_PLANE_BUDGET_BYTES = 4000
+
+
+def _active_control_plane_ticket_context(
+    ticket: dict, tickets_dir: Path, cfg: dict | None = None,
+) -> str:
+    """Describe active LaneGate touches the analyzer must plan around.
+
+    The overlap gate runs after the model proposes touches, so this bounded
+    metadata is the model's only way to name the relevant active ticket IDs.
+    """
+    if not tickets_dir.exists():
+        return ""
+    prefix = (cfg or {}).get("ticket_prefix", "TICK")
+    active: list[str] = []
+    for other in load_all_tickets(tickets_dir, prefix, cfg)[0]:
+        other_id = other.get("id")
+        if not other_id or other_id == ticket.get("id") or other.get("status") in TERMINAL_STATUSES:
+            continue
+        touches = sorted(str(path) for path in (other.get("touches") or []))
+        if touches and is_high_reasoning_ticket(other):
+            active.append(f"- {other_id} ({other.get('status', 'unknown')}): {', '.join(touches)}")
+    if not active:
+        return ""
+    # Whole-line budget, not a raw byte truncation like the sibling sections
+    # (collect_cross_ticket_change_notes etc.): a byte cutoff mid-line could
+    # silently drop the back half of a ticket's touches list, which would
+    # misrepresent that ticket's true touches to the model doing overlap
+    # detection here -- worse than omitting it entirely. When truncated, say
+    # so explicitly so the model doesn't treat a partial list as exhaustive.
+    header = "## Active control-plane tickets\n"
+    budget = _ACTIVE_CONTROL_PLANE_BUDGET_BYTES
+    kept: list[str] = []
+    used = len(header.encode("utf-8"))
+    for i, line in enumerate(active):
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if used + line_bytes > budget:
+            kept.append(
+                f"- ... {len(active) - i} more active control-plane ticket(s) omitted (over "
+                "budget) -- do not assume this list is exhaustive; check any touch you propose "
+                "explicitly rather than relying on its absence here."
+            )
+            break
+        kept.append(line)
+        used += line_bytes
+    return header + "\n".join(kept)
+
+
 def _build_prompt(
     ticket: dict, repo_root: Path, cfg: dict | None = None, *, _components: list | None = None
 ) -> str:
     from lanegate.prompts import (
         component_for,
-        get_bounded_architecture_excerpt,
+        get_bounded_shared_notes,
+        get_bounded_reference_excerpts,
         load_project_guidance,
         load_prompt_template,
         render_prompt,
+        resolve_reference_doc_paths,
     )
 
     intent = ticket.get("_body", ticket.get("title", ""))
@@ -1726,13 +2183,98 @@ def _build_prompt(
         sections.append("## Repository structure\n" + ctx.repo_structure)
 
     # Touches don't exist yet at analyze time (that's what this step is
-    # computing) -- the AST/tree-sitter symbol-hit files (falling back to
-    # importers) stand in as the "direct import/module context" relevance
-    # signal for bounding project guidance and the architecture doc (TICK-306).
-    relevant_paths = list(ctx.symbol_hits) + list(ctx.importers)
+    # computing) -- the AST/tree-sitter symbol-hit files stand in as the
+    # "direct import/module context" relevance signal for bounding project
+    # guidance and the architecture doc.
+    relevant_paths = list(ctx.symbol_hits)
+    requires_acceptance_matrix = is_high_reasoning_ticket(ticket)
 
+    shared_notes = get_bounded_shared_notes(repo_root, relevant_paths, cfg=cfg, step="analyze")
+    if shared_notes:
+        sections.append(shared_notes)
+    if _components is not None:
+        _components.append(component_for(
+            "shared-notes", ".lanegate/notes", "analyze", shared_notes,
+            reason="global-and-touch-relevant" if shared_notes else "no-relevant-notes",
+        ))
+
+    # Cross-ticket change_notes: surface what prior merged/done tickets recorded
+    # about files this ticket is likely to touch, before `touches` itself is
+    # known -- relevant_paths (the symbol-hit candidates above) stands in for
+    # candidate touches here, same as it does for project_guidance scoping.
+    cross_ticket_tickets_dir = repo_root / (cfg or {}).get("tickets_dir", ".lanegate/tickets")
+    cross_ticket_notes = collect_cross_ticket_change_notes(
+        {"id": ticket.get("id"), "touches": relevant_paths},
+        cross_ticket_tickets_dir,
+        cfg,
+        exclude_id=ticket.get("id"),
+    )
+    if cross_ticket_notes:
+        sections.append(cross_ticket_notes)
+    if _components is not None:
+        _components.append(component_for(
+            "cross-ticket-change-notes", "prior tickets.change_notes", "analyze",
+            cross_ticket_notes,
+            reason="matched-and-bounded" if cross_ticket_notes else "no-overlap",
+        ))
+
+    # find_control_plane_touch_overlaps (the actual gate, run later once
+    # touches are known) only ever fires for a high-reasoning ticket -- for
+    # any other ticket this section can never become enforceable, so showing
+    # it is pure noise (and cost) with no corresponding contract to satisfy.
+    active_control_plane_tickets = (
+        _active_control_plane_ticket_context(ticket, cross_ticket_tickets_dir, cfg)
+        if requires_acceptance_matrix
+        else ""
+    )
+    if active_control_plane_tickets:
+        sections.append(active_control_plane_tickets)
+    if _components is not None:
+        _components.append(component_for(
+            "active-control-plane-tickets", "active tickets.touches", "analyze",
+            active_control_plane_tickets,
+            reason="active-control-plane-touches" if active_control_plane_tickets else "no-active-control-plane-touches",
+        ))
+
+    # The overlap gate is evaluated (in _cmd_analyze_core) against this
+    # ticket's existing touches too, not just what the model is about to
+    # propose -- a re-analysis of an already-`open` ticket carries these
+    # forward. Unlike touches inferred from close_criteria (not known until
+    # after the model responds), existing touches ARE known now, so check
+    # them for real and tell the model exactly which active tickets they
+    # already collide with -- otherwise a collision here is unsatisfiable by
+    # any response, since the model was never told this path is even in play.
+    existing_touches = ticket.get("touches") or []
+    existing_touch_overlaps = (
+        find_control_plane_touch_overlaps(
+            {**ticket, "touches": existing_touches}, cross_ticket_tickets_dir, cfg,
+            exclude_id=ticket.get("id"),
+        )
+        if existing_touches
+        else []
+    )
+    if existing_touch_overlaps:
+        overlap_lines = "\n".join(
+            f"- {item['ticket_id']}: {', '.join(cast(list, item['paths']))}" for item in existing_touch_overlaps
+        )
+        sections.append(
+            "## Your ticket's existing touches already overlap active tickets\n"
+            f"{overlap_lines}\n"
+            "These paths are already on this ticket (carried forward) even if you don't "
+            "re-propose them yourself. overlap_review must still name every ticket ID listed "
+            "above."
+        )
+    if _components is not None:
+        _components.append(component_for(
+            "existing-touch-overlaps", "ticket.touches x active tickets", "analyze",
+            "\n".join(f"{item['ticket_id']}: {', '.join(cast(list, item['paths']))}" for item in existing_touch_overlaps),
+            reason="existing-touches-overlap" if existing_touch_overlaps else "no-existing-touch-overlap",
+        ))
+
+    ref_doc_paths = resolve_reference_doc_paths(repo_root, cfg)
     project_guidance = load_project_guidance(
-        repo_root, cfg, step="analyze", relevant_paths=relevant_paths
+        repo_root, cfg, step="analyze", relevant_paths=relevant_paths,
+        exclude_paths=ref_doc_paths or None,
     )
     if project_guidance:
         sections.append(project_guidance)
@@ -1743,13 +2285,23 @@ def _build_prompt(
             reason=sections_component_reason,
         ))
 
-    arch_excerpt, arch_component = get_bounded_architecture_excerpt(
+    ref_excerpt, ref_components = get_bounded_reference_excerpts(
         repo_root, relevant_paths, cfg=cfg, step="analyze"
     )
-    if arch_excerpt:
-        sections.append(arch_excerpt)
+    if ref_excerpt:
+        sections.append(ref_excerpt)
     if _components is not None:
-        _components.append(arch_component)
+        _components.extend(ref_components)
+
+    candidate_skeletons_text = _build_candidate_skeletons(relevant_paths, repo_root)
+    if candidate_skeletons_text:
+        sections.append(candidate_skeletons_text)
+    if _components is not None:
+        _components.append(component_for(
+            "candidate-skeletons", "stdlib ast (per-file signatures)", "analyze",
+            candidate_skeletons_text,
+            reason="matched-and-bounded" if candidate_skeletons_text else "no-candidate-files",
+        ))
 
     sections += [
         "## Symbol matches (AST / code-index search)\n"
@@ -1776,7 +2328,7 @@ def _build_prompt(
         _components.append(component_for("ticket-intent", "ticket.title + ticket._body", "analyze", intent))
 
     template = load_prompt_template("analyze", repo_root)
-    return render_prompt(
+    prompt = render_prompt(
         template,
         context_sections=context_sections,
         repo_structure=repo_structure_text,
@@ -1786,7 +2338,36 @@ def _build_prompt(
         ticket_id=ticket["id"],
         title=ticket.get("title", ""),
         intent=intent,
+        requires_acceptance_matrix=str(requires_acceptance_matrix).lower(),
     )
+    # A project override may predate the structured high-risk contract and
+    # omit its placeholder. The gate below is still mandatory, so append the
+    # required response shape outside the override instead of making a valid
+    # high-risk analysis impossible with no explanation.
+    if requires_acceptance_matrix:
+        prompt += (
+            "\n\n## Required high-risk response contract\n"
+            "Return acceptance_matrix with non-empty invariants, adversarial_cases, "
+            "compatibility_cases, and regression_tests lists. This requirement applies "
+            "even when the project uses a custom analyze prompt.\n"
+        )
+    # Same portability gap for the sibling overlap gate: an override lacking
+    # {{ context_sections }} drops the "Active control-plane tickets" listing
+    # above too, but the gate is unconditional whenever this ticket's touches
+    # turn out to overlap one of those tickets. Without this, the model has
+    # no way to learn overlap_review's shape and every retry fails identically
+    # until the other ticket reaches a terminal status.
+    if active_control_plane_tickets:
+        prompt += (
+            "\n\n## Required control-plane overlap response contract\n"
+            "If your proposed touches overlap any ticket listed under 'Active control-plane "
+            "tickets' above, return overlap_review as a mapping with mode ('dependencies' or "
+            "'stacked_review') and a non-empty ticket_ids list naming every overlapping ticket "
+            "ID. If mode is 'dependencies', those same ticket IDs must also appear in "
+            "depends_on. This requirement applies even when the project uses a custom analyze "
+            "prompt.\n"
+        )
+    return prompt
 
 
 def describe_analyze_payload(ticket: dict, repo_root: Path, cfg: dict | None = None) -> list[dict]:
@@ -1795,8 +2376,8 @@ def describe_analyze_payload(ticket: dict, repo_root: Path, cfg: dict | None = N
     and whether it's always injected or selected because of the ticket.
 
     Component metadata only; never includes the ticket's actual title/body/
-    intent text, so this is safe to log or display by default (TICK-306
-    payload audit).
+    intent text, so this is safe to log or display by default (payload
+    audit).
     """
     components: list = []
     _build_prompt(ticket, repo_root, cfg, _components=components)
@@ -1808,20 +2389,57 @@ def describe_analyze_payload(ticket: dict, repo_root: Path, cfg: dict | None = N
 # ---------------------------------------------------------------------------
 
 
+def _find_json_object(text: str) -> str | None:
+    """Return the span of the first balanced {...} object in text, or None.
+
+    A greedy first-{-to-last-} regex breaks whenever the model appends any
+    trailing content that itself contains braces (a follow-up example, a
+    second illustrative snippet); it silently absorbs that tail into the
+    match, and json.loads then fails with a misleading "Extra data" error
+    pointing well past the real object. Track string/escape state so braces
+    inside string values don't perturb the depth count.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _parse_response(text: str) -> dict:
     """Extract the JSON object from the model response."""
+    # Strip thinking/reasoning blocks emitted by models (e.g. Qwen, DeepSeek-R1)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
     # Strip markdown code fences if present
     text = re.sub(r"```(?:json)?\s*", "", text).strip()
     text = text.rstrip("`").strip()
-    # Find first { ... } block
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
+    span = _find_json_object(text)
+    if span is None:
         raise ValueError(f"No JSON object found in model response:\n{text[:400]}")
     # strict=False tolerates literal control characters (e.g. a raw newline)
     # inside a string value -- smaller/local models routinely hard-wrap long
     # string values instead of escaping the break, which is otherwise a hard
     # parse failure despite the JSON being structurally well-formed.
-    return json.loads(m.group(0), strict=False)
+    return json.loads(span, strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1837,6 +2455,7 @@ def _cmd_analyze_core(
     model_fn=None,
     keep_draft: bool = False,
     visibility: _AnalysisVisibility,
+    pool_name: str | None = None,
 ) -> None:
     """Analyze a draft ticket: populate touches + close_criteria.
 
@@ -1847,8 +2466,11 @@ def _cmd_analyze_core(
         keep_draft: when True, leave status as draft after populating touches
             (used by `lanegate create` so the user can review before the ticket
             enters the work queue).
+        pool_name: name of a `pools:` entry to draw the analyze
+            executor from, overriding the ticket's routed/default pool — the
+            same override `orchestrate --pool` applies to implement/review/fix.
     """
-    from lanegate.config import resolve_model as _resolve_model
+    from lanegate.config import resolve_model as _resolve_model, validate_model_for_executor
 
     tid = canonical_id(ticket_id)
     tickets_dir = repo_root / cfg["tickets_dir"]
@@ -1880,24 +2502,54 @@ def _cmd_analyze_core(
         resolve_driver as _resolve_driver,
     )
 
-    def resolve_analyze_driver(excluded: set[str] | None = None) -> tuple[str, dict, str, str | None]:
+    def resolve_analyze_driver(
+        excluded: set[str] | None = None, pool_name: str | None = None
+    ) -> tuple[str, dict, str, str | None]:
         driver_name = resolve_pool_executor(
             "analyze",
             ticket,
             cfg,
             repo_root,
+            pool_name=pool_name,
             excluded=excluded,
             healthy_only=bool(excluded),
         )
         if driver_name is None:
-            raise RuntimeError("no healthy pool sibling is available for analyze")
+            raise RuntimeError(
+                "no healthy pool sibling is available for analyze: every executor in "
+                "this ticket's executor pool is cooling down from a prior rate limit "
+                "or failure, so none can be dispatched right now; run "
+                "`lanegate executor status` to see which instance(s) are cooling down "
+                "and when they'll recover, then retry `lanegate analyze <id>`"
+            )
+        from lanegate.executor import get_executor_config as _get_executor_config
+
         driver_cfg = _expand_driver(driver_name, cfg)
         executor = driver_cfg.get("type", driver_name)
         effective_cfg = dict(cfg, executor=executor) if executor != cfg.get("executor") else cfg
-        model = driver_cfg.get("model") or _resolve_model(effective_cfg, "analyze")
+        analyze_model_override = driver_cfg.get("model")
+        model = analyze_model_override or _resolve_model(effective_cfg, "analyze", ticket=ticket)
+        if model:
+            # `executor` here can be a named `executors:` instance (e.g.
+            # "aider-ollama-14b"), not a resolved driver type -- validating
+            # against it directly matches no branch in
+            # validate_model_for_executor and silently no-ops. Resolve the
+            # actual type (and provider) the same way review/pool dispatch
+            # do, and validate regardless of whether the model came from a
+            # driver-level override or resolve_model's fallback chain.
+            resolved_executor_cfg = _get_executor_config(executor, effective_cfg)
+            resolved_type = resolved_executor_cfg.get("type", executor)
+            validate_model_for_executor(
+                model,
+                resolved_type,
+                "models.analyze",
+                provider=resolved_executor_cfg.get("provider") or driver_cfg.get("provider"),
+            )
         return driver_name, driver_cfg, executor, model
 
-    analyze_driver_name, analyze_driver_cfg, analyze_executor, analyze_model = resolve_analyze_driver()
+    analyze_driver_name, analyze_driver_cfg, analyze_executor, analyze_model = resolve_analyze_driver(
+        pool_name=pool_name
+    )
     visibility.set_driver(analyze_executor, analyze_model)
     implement_driver_name = _resolve_driver("implement", ticket, cfg)
     implement_driver_cfg = _expand_driver(implement_driver_name, cfg)
@@ -1919,6 +2571,8 @@ def _cmd_analyze_core(
                 executor=analyze_executor,
                 cfg=cfg,
                 driver_cfg=analyze_driver_cfg,
+                repo_root=repo_root,
+                tid=tid,
             )
 
     # Build prompt and call model. Analyze is read-only, so unlike implement
@@ -1945,19 +2599,46 @@ def _cmd_analyze_core(
         while True:
             try:
                 raw, analyze_session_id = call_model(prompt)
+                _clear_analyze_failure_streak(repo_root, analyze_driver_name)
                 break
             except RuntimeError as exc:
+                # Classify against the executor's raw output, never the
+                # display message — see ExecutorCallError. Plain RuntimeErrors
+                # from other paths carry nothing raw, so fall back to str(exc).
+                raw_stdout = getattr(exc, "raw_stdout", "")
+                raw_stderr = getattr(exc, "raw_stderr", "") or str(exc)
+                is_rate_limited = _is_rate_limit(
+                    1, repo_root, captured_stdout=raw_stdout, captured_stderr=raw_stderr
+                )
+                if model_fn is None and not is_rate_limited:
+                    failure_count = _record_analyze_failure(
+                        repo_root, analyze_driver_name, raw_stdout, raw_stderr
+                    )
+                    if failure_count == _ANALYZE_FAILURE_COOLDOWN_THRESHOLD:
+                        # Keep this reason independent of the raw error text:
+                        # write_cooldown intentionally discards known terminal
+                        # request/configuration errors, while this bounded
+                        # routing cooldown must apply to any repeated failure.
+                        _write_executor_cooldown(
+                            repo_root,
+                            analyze_driver_name,
+                            "analyze executor failed consecutive non-rate-limit calls",
+                        )
+                elif is_rate_limited:
+                    _clear_analyze_failure_streak(repo_root, analyze_driver_name)
                 if (
                     model_fn is not None
                     or attempts >= max_retries
-                    or not _is_rate_limit(1, repo_root, captured_stderr=str(exc))
+                    or not is_rate_limited
                 ):
                     raise
-                reason = _rate_limit_reason(1, repo_root, captured_stderr=str(exc))
+                reason = _rate_limit_reason(
+                    1, repo_root, captured_stdout=raw_stdout, captured_stderr=raw_stderr
+                )
                 _write_executor_cooldown(repo_root, analyze_driver_name, reason, retry_after=reason)
                 excluded.add(analyze_driver_name)
                 sibling_name, sibling_cfg, sibling_executor, sibling_model = resolve_analyze_driver(
-                    excluded
+                    excluded, pool_name=pool_name
                 )
                 if sibling_name == analyze_driver_name:
                     raise
@@ -1993,11 +2674,59 @@ def _cmd_analyze_core(
         print(f"Raw response:\n{raw[:600]}", file=sys.stderr)
         sys.exit(1)
 
+    already_resolved = bool(result.get("already_resolved"))
+    already_resolved_reason = (result.get("already_resolved_reason") or "").strip()
+
+    if already_resolved:
+        if not already_resolved_reason:
+            print(
+                "ERROR: model returned already_resolved=true with no reason; ticket left as draft",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        body = ticket.get("_body") or ""
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += (
+            "\n## Needs Review Reason\n"
+            "analyze: ticket premise appears already resolved in current code — "
+            f"{already_resolved_reason}\n"
+        )
+        ticket["_body"] = body
+        ticket["status"] = "needs_review"
+        ticket["review_summary"] = f"already_resolved: {already_resolved_reason}"
+        ticket["status_changed_at"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        write_ticket(ticket)
+        if cfg.get("commit_status_changes", True):
+            subprocess.run(
+                ["git", "add", "-f", str(ticket["_path"])],
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-s", "--only", str(ticket["_path"]), "-m", f"chore: {tid} analyzed — flagged already_resolved (needs_review)"],
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+            )
+        print(f"{tid}: analyze believes this is already resolved — status set to needs_review", file=sys.stderr)
+        print(f"  reason: {already_resolved_reason}", file=sys.stderr)
+        print(
+            f"  next: verify, then `lanegate supersede {tid} --reason ...` to close, "
+            f"or re-run `lanegate analyze {tid}` if the model is wrong",
+            file=sys.stderr,
+        )
+        visibility.emit("analysis_complete", f"Analysis complete for {tid} (already_resolved)")
+        sys.exit(0)
+
     touches = result.get("touches")
     close_criteria = result.get("close_criteria", "").strip()
     depends_on = result.get("depends_on") or []
     change_notes = result.get("change_notes") or {}
     model = result.get("model")
+    acceptance_matrix = result.get("acceptance_matrix")
+    overlap_review = result.get("overlap_review")
 
     if not touches or not isinstance(touches, list):
         print(
@@ -2016,6 +2745,21 @@ def _cmd_analyze_core(
             merged_touches.append(path)
             touches_set.add(path)
 
+    # The control-plane overlap gate below is evaluated against this
+    # snapshot, not the fully-augmented merged_touches: infer_touches_from_
+    # criteria and companion_docs_from_criteria (next two blocks) only run
+    # *after* this point, using the model's own close_criteria it just
+    # returned, so a path either of them adds could never have been shown to
+    # or asked about by the model that already responded. Gating on a path
+    # the model could not possibly have declared in overlap_review makes the
+    # ticket permanently unanalyzable -- every retry regenerates the
+    # identical augmented path from the identical close_criteria. Existing
+    # touches (carried forward from a prior draft, e.g. re-analysis) ARE
+    # known before the prompt is built and are surfaced there instead (see
+    # _build_prompt's "existing touches already overlap" section), so they
+    # stay in the gate.
+    model_visible_touches = list(merged_touches)
+
     # Augment touches with files statically implied by close_criteria + title.
     # Do NOT include _body: background prose ("lanegate board is broken") would
     # inject false file references for things the fix never touches.
@@ -2026,30 +2770,118 @@ def _cmd_analyze_core(
             merged_touches.append(path)
             touches_set.add(path)
 
-    # Augment touches with companion docs implied by close_criteria + title (TICK-253).
-    companion_docs = companion_docs_from_criteria(scan_text, repo_root)
+    # Augment touches with companion docs implied by close_criteria + title.
+    companion_docs = companion_docs_from_criteria(scan_text, repo_root, cfg)
     for path in companion_docs:
         if path not in touches_set:
             merged_touches.append(path)
             touches_set.add(path)
 
     # Drop touches carried forward from an earlier draft that reference a
-    # directory since renamed/moved/promoted by a merged ticket (TICK-269) —
+    # directory since renamed/moved/promoted by a merged ticket —
     # a stale entry only misleads the executor, which ends up implementing
     # under the real current path and getting blocked by the touches-guard
     # for a path analyze never declared.
+    basename_corrections = correct_touches_by_basename(merged_touches, repo_root)
+    if basename_corrections:
+        # Two declared paths can share a basename and correct to the same
+        # real file (or a correction can collide with an already-present
+        # correct entry) -- dedupe post-correction, not just the pre-
+        # correction list, or the ticket ends up with a repeated touch.
+        merged_touches = list(
+            dict.fromkeys(basename_corrections.get(p, p) for p in merged_touches)
+        )
+        model_visible_touches = list(
+            dict.fromkeys(basename_corrections.get(p, p) for p in model_visible_touches)
+        )
+        for old, new in basename_corrections.items():
+            print(
+                f"WARNING: {tid}: corrected touches: '{old}' does not exist; "
+                f"using '{new}' (unique basename match in the repo)",
+                file=sys.stderr,
+            )
+
     stale_touches = validate_touched_paths(existing_touches, repo_root)
     if stale_touches:
         merged_touches = [p for p in merged_touches if p not in stale_touches]
+        model_visible_touches = [p for p in model_visible_touches if p not in stale_touches]
         print(
             f"WARNING: {tid}: dropping stale touches no longer present in repo "
             f"(directory renamed/moved/promoted?): {', '.join(stale_touches)}",
             file=sys.stderr,
         )
 
+    control_plane_overlaps = find_control_plane_touch_overlaps(
+        {**ticket, "id": tid, "touches": model_visible_touches}, tickets_dir, cfg, exclude_id=tid
+    )
+    requires_acceptance_matrix = is_high_reasoning_ticket(ticket)
+    if requires_acceptance_matrix:
+        matrix_errors = validate_acceptance_matrix(acceptance_matrix, required=True)
+        if matrix_errors:
+            print(f"ERROR: {'; '.join(matrix_errors)}; ticket left as draft", file=sys.stderr)
+            sys.exit(1)
+    elif acceptance_matrix is not None and validate_acceptance_matrix(acceptance_matrix):
+        print(
+            f"WARNING: {tid}: discarding malformed optional acceptance_matrix from analyzer output",
+            file=sys.stderr,
+        )
+        acceptance_matrix = None
+    if control_plane_overlaps:
+        overlap_ids = {str(item["ticket_id"]) for item in control_plane_overlaps}
+        overlap_detail = "; ".join(
+            f"{item['ticket_id']} ({', '.join(cast(list, item['paths']))})" for item in control_plane_overlaps
+        )
+        review_errors = validate_overlap_review(overlap_review)
+        if review_errors:
+            print(
+                f"ERROR: active control-plane overlaps require a plan: {'; '.join(review_errors)} "
+                f"— overlapping ticket(s): {overlap_detail}; ticket left as draft",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        assert isinstance(overlap_review, dict)
+        declared_ids = set(overlap_review["ticket_ids"])
+        if not overlap_ids.issubset(declared_ids):
+            missing = overlap_ids - declared_ids
+            missing_detail = "; ".join(
+                f"{item['ticket_id']} ({', '.join(cast(list, item['paths']))})"
+                for item in control_plane_overlaps
+                if str(item["ticket_id"]) in missing
+            )
+            print(
+                "ERROR: active control-plane overlaps require a plan: "
+                f"overlap_review.ticket_ids is missing: {missing_detail}; ticket left as draft",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if overlap_review["mode"] == "dependencies" and not overlap_ids.issubset(set(depends_on)):
+            print("ERROR: overlap_review dependencies must also appear in depends_on; ticket left as draft", file=sys.stderr)
+            sys.exit(1)
+        overlap_review = {
+            "mode": overlap_review["mode"],
+            "ticket_ids": sorted(overlap_ids),
+            "paths": {str(item["ticket_id"]): item["paths"] for item in control_plane_overlaps},
+        }
+    elif overlap_review is not None:
+        # An overlap plan is meaningful only when the trusted overlap scan
+        # found a real active collision. Never persist model-supplied optional
+        # planning metadata in the no-overlap case: it can be malformed,
+        # self-referential, or misleading trusted implementation guidance.
+        print(
+            f"WARNING: {tid}: discarding overlap_review because no active control-plane overlap exists",
+            file=sys.stderr,
+        )
+        overlap_review = None
+
     # Apply to ticket
     ticket["touches"] = merged_touches
     ticket["close_criteria"] = close_criteria
+    if acceptance_matrix is not None:
+        ticket["acceptance_matrix"] = acceptance_matrix
+    if overlap_review is not None:
+        ticket["overlap_review"] = overlap_review
+    elif not control_plane_overlaps:
+        ticket.pop("overlap_review", None)
     file_skeletons = {
         touched: _build_file_skeleton(Path(touched), repo_root) for touched in merged_touches
     }
@@ -2076,6 +2908,18 @@ def _cmd_analyze_core(
         change_notes=change_notes,
     )
     ticket["acceptance_contract_audit"] = audit.as_metadata()
+    try:
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        if head_sha:
+            ticket["analyzed_at_sha"] = head_sha
+    except (subprocess.CalledProcessError, OSError):
+        pass
     if not keep_draft:
         ticket["status"] = "open"
 
@@ -2109,18 +2953,18 @@ def _cmd_analyze_core(
             check=False,
             capture_output=True,
         )
-        result = subprocess.run(
-            ["git", "commit", "--only", str(ticket["_path"]), str(context_path), "-m", commit_msg],
+        commit_result = subprocess.run(
+            ["git", "commit", "-s", "--only", str(ticket["_path"]), str(context_path), "-m", commit_msg],
             cwd=repo_root,
             check=False,
             capture_output=True,
         )
-        if result.returncode != 0:
+        if commit_result.returncode != 0:
             # Ticket path is force-added above, but if primary commit fails for
             # any other reason (e.g. hook rejection), fall back to committing
             # just the sidecar to prevent it from being left staged.
             subprocess.run(
-                ["git", "commit", "--only", str(context_path), "-m", commit_msg],
+                ["git", "commit", "-s", "--only", str(context_path), "-m", commit_msg],
                 cwd=repo_root,
                 check=False,
                 capture_output=True,
@@ -2144,9 +2988,10 @@ def cmd_analyze(
     *,
     model_fn=None,
     keep_draft: bool = False,
+    pool_name: str | None = None,
 ) -> None:
     """Analyze a ticket while publishing bounded standalone-analysis progress."""
-    visibility = _AnalysisVisibility(repo_root)
+    visibility = _AnalysisVisibility(repo_root, canonical_id(ticket_id))
     old_sigterm = None
     can_handle_signals = threading.current_thread() is threading.main_thread()
 
@@ -2166,6 +3011,7 @@ def cmd_analyze(
             model_fn=model_fn,
             keep_draft=keep_draft,
             visibility=visibility,
+            pool_name=pool_name,
         )
     except KeyboardInterrupt:
         visibility.emit("analysis_failed", "ERROR: analysis interrupted", error=True)

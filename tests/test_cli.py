@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
 
@@ -58,6 +59,153 @@ def _run_cli(args: list[str], repo: Path):
         cli.main()
 
 
+def test_version_matches_installed_distribution_metadata(capsys):
+    from lanegate import cli
+
+    with patch("sys.argv", ["lanegate", "--version"]), pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"lanegate {version('lanegate')}"
+
+
+def test_invalid_ticket_id_exits_cleanly_instead_of_a_raw_traceback(repo, capsys):
+    """A malformed ticket_id (stray whitespace, path syntax, ...) reaching
+    canonical_id() from a CLI argument must exit(1) with a clean ERROR
+    message, not an unhandled ValueError traceback. Regression test for
+    finding [3]: cli.py had no top-level handler for this."""
+    from lanegate import cli
+
+    with (
+        patch("lanegate.cli.find_repo_root", return_value=repo),
+        patch("lanegate.cli.load_config", return_value=_CFG),
+        patch("sys.argv", ["lanegate", "start", "TICK-001 "]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "ERROR: invalid ticket ID" in capsys.readouterr().err
+
+
+# --- top-level help tiers ---
+
+
+# This is the command set before the help presentation changed.  Keep it
+# explicit so adding/removing/renaming a parser command cannot be mistaken for
+# a harmless help-group edit.
+_TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP = frozenset(
+    {
+        "analytics",
+        "analyze",
+        "api",
+        "blocked",
+        "board",
+        "claim-file",
+        "complete",
+        "close",
+        "context-stats",
+        "create",
+        "doctor",
+        "done",
+        "executor",
+        "fix",
+        "flag",
+        "gh-sync",
+        "globals",
+        "hibernate",
+        "human-review",
+        "init",
+        "install-agent-tools",
+        "install-commands",
+        "log",
+        "logs",
+        "mcp",
+        "merge",
+        "needs-review",
+        "next",
+        "notify-watch",
+        "open",
+        "orchestrate",
+        "orchestrator-lock",
+        "run",
+        "pipeline-status",
+        "projects",
+        "promote",
+        "prompts",
+        "ps",
+        "recover-rate-limited-reviews",
+        "recover-rejected",
+        "reopen",
+        "resolve-conflict",
+        "resume-watch",
+        "review",
+        "route",
+        "run-report",
+        "session-summary",
+        "start",
+        "stats",
+        "stop",
+        "summary",
+        "supersede",
+        "symbols",
+        "tui",
+        "update-docs",
+        "validate",
+        "watch",
+    }
+)
+
+
+def test_default_help_is_tiered_and_aliases_use_the_same_tiers(capsys, monkeypatch):
+    from lanegate import cli
+
+    monkeypatch.setenv("COLUMNS", "200")
+    for program_name in ("lanegate", "lgt", "lane"):
+        with patch("sys.argv", [program_name, "--help"]), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0
+        output = capsys.readouterr().out
+        assert "Common commands:" in output
+        assert "Ticket lifecycle and recovery:" in output
+        assert "Monitoring and reporting:" in output
+        assert "Setup and integration:" in output
+        assert "Agent and run tools:" in output
+        assert "--help-all" in output
+        assert "context-stats" not in output
+        assert all(len(line) <= 80 for line in output.splitlines())
+
+
+def test_help_all_lists_every_registered_top_level_command():
+    from lanegate import cli
+
+    parser = cli.build_parser()
+    with patch.object(parser, "_print_message") as print_message, pytest.raises(SystemExit) as exc:
+        parser.parse_args(["--help-all"])
+
+    assert exc.value.code == 0
+    output = print_message.call_args.args[0]
+    assert "All commands:" in output
+    for command in cli.registered_command_names(parser):
+        assert f"  {command}" in output
+
+
+def test_tiered_help_keeps_the_existing_command_set_and_catches_unassigned_commands():
+    from lanegate import cli
+
+    parser = cli.build_parser()
+    assert cli.registered_command_names(parser) == _TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP
+    # context-stats is intentionally hidden by argparse.SUPPRESS.  Any newly
+    # registered, ungrouped command makes this equality fail until assigned.
+    assert cli.unassigned_command_names(parser) == cli.HIDDEN_TOP_LEVEL_COMMANDS
+
+    # Every pre-existing name remains parseable with its per-command help.
+    for command in _TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP:
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args([command, "--help"])
+        assert exc.value.code == 0
+
+
 # --- lanegate create --no-analyze ---
 
 
@@ -81,6 +229,32 @@ def test_create_no_analyze_does_not_call_model(repo):
         mock_analyze.assert_not_called()
 
 
+def test_create_accepts_explicit_board_title_and_autonomy(repo):
+    title = "Preserve this complete board title instead of deriving one from the intent"
+    _run_cli(
+        [
+            "create",
+            "A much longer implementation description that should stay in the body.",
+            "--title",
+            title,
+            "--autonomy",
+            "full",
+            "--no-analyze",
+        ],
+        repo,
+    )
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["title"] == title
+    assert ticket["autonomy"] == "full"
+
+
+def test_create_autonomy_flag(repo):
+    _run_cli(["create", "Escalate credentials handling", "--autonomy", "red", "--no-analyze"], repo)
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["autonomy"] == "red"
+
+
 # --- lanegate create (default: runs analyze) ---
 
 
@@ -100,6 +274,64 @@ def test_create_default_prints_both_id_and_analysis(repo, capsys):
     out = capsys.readouterr().out
     assert "TICK-" in out
     assert "touches populated" in out
+
+
+# --- lanegate context-stats --compare (DB-backed, real executor attribution) ---
+
+
+def test_context_stats_compare_cli_resolves_executor_from_step_costs(repo, capsys):
+    """The real CLI path (lanegate context-stats --compare) must route through
+    step_costs, not just _print_compare called directly with a hand-built
+    step_costs list. TICK-549 review caught that a naive revert of the
+    cli.py wiring (moving the step_costs load back below the --compare
+    early return) would leave every unit test on _print_compare green while
+    silently regressing the actual DB-backed --compare output back to the
+    analytics table's wrong per-ticket executor guess."""
+    from lanegate.context_log import _get_default_db_path, _get_project_id, _upsert_row, log_step_cost
+
+    db_path = _get_default_db_path()
+    project = _get_project_id(repo)
+    # analytics table: the static per-ticket guess, wrong (mirrors the
+    # production bug this ticket exists to fix).
+    _upsert_row(
+        db_path, project,
+        {"ticket_id": "TICK-1", "executor": "codex", "timestamp": "2026-06-20T10:00:00Z"},
+    )
+    # step_costs: the real executor that actually ran this ticket's implement step.
+    log_step_cost(db_path, project, "TICK-1", "implement", executor="claude-b", cost_usd=0.05)
+    # A second ticket genuinely run by codex, with no step_costs row -- the
+    # analytics table's guess is trusted here (correctly, since it's right).
+    _upsert_row(
+        db_path, project,
+        {"ticket_id": "TICK-2", "executor": "codex", "timestamp": "2026-06-20T10:00:00Z"},
+    )
+
+    _run_cli(["context-stats", "--compare"], repo)
+    out = capsys.readouterr().out
+
+    assert "claude-b" in out
+    assert "codex" in out
+    # TICK-1 must be bucketed under claude-b, not codex.
+    codex_line = next(line for line in out.splitlines() if line.startswith("codex"))
+    assert codex_line.split()[1] == "1"
+
+
+def test_create_prints_next_step_hint_when_auto_analyze_fails(repo, capsys):
+    with patch("lanegate.analyze.cmd_analyze", side_effect=SystemExit(1)):
+        _run_cli(["create", "Build a login page"], repo)
+    out = capsys.readouterr()
+    assert "TICK-001" in out.out
+    assert "TICK-001 left in draft — run `lanegate analyze TICK-001`" in out.err
+    assert "analyze skipped:" in out.err
+
+
+def test_create_reraises_keyboard_interrupt_from_auto_analyze(repo, capsys):
+    with patch("lanegate.analyze.cmd_analyze", side_effect=SystemExit(130)):
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cli(["create", "Build a login page"], repo)
+    assert exc_info.value.code == 130
+    err = capsys.readouterr().err
+    assert "left in draft" not in err
 
 
 # --- lanegate analyze (standalone) ---
@@ -264,6 +496,36 @@ def test_stop_reason_and_grace_seconds_are_passed_through(repo):
         )
 
 
+def test_cli_human_review_parser(repo):
+    with patch("lanegate.lifecycle.cmd_human_review_approve") as mock_approve:
+        _run_cli(
+            ["human-review", "TICK-001", "--rationale", "Manually inspected the diff; safe."],
+            repo,
+        )
+        mock_approve.assert_called_once_with(
+            "TICK-001", _CFG, repo, rationale="Manually inspected the diff; safe."
+        )
+
+
+def test_cli_human_review_requires_rationale_flag(repo, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _run_cli(["human-review", "TICK-001"], repo)
+    assert exc.value.code != 0
+    assert "--rationale" in capsys.readouterr().err
+
+
+def test_cli_human_review_code_complete_changes_requested(repo):
+    """Verify CLI dispatches human-review with rationale for a code_complete ticket with changes_requested."""
+    with patch("lanegate.lifecycle.cmd_human_review_approve") as mock_approve:
+        _run_cli(
+            ["human-review", "TICK-001", "--rationale", "Dismissing false-positive review finding."],
+            repo,
+        )
+        mock_approve.assert_called_once_with(
+            "TICK-001", _CFG, repo, rationale="Dismissing false-positive review finding."
+        )
+
+
 def test_install_commands_copies_skills_to_lanegate_subdir(tmp_path, capsys):
     from lanegate import cli
 
@@ -281,6 +543,7 @@ def test_install_commands_copies_skills_to_lanegate_subdir(tmp_path, capsys):
     assert dest.is_dir(), ".claude/commands/lanegate/ was not created"
     installed = {p.name for p in dest.glob("*.md")}
     assert "implement.md" in installed
+    assert "run.md" in installed
     assert "orchestrate.md" in installed
     assert "tickets.md" in installed
     out = capsys.readouterr().out
@@ -308,6 +571,7 @@ def test_install_agent_tools_writes_claude_and_codex_configs(tmp_path, capsys):
 
     claude_dir = tmp_path / ".claude" / "commands" / "lanegate"
     assert (claude_dir / "implement.md").exists()
+    assert (claude_dir / "run.md").exists()
     assert (claude_dir / "orchestrate.md").exists()
 
     codex_config = tmp_path / ".codex" / "mcp" / "lanegate.json"
@@ -568,8 +832,8 @@ def test_executor_reset_all_clears_every_cooldown_file(repo):
 # --- orchestrate --status ---
 
 
-def test_orchestrate_status_reports_active_ticket(repo, capsys):
-    """lanegate orchestrate --status reports active ticket, executor PID, elapsed time, log path."""
+def test_run_status_reports_active_ticket(repo, capsys):
+    """lanegate run --status reports active ticket, executor PID, elapsed time, log path."""
     import time
 
     # Create an active status
@@ -596,7 +860,7 @@ def test_orchestrate_status_reports_active_ticket(repo, capsys):
 
     with patch("lanegate.cli.find_repo_root", return_value=repo), patch(
         "lanegate.cli.load_config", return_value=_CFG
-    ), patch("sys.argv", ["lanegate", "orchestrate", "--status"]):
+    ), patch("lanegate.pidutil.pid_alive", return_value=True), patch("sys.argv", ["lanegate", "run", "--status"]):
         _write_active_status(repo, status)
         from lanegate import cli
 
@@ -610,7 +874,7 @@ def test_orchestrate_status_reports_active_ticket(repo, capsys):
     assert "/repo/.lanegate/executor-runs/TICK-055/session" in out
 
 
-def test_orchestrate_status_json_includes_audit_bundle_path(repo, capsys):
+def test_run_status_json_includes_audit_bundle_path(repo, capsys):
     import json
 
     from lanegate.orchestrate import _write_active_status
@@ -629,7 +893,7 @@ def test_orchestrate_status_json_includes_audit_bundle_path(repo, capsys):
     )
     with patch("lanegate.cli.find_repo_root", return_value=repo), patch(
         "lanegate.cli.load_config", return_value=_CFG
-    ), patch("sys.argv", ["lanegate", "--json", "orchestrate", "--status"]):
+    ), patch("sys.argv", ["lanegate", "--json", "run", "--status"]):
         from lanegate import cli
 
         cli.main()
@@ -638,11 +902,11 @@ def test_orchestrate_status_json_includes_audit_bundle_path(repo, capsys):
     assert data["audit_bundle_path"] == "/repo/.lanegate/executor-runs/TICK-055/session"
 
 
-def test_orchestrate_status_no_active_run(repo, capsys):
-    """lanegate orchestrate --status reports when no orchestration is active."""
+def test_run_status_no_active_run(repo, capsys):
+    """lanegate run --status reports when no run is active."""
     with patch("lanegate.cli.find_repo_root", return_value=repo), patch(
         "lanegate.cli.load_config", return_value=_CFG
-    ), patch("sys.argv", ["lanegate", "orchestrate", "--status"]):
+    ), patch("sys.argv", ["lanegate", "run", "--status"]):
         from lanegate import cli
 
         cli.main()
@@ -715,6 +979,69 @@ def test_logs_open_with_missing_viewer_exits(repo):
     assert "not installed" in str(exc.value)
 
 
+def test_logs_line_style_prevents_false_positives():
+    from lanegate.logs import _line_style, semantic_line_metadata
+
+    bullet_line_1 = "- HTTP 429 rate limit retry"
+    bullet_line_2 = "  - HTTP 429 rate limit retry"
+    checklist_line = "- [ ] checklist item"
+
+    assert _line_style(bullet_line_1) != "red"
+    assert _line_style(bullet_line_2) != "red"
+    assert _line_style(checklist_line) != "red"
+    assert semantic_line_metadata(bullet_line_1)["level"] != "error"
+    assert semantic_line_metadata(bullet_line_2)["level"] != "error"
+    assert semantic_line_metadata(checklist_line)["level"] != "error"
+
+    prose_merged = "PR #123 was merged into main"
+    prose_passed = "The test passed after retry"
+    prose_merged_reverted = "The PR was merged, then reverted"
+    prose_no_passed = "No tests passed."
+    identifier_approved = "downgrade_approved_review_to_needs_review"
+
+    assert _line_style(prose_merged) != "green"
+    assert _line_style(prose_passed) != "green"
+    assert _line_style(prose_merged_reverted) != "green"
+    assert _line_style(prose_no_passed) != "green"
+    assert _line_style(identifier_approved) != "green"
+    assert semantic_line_metadata(prose_merged)["level"] != "success"
+    assert semantic_line_metadata(prose_passed)["level"] != "success"
+    assert semantic_line_metadata(prose_merged_reverted)["level"] != "success"
+    assert semantic_line_metadata(prose_no_passed)["level"] != "success"
+    assert semantic_line_metadata(identifier_approved)["level"] != "success"
+
+    assert _line_style("-def foo():") == "red"
+    assert _line_style("+def foo():") == "green"
+    assert _line_style("-    return value") == "red"
+    assert _line_style("+    return value") == "green"
+    assert _line_style("verdict: approved") == "green"
+
+    # Regression: bullets with two-space or tab indentation must not be
+    # mistaken for diff-deletion lines (review attempt 2, finding [2]).
+    bullet_two_space = "-  HTTP 429 rate limit retry"
+    bullet_tab = "-\tHTTP 429 rate limit retry"
+    assert _line_style(bullet_two_space) != "red"
+    assert _line_style(bullet_tab) != "red"
+    assert semantic_line_metadata(bullet_two_space)["level"] != "error"
+    assert semantic_line_metadata(bullet_tab)["level"] != "error"
+
+    # Regression: a colon-prefixed keyword followed by more prose must not
+    # be treated as a standalone status line (review attempt 2, finding [1]).
+    prose_state_merged_reverted = "The PR state: merged, then reverted"
+    assert _line_style(prose_state_merged_reverted) != "green"
+    assert semantic_line_metadata(prose_state_merged_reverted)["level"] != "success"
+
+
+def test_semantic_line_metadata_protocol_scalars():
+    from lanegate.logs import semantic_line_metadata
+
+    for scalar in ("42", "null", '"foo"', "-1"):
+        assert semantic_line_metadata(scalar)["kind"] == "executor"
+
+    for protocol_line in ('{"type":"item.started"}', "[1, 2, 3]"):
+        assert semantic_line_metadata(protocol_line)["kind"] == "protocol"
+
+
 # ── UTF-8 output hardening (Windows cp1252 regression) ────────────────────────
 
 
@@ -743,3 +1070,51 @@ def test_force_utf8_output_lets_glyphs_print_on_legacy_codepage():
         sys.stdout, sys.stderr = real_stdout, real_stderr
 
     assert "✓ done" in raw.getvalue().decode("utf-8")
+
+
+def test_run_command_and_lane_alias(repo):
+    """Assert lane script entrypoint exists in pyproject.toml and both 'run' and 'orchestrate' invoke cmd_orchestrate."""
+    import tomllib
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    assert "lane" in data["project"]["scripts"]
+    assert data["project"]["scripts"]["lane"] == "lanegate.cli:main"
+
+    for subcmd in ["run", "orchestrate"]:
+        with patch("lanegate.orchestrate.cmd_orchestrate") as mock_cmd:
+            _run_cli([subcmd], repo)
+            assert mock_cmd.called, f"Expected cmd_orchestrate to be called for subcommand '{subcmd}'"
+
+
+def test_orchestrate_executors_flag_parses_comma_list(repo):
+    with patch("lanegate.orchestrate.cmd_orchestrate") as mock_cmd:
+        _run_cli(["run", "--executors", "agy,claude-b"], repo)
+        assert mock_cmd.called
+        assert mock_cmd.call_args.kwargs["executors"] == ["agy", "claude-b"]
+        assert mock_cmd.call_args.kwargs["pool"] is None
+
+
+def test_help_all_labels_orchestrate_as_a_compatibility_command():
+    from lanegate import cli
+
+    parser = cli.build_parser()
+    with patch.object(parser, "_print_message") as print_message, pytest.raises(SystemExit) as exc:
+        parser.parse_args(["--help-all"])
+
+    assert exc.value.code == 0
+    output = print_message.call_args.args[0]
+    assert "run                            Clear the ticket board" in output
+    assert "orchestrate                    Compatibility command" in output
+
+
+def test_cli_help_text_includes_direct_action_tracking():
+    from lanegate import cli
+
+    parser = cli.build_parser()
+    commands = next(action.choices for action in parser._actions if isinstance(getattr(action, "choices", None), dict))
+    assert "direct action IDs" in commands["ps"].format_help()
+    fix_parser = commands["fix"]
+    assert "stable action ID" in fix_parser.format_help()

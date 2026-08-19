@@ -4,15 +4,18 @@ lanegate/orchestrate/run_report.py — durable run-event log and CLI status repo
 Extracted from orchestrate.py (TICK-255/TICK-271..274): the durable per-run
 event log (append/load/path helpers, last-run pointer, session-ts
 resolution), live lanegate-spawned process enumeration, `lanegate ps`,
-`build_run_report`/`lanegate run-report`, `lanegate orchestrate-status`, and the
+`build_run_report`/`lanegate run-report`, `lanegate run --status`, and the
 subprocess-streaming helper used by executor dispatch.
 """
 
 from __future__ import annotations
 
 import datetime
+import contextlib
+import contextvars
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -27,6 +30,7 @@ from lanegate.concurrency import orchestrator_lock_status
 from lanegate.config import resolve_executor_route
 from lanegate.executor import get_executor_config
 from lanegate.executor_events import ExecutorEvent, redact_transcript_text
+from lanegate.logs import semantic_line_metadata
 from lanegate.orchestrate.run_summary import (
     RunReason,
     RunSummary,
@@ -53,6 +57,14 @@ from .status import _format_elapsed, _normalize_active_status
 
 _RUN_EVENTS_SUFFIX = ".events.jsonl"
 _LAST_RUN_POINTER = "last-run.json"
+_SESSION_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\Z")
+_API_RUN_ID_RE = re.compile(r"run-\d{8}T\d{6}Z-[0-9a-f]{8}\Z")
+_DIRECT_ACTION_SUPPRESSED = contextvars.ContextVar("direct_action_suppressed", default=False)
+# Context variables do not cross process boundaries.  Executor processes may
+# invoke ``lanegate review``/``fix`` themselves, so the orchestrator passes
+# this marker to distinguish those nested lifecycle calls from a command an
+# operator started directly in their shell.
+INTERNAL_RUN_ENV = "LANEGATE_INTERNAL_RUN"
 
 
 def _terminate_process_tree(proc: subprocess.Popen[str], *, grace_seconds: float = 2.0) -> None:
@@ -105,6 +117,57 @@ def _run_events_path(repo_root: Path, session_ts: str) -> Path:
     return logs_dir / f"orchestrate-{session_ts}{_RUN_EVENTS_SUFFIX}"
 
 
+def _action_events_path(repo_root: Path, action_id: str) -> Path:
+    """Return the durable event stream for one direct CLI/MCP action."""
+    logs_dir = repo_root / ".lanegate" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = action_id if action_id.startswith("action-") else f"action-{action_id}"
+    return logs_dir / f"{safe_id}{_RUN_EVENTS_SUFFIX}"
+
+
+def begin_direct_action(
+    repo_root: Path, action_type: str, *, ticket_id: str | None = None, executor: str | None = None
+) -> dict:
+    """Create a stable direct-action reference and persist its start event."""
+    action_id = "action-" + datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    log_path = _action_events_path(repo_root, action_id)
+    record_direct_action_event(
+        repo_root, action_id, "action_start", action_type=action_type, ticket_id=ticket_id,
+        executor=executor, status="running",
+    )
+    return {"action_id": action_id, "log_path": str(log_path), "status": "running"}
+
+
+def record_direct_action_event(
+    repo_root: Path, action_id: str, event: str, **fields
+) -> Path:
+    """Append an fsynced direct-action event and return its audit-log path."""
+    path = _action_events_path(repo_root, action_id)
+    entry = {"ts": _utc_now_iso(), "event": event, "action_id": action_id, **fields}
+    try:
+        with portalocker.Lock(str(path), "a", timeout=None) as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    return path
+
+
+@contextlib.contextmanager
+def suppress_direct_action_tracking():
+    """Let a transport own one action stream instead of a nested command."""
+    token = _DIRECT_ACTION_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _DIRECT_ACTION_SUPPRESSED.reset(token)
+
+
+def direct_action_tracking_suppressed() -> bool:
+    return _DIRECT_ACTION_SUPPRESSED.get() or os.environ.get(INTERNAL_RUN_ENV) == "1"
+
+
 def _append_run_event(repo_root: Path, session_ts: str | None, event: str, **fields) -> None:
     """Append one structured event to the current run's durable event log.
 
@@ -139,9 +202,62 @@ def _write_last_run_pointer(repo_root: Path, session_ts: str, log_path: Path) ->
 
 
 def _resolve_run_session_ts(repo_root: Path, session_ts: str | None) -> str | None:
-    if session_ts:
-        return session_ts
     logs_dir = repo_root / ".lanegate" / "logs"
+    if session_ts:
+        # ``orchestrator-<pid>`` is the API's fallback identifier while a
+        # CLI-started loop is live. Resolve it through the active run rather
+        # than treating it as a literal log filename.
+        if session_ts.startswith("orchestrator-"):
+            pid_text = session_ts.removeprefix("orchestrator-")
+            lock = orchestrator_lock_status(repo_root)
+            if not (pid_text.isdigit() and lock.get("held") and lock.get("pid") == int(pid_text)):
+                return None
+            return _resolve_run_session_ts(repo_root, None)
+
+        # The API assigns an opaque ID before the spawned loop creates its
+        # durable timestamped audit files.  Accept only its currently-recorded
+        # ID, and only while the loop still owns the orchestrator lock; this
+        # maps the API handle to the active durable run without accepting
+        # arbitrary ``run-...`` strings.
+        if _API_RUN_ID_RE.fullmatch(session_ts):
+            try:
+                api_run = json.loads(
+                    (repo_root / ".lanegate" / "api-run-current.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return None
+            if api_run.get("run_id") != session_ts or not orchestrator_lock_status(repo_root).get("held"):
+                return None
+            return _resolve_run_session_ts(repo_root, None)
+
+        # Never allow a supplied identifier to escape the logs directory.
+        # Older durable records may use a pre-timestamp session convention, so
+        # an existing artifact remains the authority for those IDs.
+        if "/" in session_ts or "\\" in session_ts or session_ts in {".", ".."}:
+            return None
+
+        raw_log_name = f"orchestrate-{session_ts}.log"
+        known_artifacts = (
+            logs_dir / raw_log_name,
+            logs_dir / "archive" / raw_log_name,
+            _run_events_path(repo_root, session_ts),
+        )
+        if any(path.is_file() for path in known_artifacts):
+            return session_ts
+
+        # Per-ticket executor sessions (and other arbitrary strings) must not
+        # be accepted merely because an orchestrator happens to be active.
+        # Real current sessions use the timestamp assigned by the loop.
+        if not _SESSION_TS_RE.fullmatch(session_ts):
+            return None
+
+        # A newly-started orchestrator can be queried before its first audit
+        # artifact is flushed. The timestamp format above keeps this narrow
+        # while allowing that live run to resolve.
+        if orchestrator_lock_status(repo_root).get("held"):
+            return session_ts
+        return None
+
     pointer_path = logs_dir / _LAST_RUN_POINTER
     try:
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -281,9 +397,8 @@ def read_log_page(log_path: Path, offset: int, limit: int) -> dict:
         lines = []
     total = len(lines)
     page = lines[offset : offset + limit]
-    next_offset = offset + len(page)
-    if next_offset >= total:
-        next_offset = None
+    raw_next_offset = offset + len(page)
+    next_offset: int | None = None if raw_next_offset >= total else raw_next_offset
     return {"lines": page, "total_count": total, "next_offset": next_offset}
 
 
@@ -297,69 +412,101 @@ def read_logs_paginated(
     structured recovery/progress record, not the raw audit transcript, and is
     used only for older runs whose text log has been purged.
     """
-    session_ts = _resolve_run_session_ts(repo_root, None if run_id == "current" else run_id)
-    if not session_ts:
-        return None
-
-    events: list[dict] = []
-    logs_dir = repo_root / ".lanegate" / "logs"
-    raw_log_name = f"orchestrate-{session_ts}.log"
-    raw_log_paths = (logs_dir / raw_log_name, logs_dir / "archive" / raw_log_name)
-    raw_log_path = next((path for path in raw_log_paths if path.is_file()), None)
-    if raw_log_path is not None:
-        try:
-            raw = raw_log_path.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                events.append({"ts": "", "event": "log", "message": line})
-        except OSError:
+    if run_id.startswith("action-") and "/" not in run_id and "\\" not in run_id:
+        path = _action_events_path(repo_root, run_id)
+        if not path.is_file():
             return None
-    else:
-        events_path = _run_events_path(repo_root, session_ts)
-        if not events_path.is_file():
-            return None
+        events: list[dict] = []
         try:
-            raw = events_path.read_text(encoding="utf-8")
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
                     continue
-                try:
-                    ev = json.loads(line)
-                    if isinstance(ev, dict) and "message" not in ev:
-                        if "line" in ev:
-                            ev["message"] = str(ev["line"])
-                        else:
-                            parts = []
-                            for k in ("event", "ticket_id", "status", "reason"):
-                                if k in ev:
-                                    parts.append(f"{k}={ev[k]}")
-                            ev["message"] = " ".join(parts) if parts else str(ev)
-                    events.append(ev)
-                except json.JSONDecodeError:
-                    events.append({"ts": "", "event": "log", "message": line})
-        except OSError:
+                event = json.loads(line)
+                event.setdefault(
+                    "message",
+                    " ".join(
+                        f"{key}={event[key]}"
+                        for key in ("event", "action_type", "ticket_id", "status")
+                        if event.get(key) is not None
+                    ),
+                )
+                event["kind"] = "structured"
+                events.append(event)
+        except (OSError, json.JSONDecodeError):
             return None
-
-    # This is the HTTP-facing projection of a durable raw audit artifact. Keep
-    # line count and order intact for pagination while applying the same secret
-    # redaction policy used by executor events. The local artifact itself is
-    # deliberately left unchanged for operator recovery.
-    for event in events:
-        message = event.get("message")
-        if message is not None:
-            event["message"] = redact_transcript_text(str(message))
+        response_run_id = run_id
+    else:
+        session_ts = _resolve_run_session_ts(repo_root, None if run_id == "current" else run_id)
+        if not session_ts:
+            return None
+        response_run_id = session_ts
+        events = []
+        logs_dir = repo_root / ".lanegate" / "logs"
+        raw_log_name = f"orchestrate-{session_ts}.log"
+        raw_log_paths = (logs_dir / raw_log_name, logs_dir / "archive" / raw_log_name)
+        raw_log_path = next((path for path in raw_log_paths if path.is_file()), None)
+        if raw_log_path is not None:
+            try:
+                raw = raw_log_path.read_text(encoding="utf-8")
+                for line in raw.splitlines():
+                    events.append({"ts": "", "event": "log", "message": line})
+            except OSError:
+                return None
+        else:
+            events_path = _run_events_path(repo_root, session_ts)
+            if not events_path.is_file():
+                return None
+            try:
+                raw = events_path.read_text(encoding="utf-8")
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                        if isinstance(ev, dict) and "message" not in ev:
+                            if "line" in ev:
+                                ev["message"] = str(ev["line"])
+                            else:
+                                parts = []
+                                for k in ("event", "ticket_id", "status", "reason"):
+                                    if k in ev:
+                                        parts.append(f"{k}={ev[k]}")
+                                ev["message"] = " ".join(parts) if parts else str(ev)
+                        events.append(ev)
+                    except json.JSONDecodeError:
+                        events.append({"ts": "", "event": "log", "message": line})
+            except OSError:
+                return None
 
     total_count = len(events)
     offset = max(0, offset)
     limit = max(1, limit)
     events_slice = events[offset : offset + limit]
 
+    # This is the HTTP-facing projection of a durable raw audit artifact. Keep
+    # line count and order intact for pagination while applying the same secret
+    # redaction policy used by executor events. The local artifact itself is
+    # deliberately left unchanged for operator recovery.
+    for event in events_slice:
+        message = event.get("message")
+        if message is not None:
+            event["message"] = redact_transcript_text(str(message))
+            metadata = semantic_line_metadata(event["message"])
+            if event.get("level") not in {"error", "warning", "success", "info"}:
+                event["level"] = metadata["level"]
+            event.setdefault("style", metadata["style"])
+            if event.get("event") != "log":
+                event["kind"] = "structured"
+            elif not event.get("kind"):
+                event["kind"] = metadata["kind"]
+
     next_offset = (
         (offset + len(events_slice)) if (offset + len(events_slice) < total_count) else None
     )
 
     return {
-        "run_id": session_ts,
+        "run_id": response_run_id,
         "events": events_slice,
         "total_count": total_count,
         "offset": offset,
@@ -446,7 +593,8 @@ def _collect_live_lanegate_processes(cfg: dict, repo_root: Path) -> list[dict]:
             continue
         alive = pid_alive(pid)
         status = ticket_status.get(tid)
-        orphaned = alive and (status != "in_progress" or not orchestrator_alive)
+        is_orchestrated = pid_path.with_suffix(".orchestrated").is_file()
+        orphaned = alive and (status != "in_progress" or (is_orchestrated and not orchestrator_alive))
         executor_instance = dispatch_executors.get(tid)
         if not executor_instance:
             ticket = tickets_by_id.get(tid)
@@ -468,6 +616,29 @@ def _collect_live_lanegate_processes(cfg: dict, repo_root: Path) -> list[dict]:
             }
         )
 
+    # Direct actions have no durable child PID.  Show their recent action
+    # streams alongside process state so `lanegate ps` remains the single
+    # operator entry point for both live work and its immediate history.
+    from lanegate.orchestrate.run_summary import list_run_summaries
+
+    for summary in list_run_summaries(cfg, repo_root)[:10]:
+        if not summary.run_id.startswith("action-"):
+            continue
+        action_ticket = summary.batch_tickets[0] if summary.batch_tickets else None
+        procs.append(
+            {
+                "kind": "direct-action",
+                "pid": None,
+                "alive": summary.reason == RunReason.RUNNING,
+                "orphaned": False,
+                "recent": True,
+                "action_id": summary.run_id,
+                "detail": (
+                    f"{action_ticket.ticket_id if action_ticket else 'unknown'} "
+                    f"({action_ticket.executor if action_ticket else 'direct'}) — {summary.reason.value}"
+                ),
+            }
+        )
     return procs
 
 
@@ -477,13 +648,18 @@ def cmd_ps(cfg: dict, repo_root: Path, *, json_output: bool = False) -> None:
     if json_output:
         print(json.dumps(procs, indent=2))
         return
-    live = [p for p in procs if p["alive"]]
-    if not live:
+    live = [p for p in procs if p["alive"] and p["kind"] != "direct-action"]
+    actions = [p for p in procs if p["kind"] == "direct-action"]
+    if not live and not actions:
         print("No live lanegate-spawned processes.")
         return
     for p in live:
         flag = "  [ORPHANED]" if p["orphaned"] else ""
         print(f"  PID {p['pid']:<8} {p['kind']:<18} {p['detail']}{flag}")
+    if actions:
+        print("Direct actions (recent):")
+        for action in actions:
+            print(f"  {action['action_id']:<34} {action['detail']}")
     orphaned = [p for p in live if p["orphaned"]]
     if orphaned:
         print(
@@ -497,7 +673,7 @@ def _stale_worker_recovery_hint(ticket_id: str) -> str:
     return (
         f"no terminal outcome recorded for {ticket_id} and the orchestrator process "
         f"is no longer running — run `lanegate ps` to check for a stale worker, then "
-        f"`lanegate orchestrate --tickets {ticket_id}` to redispatch"
+        f"`lanegate run --tickets {ticket_id}` to redispatch"
     )
 
 
@@ -510,8 +686,18 @@ def _map_ticket_outcome(
     r = raw_outcome.lower()
     if r in ("success", "closed", "approved", "merged", "completed"):
         return TicketOutcomeStatus.SUCCESS, None, None
-    elif r in ("changes_requested", "needs_review", "awaiting_human_review", "review_pending"):
+    elif r in ("changes_requested", "needs_review"):
         return TicketOutcomeStatus.CHANGES_REQUESTED, None, raw_reason or "changes requested"
+    elif r == "review_pending":
+        # Review never produced a verdict, so this is resumable work rather
+        # than a rejection or an auto-fix recommendation.
+        return TicketOutcomeStatus.SKIPPED, None, raw_reason or "review pending"
+    elif r == "awaiting_human_review":
+        return (
+            TicketOutcomeStatus.AWAITING_MERGE,
+            None,
+            raw_reason or "reviewer approved — run `lanegate merge` to land it",
+        )
     elif r in ("skipped", "hibernated", "paused"):
         return TicketOutcomeStatus.SKIPPED, None, None
     elif r in ("failure", "failed", "error", "crashed"):
@@ -599,7 +785,12 @@ def build_run_summary(
         timestamp = datetime.datetime.now(datetime.UTC)
 
     all_tickets = tickets if tickets is not None else _load_current_tickets(cfg, repo_root)
-    tickets_by_id = {canonical_id(ticket["id"]): ticket for ticket in all_tickets}
+    tickets_by_id: dict[str, dict] = {}
+    for ticket in all_tickets:
+        try:
+            tickets_by_id[canonical_id(ticket["id"])] = ticket
+        except ValueError:
+            continue
 
     tickets_map: dict[str, dict] = {}
     for e in events:
@@ -608,12 +799,22 @@ def build_run_summary(
             continue
         row = tickets_map.setdefault(
             tid,
-            {"ticket_id": tid, "executor": None, "dispatched_at": None, "outcomes": []},
+            {"ticket_id": tid, "executors": [], "dispatched_at": None, "outcomes": []},
         )
+
+        def record_executor(value: object) -> None:
+            if isinstance(value, str) and value and value not in row["executors"]:
+                row["executors"].append(value)
+
         if e.get("event") == "ticket_dispatch":
-            if e.get("executor"):
-                row["executor"] = e.get("executor")
+            record_executor(e.get("executor"))
             row["dispatched_at"] = e.get("ts")
+        elif e.get("event") == "executor_metrics" and isinstance(e.get("metrics"), dict):
+            record_executor(e["metrics"].get("executor"))
+        elif e.get("event") == "executor_progress" and isinstance(e.get("progress"), dict):
+            record_executor(e["progress"].get("executor"))
+        elif e.get("event") == "executor_cooldown":
+            record_executor(e.get("instance"))
         elif e.get("event") == "ticket_outcome":
             row["outcomes"].append(
                 {"ts": e.get("ts"), "outcome": e.get("outcome"), "reason": e.get("reason")}
@@ -622,21 +823,27 @@ def build_run_summary(
     report_ts = _utc_now_iso()
     batch_tickets: list[TicketOutcome] = []
     for tid, row in sorted(tickets_map.items(), key=lambda item: item[1].get("dispatched_at") or ""):
-        executor = row.get("executor") or "unknown"
+        executor = " → ".join(row.get("executors") or []) or "unknown"
         dispatched_at = row.get("dispatched_at")
         outcomes = row.get("outcomes", [])
 
+        try:
+            matched_ticket = tickets_by_id.get(canonical_id(tid))
+        except ValueError:
+            matched_ticket = None
         if outcomes:
             last = outcomes[-1]
             raw_outcome = last.get("outcome")
             raw_reason = last.get("reason")
             finished_at = last.get("ts")
             outcome_status, failure_reason, review_reason = _map_ticket_outcome(raw_outcome, raw_reason)
-            ticket = tickets_by_id.get(canonical_id(tid))
             if outcome_status == TicketOutcomeStatus.FAILURE:
-                failure_reason = _enrich_reason(repo_root, tid, ticket, failure_reason)
-            elif outcome_status == TicketOutcomeStatus.CHANGES_REQUESTED:
-                review_reason = _enrich_reason(repo_root, tid, ticket, review_reason)
+                failure_reason = _enrich_reason(repo_root, tid, matched_ticket, failure_reason)
+            elif outcome_status in (
+                TicketOutcomeStatus.CHANGES_REQUESTED,
+                TicketOutcomeStatus.AWAITING_MERGE,
+            ):
+                review_reason = _enrich_reason(repo_root, tid, matched_ticket, review_reason)
         elif end_status == "running":
             # Dispatched, no terminal event yet, parent orchestrator still alive.
             finished_at = None
@@ -672,6 +879,8 @@ def build_run_summary(
         reason = RunReason.FAILURE
     elif end_status == "stopped":
         reason = RunReason.STOPPED
+    elif end_status == "running":
+        reason = RunReason.RUNNING
     else:
         if any(t.outcome == TicketOutcomeStatus.FAILURE for t in batch_tickets):
             reason = RunReason.FAILURE
@@ -679,6 +888,7 @@ def build_run_summary(
             t.outcome
             in (
                 TicketOutcomeStatus.CHANGES_REQUESTED,
+                TicketOutcomeStatus.AWAITING_MERGE,
                 TicketOutcomeStatus.SKIPPED,
                 TicketOutcomeStatus.INTERRUPTED,
             )
@@ -693,6 +903,8 @@ def build_run_summary(
         timestamp=timestamp,
         reason=reason,
         batch_tickets=batch_tickets,
+        triggered_by=run_start.get("triggered_by", "manual"),
+        trigger_reason=run_start.get("trigger_reason"),
     )
 
 
@@ -712,6 +924,15 @@ def print_run_summary(summary: RunSummary, stream=None) -> None:
             f"executor={t.executor:14s} duration={dur}{reason_str}",
             file=stream,
         )
+
+    try:
+        from lanegate.pending_globals import check_pending_globals, format_pending_globals_notice
+        pg_info = check_pending_globals(Path.cwd())
+        if pg_info["has_pending"]:
+            print(f"[orchestrate] {format_pending_globals_notice(pg_info)}", file=stream)
+    except Exception:
+        pass
+
 
 
 def build_run_report(cfg: dict, repo_root: Path, *, session_ts: str | None = None) -> dict | None:
@@ -750,28 +971,39 @@ def build_run_report(cfg: dict, repo_root: Path, *, session_ts: str | None = Non
             tid,
             {
                 "ticket_id": tid,
-                "executor": None,
+                "executors": [],
                 "dispatched_at": None,
                 "outcomes": [],
                 "progress_events": [],
             },
         )
+
+        def record_executor(value: object) -> None:
+            if isinstance(value, str) and value and value not in row["executors"]:
+                row["executors"].append(value)
+
         if e.get("event") == "ticket_dispatch":
-            row["executor"] = e.get("executor")
+            record_executor(e.get("executor"))
             row["dispatched_at"] = e.get("ts")
             row["was_hibernated"] = e.get("was_hibernated", False)
+        elif e.get("event") == "executor_metrics" and isinstance(e.get("metrics"), dict):
+            record_executor(e["metrics"].get("executor"))
         elif e.get("event") == "ticket_outcome":
             row["outcomes"].append(
                 {"ts": e.get("ts"), "outcome": e.get("outcome"), "reason": e.get("reason")}
             )
         elif e.get("event") == "executor_progress" and isinstance(e.get("progress"), dict):
+            record_executor(e["progress"].get("executor"))
             # Re-normalize persisted data before it reaches JSON/text reports.
             row["progress_events"].append(ExecutorEvent.from_dict(e["progress"]).to_dict())
+        elif e.get("event") == "executor_cooldown":
+            record_executor(e.get("instance"))
 
     report_ts = _utc_now_iso()
     ticket_state = _load_current_tickets(cfg, repo_root)
     by_id = {ticket["id"]: ticket for ticket in ticket_state}
     for row in tickets.values():
+        row["executor"] = " → ".join(row.pop("executors", [])) or "unknown"
         if row["outcomes"]:
             last = row["outcomes"][-1]
             row["final_outcome"] = last["outcome"]
@@ -845,15 +1077,39 @@ def build_run_report(cfg: dict, repo_root: Path, *, session_ts: str | None = Non
 def cmd_run_report(
     cfg: dict, repo_root: Path, *, session_ts: str | None = None, json_output: bool = False
 ) -> None:
-    """`lanegate run-report` — structured summary of an orchestrate run.
+    """`lanegate run-report` — structured summary of an orchestrate run or action.
 
     With no arguments, reports on the most recently started run (via the
     last-run pointer, falling back to the newest log on disk) — no
-    run-specific argument required.
+    run-specific argument required.  An ``action-...`` session ID reports a
+    direct lifecycle action from its durable action event log.
     """
+    if session_ts and session_ts.startswith("action-"):
+        from lanegate.orchestrate.run_summary import _build_direct_action_summary
+
+        summary = _build_direct_action_summary(repo_root, session_ts)
+        if summary is None:
+            msg = f"No LaneGate action report found for {session_ts}."
+            print(json.dumps({"error": msg}) if json_output else msg)
+            return
+        ticket = summary.batch_tickets[0] if summary.batch_tickets else None
+        log_path = _action_events_path(repo_root, session_ts)
+        if json_output:
+            print(json.dumps({"summary": summary.to_dict(), "log_path": str(log_path)}, indent=2))
+            return
+        print(f"Action: {summary.run_id}   status: {summary.reason.value}")
+        if ticket:
+            duration = _format_elapsed(ticket.duration_seconds)
+            print(
+                f"  {ticket.ticket_id:12s} {ticket.outcome.value:20s} "
+                f"executor={ticket.executor:14s} {duration}"
+            )
+        print(f"  log: {log_path}")
+        return
+
     report = build_run_report(cfg, repo_root, session_ts=session_ts)
     if report is None:
-        msg = "No orchestrate run report found — run `lanegate orchestrate` at least once."
+        msg = "No LaneGate run report found — run `lanegate run` at least once."
         print(json.dumps({"error": msg}) if json_output else msg)
         return
 
@@ -990,15 +1246,17 @@ def _stream_subprocess(
     absolute_ceiling: float | None = None,
     liveness_probe=None,
     progress_probe=None,
+    budget_probe=None,
 ) -> tuple[int, str, str, str | None]:
     """Run a subprocess, streaming stdout/stderr to the given streams.
 
     Returns (exit_code, captured_stdout, captured_stderr, kill_reason), where
-    ``kill_reason`` is ``"idle"``, ``"stall"``, or ``"ceiling"`` when this
-    helper kills the child and otherwise ``None``. ``liveness_probe`` and
-    ``progress_probe`` return timestamps from independent executor monitoring:
-    a recent verified heartbeat suppresses a short output-idle kill, while a
-    long absence of semantic progress still reaches ``stall_timeout``.
+    ``kill_reason`` is ``"idle"``, ``"stall"``, ``"ceiling"``, or
+    ``"budget_exceeded"`` when this helper kills the child and otherwise
+    ``None``. ``liveness_probe`` and ``progress_probe`` return timestamps from
+    independent executor monitoring: a recent verified heartbeat suppresses a
+    short output-idle kill, while a long absence of semantic progress still
+    reaches ``stall_timeout``.
 
     When out_stream/err_stream are None, falls back to sys.stdout/sys.stderr.
     Using sys.stdout/sys.stderr here (rather than the fd directly) means the
@@ -1027,22 +1285,22 @@ def _stream_subprocess(
     last_line_ts = time.time()
     start_ts = last_line_ts
 
-    popen_kwargs = {
-        "cwd": cwd,
-        "stdin": subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "bufsize": 1,
-        "env": env,
-    }
-    if sys.platform == "win32":
-        popen_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **popen_kwargs)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        creationflags=0x00000200 if sys.platform == "win32" else 0,  # CREATE_NEW_PROCESS_GROUP
+        start_new_session=sys.platform != "win32",
+    )
     if on_start is not None:
         on_start(proc.pid)
+
+    guard_violation: list[BaseException] = []
 
     def relay(src, dst, capture: list[str] | None = None, is_stdout: bool = True):
         nonlocal last_line_ts
@@ -1053,8 +1311,13 @@ def _stream_subprocess(
             if on_line is not None:
                 try:
                     on_line(line, is_stdout)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    err_stream.write(f"{exc}\n")
+                    err_stream.flush()
+                    from lanegate.orchestrate.pool import WorktreeGuardViolation
+
+                    if isinstance(exc, WorktreeGuardViolation):
+                        guard_violation.append(exc)
             dst.write(line)
             dst.flush()
 
@@ -1063,18 +1326,49 @@ def _stream_subprocess(
     t_out.start()
     t_err.start()
     if stdin_text is not None and proc.stdin is not None:
-        proc.stdin.write(stdin_text)
-        proc.stdin.close()
+        try:
+            proc.stdin.write(stdin_text)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            # The child exited or closed stdin before reading it (for example
+            # a command that never touches stdin) — not our failure to report.
+            pass
 
     kill_reason: str | None = None
-    if idle_timeout is None and absolute_ceiling is None:
+    budget_msg: str | None = None
+    if idle_timeout is None and absolute_ceiling is None and budget_probe is None:
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             kill_reason = "timeout"
     else:
         while proc.poll() is None:
+            if guard_violation:
+                kill_reason = "worktree_violation"
+                break
+            if budget_probe is not None:
+                try:
+                    b_res = budget_probe()
+                    if b_res:
+                        kill_reason = "budget_exceeded"
+                        budget_msg = str(b_res)
+                        break
+                except Exception:
+                    pass
             now = time.time()
+            # ``timeout`` is the flat process limit used by completion-only
+            # executors. Streaming dispatches instead use their explicit
+            # idle/stall/ceiling watchdogs; do not let a short flat timeout
+            # override those richer liveness signals merely because they also
+            # carry a budget probe.
+            if (
+                timeout is not None
+                and idle_timeout is None
+                and absolute_ceiling is None
+                and now - start_ts > timeout
+            ):
+                kill_reason = "timeout"
+                break
             if absolute_ceiling is not None and now - start_ts > absolute_ceiling:
                 kill_reason = "ceiling"
                 break
@@ -1109,6 +1403,8 @@ def _stream_subprocess(
                 kill_reason = "idle"
                 break
             time.sleep(0.05)
+    if kill_reason is None and guard_violation:
+        kill_reason = "worktree_violation"
     if kill_reason is not None:
         _terminate_process_tree(proc)
         if kill_reason == "timeout":
@@ -1117,6 +1413,10 @@ def _stream_subprocess(
             message = f"was idle for {idle_timeout}s"
         elif kill_reason == "stall":
             message = f"made no semantic progress for {stall_timeout}s"
+        elif kill_reason == "budget_exceeded":
+            message = f"budget cap exceeded: {budget_msg if budget_msg else 'budget ceiling reached'}"
+        elif kill_reason == "worktree_violation":
+            message = str(guard_violation[0]) if guard_violation else "wrote outside its assigned worktree"
         else:
             message = f"reached absolute ceiling of {absolute_ceiling}s"
         msg = f"\n[orchestrate] ERROR: executor process (PID {proc.pid}) {message}\n"

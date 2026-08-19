@@ -9,16 +9,24 @@ from __future__ import annotations
 import io
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-from lanegate.config import resolve_model, resolve_trunk_branch
+from lanegate.config import (
+    _VALID_EXECUTOR_TYPES,
+    resolve_human_escalation,
+    resolve_model,
+    resolve_trunk_branch,
+)
+from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.executor import (
     _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
     get_executor_config,
     parse_structured_result,
+    reject_ollama_for_code_step,
     resolve_executor_env,
 )
 from lanegate.ticket import latest_review_findings, load_all_tickets, write_ticket
@@ -27,6 +35,7 @@ from .audit import _write_review_verdict
 from .pool import (
     _build_env,
     _cfg_with_driver_command_overrides,
+    _get_step_budget_cap,
     _resolve_drift_driver_name,
     _resolve_driver_route,
     _unpack_stream_result,
@@ -38,7 +47,28 @@ from .pool import (
     write_prompt_file_best_effort,
 )
 from .review import _git_head_sha, resolve_independent_review_driver, run_review_agent
-from .run_report import _resolve_active_run_session_ts, _stream_subprocess
+from .run_report import (
+    _resolve_active_run_session_ts,
+    _stream_subprocess,
+    begin_direct_action,
+    record_direct_action_event,
+)
+
+
+class RateLimitedFixError(Exception):
+    """Raised by run_fix_agent when the fix executor exits due to a rate limit,
+    crash, or interrupt — i.e. the agent never meaningfully attempted the fix.
+    The auto-fix loop should hibernate the ticket without consuming an attempt
+    counter slot, matching how the implement/review phases handle rate limits.
+    """
+
+
+class FixFailedError(Exception):
+    """Raised by run_fix_agent when the executor ran and explicitly failed
+    (exited 0 but produced no commit, or any non-rate-limit non-zero exit).
+    The auto-fix loop should consume an attempt slot and escalate if the cap
+    is reached.
+    """
 
 
 def run_fix_agent(
@@ -48,6 +78,7 @@ def run_fix_agent(
     worktree_path: Path,
     findings: str,
     pre_fix_sha: str,
+    pool_name: str | None = None,
 ) -> bool:
     """
     Run a fix subagent that addresses review findings on top of the ticket's
@@ -60,10 +91,18 @@ def run_fix_agent(
             return True here since the branch already has the original
             implementation's commits, so it can't be reused for this check.
 
-    Returns True only if the executor exited 0 and produced at least one new
-    commit on top of pre_fix_sha; False otherwise (a mechanical failure — the
-    caller should escalate without running a drift check, since there is
-    nothing new to check).
+    Returns True if the executor exited 0 and produced at least one new commit
+    on top of pre_fix_sha.
+
+    Raises:
+        RateLimitedFixError: The executor exited non-zero due to a rate limit
+            or interrupt (SIGINT/Ctrl-C). The agent never meaningfully attempted
+            the fix; the attempt counter should NOT be incremented and the ticket
+            should be hibernated for later retry.
+        FixFailedError: The executor ran but failed (exited non-zero for a
+            non-rate-limit reason, or exited 0 but produced no commit). The
+            attempt counter should be incremented and the ticket escalated if
+            the cap is reached.
     """
     from lanegate.reviewer import ReviewError, build_fix_prompt, get_worktree_diff
     from lanegate.ticket import branch_name
@@ -77,28 +116,35 @@ def run_fix_agent(
         )
     except ReviewError as exc:
         print(f"WARNING: fix agent could not read diff for {tid}: {exc}", file=sys.stderr)
-        return False
+        raise FixFailedError(f"fix agent could not read diff for {tid}: {exc}") from exc
 
     fix_prompt = build_fix_prompt(
-        ticket, diff=diff, findings=findings, project_root=worktree_path, cfg=cfg
+        ticket,
+        diff=diff,
+        findings=findings,
+        project_root=repo_root,
+        worktree_path=worktree_path,
+        cfg=cfg,
     )
 
     # The reviewer that recorded the findings being fixed must never also be
     # the one fixing them — a reviewer fixing its own findings has no
-    # independent check (TICK-345, one step earlier in the cycle).
+    # independent check (one step earlier in the cycle).
     from lanegate.orchestrate.loop import resolve_pool_executor
 
     excluded = {ticket["review_driver"]} if ticket.get("review_driver") else set()
-    fix_executor = resolve_pool_executor("fix", ticket, cfg, repo_root, excluded=excluded)
+    fix_executor = resolve_pool_executor(
+        "fix", ticket, cfg, repo_root, excluded=excluded, pool_name=pool_name
+    )
     if excluded and (fix_executor is None or fix_executor in excluded):
         print(
             f"WARNING: no independent fix executor is available for {tid}; "
             "refusing to dispatch the reviewer to fix its own findings",
             file=sys.stderr,
         )
-        return False
+        raise FixFailedError(f"no independent fix executor available for {tid}")
 
-    exit_code, *_ = invoke_executor(
+    exit_code, captured_stdout, captured_stderr = invoke_executor(
         ticket,
         cfg,
         worktree_path,
@@ -108,8 +154,23 @@ def run_fix_agent(
         executor_override=fix_executor,
     )
     if exit_code != 0:
+        # Distinguish rate-limit / interrupt exits (agent never tried) from
+        # genuine failures (agent tried and produced an error).  Deferred
+        # import avoids the circular-import issue (loop.py already imports
+        # run_auto_fix_cycle from this module at module level).
+        from lanegate.orchestrate.loop import _is_interrupted_exit, _is_rate_limit
+
+        if _is_rate_limit(
+            exit_code,
+            worktree_path,
+            captured_stdout=captured_stdout,
+            captured_stderr=captured_stderr,
+        ) or _is_interrupted_exit(exit_code):
+            raise RateLimitedFixError(
+                f"fix agent exited {exit_code} for {tid} (rate limit or interrupt)"
+            )
         print(f"WARNING: fix agent exited {exit_code} for {tid}", file=sys.stderr)
-        return False
+        raise FixFailedError(f"fix agent exited {exit_code} for {tid}")
 
     commit_worktree_changes(
         worktree_path, tid, message=f"fix: address review findings for {tid}"
@@ -118,7 +179,7 @@ def run_fix_agent(
     head_after = _git_head_sha(worktree_path)
     if head_after is None or head_after == pre_fix_sha:
         print(f"WARNING: fix agent for {tid} exited 0 but made no new commit", file=sys.stderr)
-        return False
+        raise FixFailedError(f"fix agent for {tid} exited 0 but made no new commit")
     return True
 
 
@@ -128,44 +189,545 @@ def run_rebase_fix_agent(
     repo_root: Path,
     worktree_path: Path,
     rebase_detail: str,
+    pool_name: str | None = None,
 ) -> bool:
     """Run an autofix agent in worktree_path to resolve git rebase content conflicts,
-    run tests, and continue the rebase.
+    handling metadata-only conflicts deterministically without LLM, invoking fix agents
+    for code conflicts, and continuing until complete or failing closed.
 
     Returns True if conflict resolution succeeded and rebase was continued cleanly,
     False otherwise.
     """
-    from lanegate.orchestrate.loop import _abort_rebase, _conflicted_files, _continue_rebase
+    from lanegate.orchestrate.loop import (
+        _abort_rebase,
+        _conflicted_files,
+        _continue_rebase,
+        _format_conflict_detail,
+        resolve_pool_executor,
+    )
+    from lanegate.reconciliation import is_metadata_only_conflict, resolve_metadata_conflict
+    from lanegate.orchestrate.run_report import begin_direct_action, record_direct_action_event
 
     tid = ticket["id"]
-    conflict_files = _conflicted_files(worktree_path)
+    tickets_dir = cfg.get("tickets_dir", ".lanegate/tickets")
+    max_steps = cfg.get("max_rebase_steps", 10)
+    seen_snapshots: set[tuple[tuple[str, str], ...]] = set()
+    agent_resolved_conflict_files: set[str] = set()
+    recovery_action = begin_direct_action(repo_root, "rebase-recovery", ticket_id=tid)
+    recovery_action_id = recovery_action["action_id"]
 
-    rebase_fix_prompt = (
-        f"You are resolving git rebase content conflicts for ticket {tid}.\n\n"
-        f"{rebase_detail}\n\n"
-        "Instructions:\n"
-        "1. Inspect the conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`) in the conflicted files.\n"
-        "2. Edit the files to resolve the conflict markers cleanly, combining the changes correctly.\n"
-        "3. Run project tests to confirm the resolution passes tests and is syntactically valid.\n"
-        "4. Do NOT run `git rebase --continue` or `git add` yourself; save the resolved files in place."
-    )
+    def finish_recovery(success: bool) -> bool:
+        """Close the recovery stream so it is never rendered as perpetually live."""
+        record_direct_action_event(
+            repo_root,
+            recovery_action_id,
+            "action_end",
+            ticket_id=tid,
+            action_type="rebase-recovery",
+            status="success" if success else "failed",
+        )
+        return success
 
-    exit_code, *_ = invoke_executor(
-        ticket, cfg, worktree_path, prompt_override=rebase_fix_prompt, step="fix", repo_root=repo_root
-    )
-    if exit_code != 0:
-        print(f"WARNING: rebase fix agent exited {exit_code} for {tid}", file=sys.stderr)
-        return False
+    def record_human_merge_hold() -> None:
+        """Persist the extra merge gate required after agent conflict recovery.
 
-    continued, continue_detail = _continue_rebase(worktree_path, conflict_files)
-    if not continued:
-        print(f"WARNING: continue rebase failed for {tid}: {continue_detail}", file=sys.stderr)
-        return False
+        Git can verify that a rebase completed and the normal review can verify
+        the resulting diff, but an agent had to make a semantic choice for at
+        least one conflicting hunk.  That is sufficient reason to prevent an
+        unattended merge even when the ticket otherwise uses ``full``
+        autonomy.  Keep the compact evidence on the ticket so the hold survives
+        a later orchestrator run.
+        """
+        if not agent_resolved_conflict_files:
+            return
 
-    commit_worktree_changes(
-        worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
-    )
-    return True
+        ticket["requires_human_merge"] = True
+        ticket["human_merge_reason"] = "automated rebase conflict recovery"
+        ticket["rebase_conflict_files"] = sorted(agent_resolved_conflict_files)
+        if not ticket.get("_path"):
+            return
+
+        write_ticket(ticket)
+        # Import only at the point of persistence: lifecycle commands import
+        # this module for conflict recovery, so a module-level import would
+        # create a cycle.
+        from lanegate.lifecycle import _commit_generated_ticket_write
+
+        _commit_generated_ticket_write(
+            repo_root,
+            Path(ticket["_path"]),
+            tid,
+            "rebase-conflict-recovery-hold",
+            cfg,
+            required=False,
+        )
+
+    def _get_staged_marker_info(rel_path: str) -> tuple[dict[str, int], list[dict]]:
+        """Collect max occurrences and surrounding non-marker contexts for lines starting
+        with conflict marker prefixes from git index stages 1, 2, 3."""
+        from collections import Counter
+        import subprocess
+
+        staged_counts: dict[str, int] = {}
+        staged_occurrences: list[dict] = []
+
+        def _is_marker(line: str) -> bool:
+            s = line.lstrip()
+            return s.startswith(("<<<<<<<", ">>>>>>>")) or s.rstrip() == "======="
+
+        for stage in (1, 2, 3):
+            try:
+                res = subprocess.run(
+                    ["git", "show", f":{stage}:{rel_path}"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if res.returncode == 0:
+                    lines = res.stdout.splitlines()
+                    stage_counts = Counter(
+                        line.lstrip()
+                        for line in lines
+                        if _is_marker(line)
+                    )
+                    for marker, count in stage_counts.items():
+                        staged_counts[marker] = max(staged_counts.get(marker, 0), count)
+
+                    for idx, line in enumerate(lines):
+                        marker = line.lstrip()
+                        if not _is_marker(line):
+                            continue
+
+                        prev_line = lines[idx - 1].rstrip() if idx > 0 else None
+                        next_line = lines[idx + 1].rstrip() if idx < len(lines) - 1 else None
+
+                        p = idx - 1
+                        prev_nm = None
+                        while p >= 0:
+                            if not _is_marker(lines[p]):
+                                prev_nm = lines[p].rstrip()
+                                break
+                            p -= 1
+
+                        n = idx + 1
+                        next_nm = None
+                        while n < len(lines):
+                            if not _is_marker(lines[n]):
+                                next_nm = lines[n].rstrip()
+                                break
+                            n += 1
+
+                        is_top = (idx == 0) or all(
+                            _is_marker(lines[k])
+                            for k in range(idx)
+                        )
+                        is_bottom = (idx == len(lines) - 1) or all(
+                            _is_marker(lines[k])
+                            for k in range(idx + 1, len(lines))
+                        )
+
+                        staged_occurrences.append({
+                            "stage": stage,
+                            "marker": marker,
+                            "prev_line": prev_line,
+                            "next_line": next_line,
+                            "prev_nm": prev_nm,
+                            "next_nm": next_nm,
+                            "is_top": is_top,
+                            "is_bottom": is_bottom,
+                        })
+            except Exception:
+                pass
+        return staged_counts, staged_occurrences
+
+    def abort_if_markers_remain(paths: list[str]) -> bool:
+        """Fail closed before staging text that still contains a conflict hunk.
+
+        Git considers a file resolved once it is staged; it does not reject
+        literal ``<<<<<<<`` / ``=======`` / ``>>>>>>>`` text.  The executor is
+        deliberately asked not to stage files, so this is the last trustworthy
+        point to reject an incomplete agent resolution. Pre-existing source
+        lines beginning with ``<<<<<<<``, ``=======``, or ``>>>>>>>`` (e.g.,
+        RST underlines or test fixtures) present in stage 1, 2, or 3 of the git
+        index are valid source text. Residual markers introduced during
+        conflict resolution that were not present in any staged version (or
+        present in excess of staged multiplicity, or whose position does not
+        preserve a staged line's surrounding context) are hunk markers and
+        must never be staged from an agent-resolved source file.
+        """
+        from collections import Counter
+
+        def _is_marker(line: str) -> bool:
+            s = line.lstrip()
+            return s.startswith(("<<<<<<<", ">>>>>>>")) or s.rstrip() == "======="
+
+        marker_files: list[str] = []
+        for rel_path in paths:
+            path = worktree_path / rel_path
+            if not path.exists():
+                continue
+            staged_counts, staged_occurrences = _get_staged_marker_info(rel_path)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            wt_lines = text.splitlines()
+
+            worktree_counts = Counter(
+                line.lstrip()
+                for line in wt_lines
+                if _is_marker(line)
+            )
+
+            has_residual = False
+            for marker, count in worktree_counts.items():
+                if count > staged_counts.get(marker, 0):
+                    has_residual = True
+                    break
+
+            if has_residual:
+                marker_files.append(rel_path)
+                continue
+
+            for st in staged_occurrences:
+                m = st["marker"]
+                st2_prevs = {
+                    occ["prev_line"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 2 and occ["marker"] == m and occ["prev_line"] is not None
+                } | {
+                    occ["prev_nm"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 2 and occ["marker"] == m and occ["prev_nm"] is not None
+                }
+                st3_prevs = {
+                    occ["prev_line"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 3 and occ["marker"] == m and occ["prev_line"] is not None
+                } | {
+                    occ["prev_nm"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 3 and occ["marker"] == m and occ["prev_nm"] is not None
+                }
+
+                st2_nexts = {
+                    occ["next_line"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 2 and occ["marker"] == m and occ["next_line"] is not None
+                } | {
+                    occ["next_nm"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 2 and occ["marker"] == m and occ["next_nm"] is not None
+                }
+                st3_nexts = {
+                    occ["next_line"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 3 and occ["marker"] == m and occ["next_line"] is not None
+                } | {
+                    occ["next_nm"]
+                    for occ in staged_occurrences
+                    if occ["stage"] == 3 and occ["marker"] == m and occ["next_nm"] is not None
+                }
+
+                if st2_prevs and st3_prevs:
+                    st["prev_stable"] = bool(st2_prevs & st3_prevs)
+                else:
+                    st["prev_stable"] = True
+
+                if st2_nexts and st3_nexts:
+                    st["next_stable"] = bool(st2_nexts & st3_nexts)
+                else:
+                    st["next_stable"] = True
+
+            used_staged_indices: set[int] = set()
+            for idx, line in enumerate(wt_lines):
+                marker = line.lstrip()
+                if not _is_marker(line):
+                    continue
+
+                prev_line = wt_lines[idx - 1].rstrip() if idx > 0 else None
+                next_line = wt_lines[idx + 1].rstrip() if idx < len(wt_lines) - 1 else None
+
+                p = idx - 1
+                prev_nm = None
+                while p >= 0:
+                    if not _is_marker(wt_lines[p]):
+                        prev_nm = wt_lines[p].rstrip()
+                        break
+                    p -= 1
+
+                n = idx + 1
+                next_nm = None
+                while n < len(wt_lines):
+                    if not _is_marker(wt_lines[n]):
+                        next_nm = wt_lines[n].rstrip()
+                        break
+                    n += 1
+
+                is_top = (idx == 0) or all(
+                    _is_marker(wt_lines[k])
+                    for k in range(idx)
+                )
+                is_bottom = (idx == len(wt_lines) - 1) or all(
+                    _is_marker(wt_lines[k])
+                    for k in range(idx + 1, len(wt_lines))
+                )
+
+                wt_info = {
+                    "marker": marker,
+                    "prev_line": prev_line,
+                    "next_line": next_line,
+                    "prev_nm": prev_nm,
+                    "next_nm": next_nm,
+                    "is_top": is_top,
+                    "is_bottom": is_bottom,
+                }
+
+                def _contexts_match(wt: dict, st: dict) -> bool:
+                    if wt["marker"] != st["marker"]:
+                        return False
+                    if (
+                        st["prev_nm"] is None
+                        and st["next_nm"] is None
+                        and wt["prev_nm"] is None
+                        and wt["next_nm"] is None
+                    ):
+                        return True
+
+                    if st["is_top"]:
+                        prev_matched = wt["is_top"]
+                    else:
+                        prev_matched = (not wt["is_top"]) and (
+                            (
+                                wt["prev_line"] is not None
+                                and wt["prev_line"] == st["prev_line"]
+                                and st["prev_line"].strip() != ""
+                            )
+                            or (
+                                wt["prev_nm"] is not None
+                                and wt["prev_nm"] == st["prev_nm"]
+                                and st["prev_nm"].strip() != ""
+                            )
+                        )
+
+                    if st["is_bottom"]:
+                        next_matched = wt["is_bottom"]
+                    else:
+                        next_matched = (not wt["is_bottom"]) and (
+                            (
+                                wt["next_line"] is not None
+                                and wt["next_line"] == st["next_line"]
+                                and st["next_line"].strip() != ""
+                            )
+                            or (
+                                wt["next_nm"] is not None
+                                and wt["next_nm"] == st["next_nm"]
+                                and st["next_nm"].strip() != ""
+                            )
+                        )
+
+                    prev_must_match = st.get("prev_stable", True)
+                    next_must_match = st.get("next_stable", True)
+
+                    if st["is_top"] and st["is_bottom"]:
+                        return wt["is_top"] and wt["is_bottom"]
+                    elif st["is_top"]:
+                        return wt["is_top"] and (next_matched if next_must_match else True)
+                    elif st["is_bottom"]:
+                        return wt["is_bottom"] and (prev_matched if prev_must_match else True)
+                    else:
+                        if not prev_must_match and not next_must_match:
+                            # Both neighboring lines are unstable across stages —
+                            # no context anchor exists to confirm identity.  Fail
+                            # closed: an unanchored marker cannot be matched.
+                            return False
+                        req_prev = prev_matched if prev_must_match else True
+                        req_next = next_matched if next_must_match else True
+                        return req_prev and req_next
+
+                matched = False
+                for st_idx, st_occ in enumerate(staged_occurrences):
+                    if st_idx in used_staged_indices:
+                        continue
+                    if _contexts_match(wt_info, st_occ):
+                        used_staged_indices.add(st_idx)
+                        matched = True
+                        break
+
+                if not matched:
+                    has_residual = True
+                    break
+
+            if has_residual:
+                marker_files.append(rel_path)
+
+        if not marker_files:
+            return False
+
+        print(
+            f"WARNING: rebase conflict markers remain for {tid}: {', '.join(marker_files)}",
+            file=sys.stderr,
+        )
+        record_direct_action_event(
+            repo_root,
+            recovery_action_id,
+            "rebase_markers_remaining",
+            ticket_id=tid,
+            reason_code="conflict_markers_remaining",
+            conflict_files=marker_files,
+        )
+        _abort_rebase(worktree_path)
+        return True
+
+    try:
+        step = 0
+        while step < max_steps:
+            step += 1
+            conflict_files = _conflicted_files(worktree_path)
+            if not conflict_files:
+                continued, continue_detail = _continue_rebase(worktree_path, [])
+                if continued:
+                    record_human_merge_hold()
+                    commit_worktree_changes(
+                        worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                    )
+                    return finish_recovery(True)
+                _abort_rebase(worktree_path)
+                return finish_recovery(False)
+
+            snapshot_list = []
+            for f in sorted(conflict_files):
+                fp = worktree_path / f
+                content = fp.read_text(encoding="utf-8", errors="replace") if fp.exists() else ""
+                snapshot_list.append((f, content))
+            snapshot = tuple(snapshot_list)
+
+            if snapshot in seen_snapshots:
+                print(f"WARNING: rebase conflict state unchanged for {tid}", file=sys.stderr)
+                record_direct_action_event(
+                    repo_root,
+                    recovery_action_id,
+                    "rebase_stuck",
+                    ticket_id=tid,
+                    reason_code="stuck_rebase",
+                    conflict_files=conflict_files,
+                )
+                _abort_rebase(worktree_path)
+                return finish_recovery(False)
+            seen_snapshots.add(snapshot)
+
+            metadata_conflict_files = [
+                path for path in conflict_files
+                if is_metadata_only_conflict([path], tickets_dir)
+            ]
+            source_conflict_files = [
+                path for path in conflict_files
+                if path not in metadata_conflict_files
+            ]
+
+            # Resolve ticket metadata before any agent sees a mixed batch. This
+            # preserves the deterministic reconciliation policy for lifecycle
+            # state and ensures the source-only marker scan cannot conceal a
+            # staged ticket conflict marker.
+            if metadata_conflict_files:
+                try:
+                    for p in metadata_conflict_files:
+                        resolve_metadata_conflict(worktree_path, p)
+                except Exception as exc:
+                    print(
+                        f"WARNING: failed to resolve metadata conflict for {tid}: {exc}",
+                        file=sys.stderr,
+                    )
+                    record_direct_action_event(
+                        repo_root,
+                        recovery_action_id,
+                        "metadata_conflict_error",
+                        ticket_id=tid,
+                        reason_code="metadata_conflict_error",
+                        error=str(exc),
+                        conflict_files=metadata_conflict_files,
+                    )
+                    _abort_rebase(worktree_path)
+                    return finish_recovery(False)
+
+                record_direct_action_event(
+                    repo_root,
+                    recovery_action_id,
+                    "resolve_metadata_conflict",
+                    ticket_id=tid,
+                    reason_code="metadata_conflict_resolved",
+                    conflict_files=metadata_conflict_files,
+                )
+
+            if not source_conflict_files:
+                continued, continue_detail = _continue_rebase(worktree_path, conflict_files)
+                if continued:
+                    record_human_merge_hold()
+                    commit_worktree_changes(
+                        worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                    )
+                    return finish_recovery(True)
+                continue
+
+            current_detail = _format_conflict_detail(worktree_path, source_conflict_files)
+
+            rebase_fix_prompt = (
+                f"You are resolving git rebase content conflicts for ticket {tid}.\n\n"
+                f"{current_detail}\n\n"
+                "Instructions:\n"
+                "1. Inspect the conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`) in the conflicted files.\n"
+                "2. Edit the files to resolve the conflict markers cleanly, combining the changes correctly.\n"
+                "3. Run project tests to confirm the resolution passes tests and is syntactically valid.\n"
+                "4. Do NOT run `git rebase --continue` or `git add` yourself; save the resolved files in place."
+            )
+
+            record_direct_action_event(
+                repo_root,
+                recovery_action_id,
+                "rebase_code_conflict",
+                ticket_id=tid,
+                reason_code="code_conflict_detected",
+                conflict_files=source_conflict_files,
+                conflict_hunks=current_detail,
+            )
+            # Metadata conflicts are reconciled deterministically. Only source
+            # conflicts resolved by an agent require the extra human merge gate.
+            agent_resolved_conflict_files.update(source_conflict_files)
+
+            fix_executor = resolve_pool_executor(
+                "fix", ticket, cfg, repo_root, pool_name=pool_name
+            )
+            exit_code, *_ = invoke_executor(
+                ticket,
+                cfg,
+                worktree_path,
+                prompt_override=rebase_fix_prompt,
+                step="fix",
+                repo_root=repo_root,
+                executor_override=fix_executor,
+            )
+            if exit_code != 0:
+                print(f"WARNING: rebase fix agent exited {exit_code} for {tid}", file=sys.stderr)
+                _abort_rebase(worktree_path)
+                return finish_recovery(False)
+
+            if abort_if_markers_remain(source_conflict_files):
+                return finish_recovery(False)
+
+            continued, continue_detail = _continue_rebase(worktree_path, source_conflict_files)
+            if continued:
+                record_human_merge_hold()
+                commit_worktree_changes(
+                    worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                )
+                return finish_recovery(True)
+
+        print(f"WARNING: rebase recovery exceeded max iterations for {tid}", file=sys.stderr)
+        _abort_rebase(worktree_path)
+        return finish_recovery(False)
+    except Exception as exc:
+        print(f"WARNING: rebase recovery exception for {tid}: {exc}", file=sys.stderr)
+        _abort_rebase(worktree_path)
+        return finish_recovery(False)
 
 
 def run_drift_check(
@@ -175,6 +737,7 @@ def run_drift_check(
     worktree_path: Path,
     findings: str,
     pre_fix_sha: str,
+    pool_name: str | None = None,
 ):
     """
     Run a drift-check subagent that verifies a fix pass still matches ticket
@@ -214,7 +777,8 @@ def run_drift_check(
         original_diff=original_diff,
         fix_diff=fix_diff,
         findings=findings,
-        project_root=worktree_path,
+        project_root=repo_root,
+        worktree_path=worktree_path,
         cfg=cfg,
     )
 
@@ -239,9 +803,19 @@ def run_drift_check(
         # pointing at an unset var, or a type with no known key-injection
         # target — TICK-088), or a malformed driver env overlay, is caught by
         # the same fail-closed handler below as any other drift-check error.
-        drift_driver_name = _resolve_drift_driver_name(ticket, cfg)
+        drift_driver_name = _resolve_drift_driver_name(
+            ticket, cfg, repo_root, pool_name=pool_name
+        )
         drift_driver_cfg = expand_driver(drift_driver_name, cfg)
         drift_executor = drift_driver_cfg.get("type", drift_driver_name)
+        # expand_driver() only expands `drivers:` entries, so a drift executor
+        # configured as a named instance (`executors: {local-ollama: {type:
+        # ollama}}`, TICK-088) is still an instance name here. Guard on the
+        # resolved type or that config dispatches a raw ollama drift check.
+        resolved_drift_type = get_executor_config(drift_executor, cfg).get(
+            "type", drift_executor
+        )
+        reject_ollama_for_code_step("drift_check", resolved_drift_type)
         drift_effective_cfg = (
             dict(cfg, executor=drift_executor) if drift_executor != cfg.get("executor") else cfg
         )
@@ -283,9 +857,6 @@ def run_drift_check(
                     f"[orchestrate] {tid}: not resuming session for drift_check — {reason}",
                     file=sys.stderr,
                 )
-        resolved_drift_type = get_executor_config(drift_executor, cfg).get(
-            "type", drift_executor
-        )
         stdin_capable = resolved_drift_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"})
         # Agy's JSON mode is completion-only, so it needs a flat timeout
         # rather than output-idle detection.
@@ -293,17 +864,43 @@ def run_drift_check(
         # can be quiet while it works, so use the hard ceiling instead of an
         # output-idle kill for that executor type.
         streaming_capable = resolved_drift_type in _CLAUDE_SUBPROCESS_TYPES
+        step_max_turns = _get_step_budget_cap(cfg, "drift_check", "max_turns")
+        step_max_tokens = _get_step_budget_cap(cfg, "drift_check", "max_cumulative_tokens")
+        meter = (
+            DispatchMeter(step="drift_check")
+            if metering_supported_for(resolved_drift_type)
+            else None
+        )
+
+        def check_budget() -> str | None:
+            if meter is None:
+                return None
+            if step_max_turns is not None and meter.turns >= step_max_turns:
+                return f"max_turns cap reached ({meter.turns}/{step_max_turns} turns)"
+            if step_max_tokens is not None and meter.tokens >= step_max_tokens:
+                return (
+                    "max_cumulative_tokens cap reached "
+                    f"({meter.tokens}/{step_max_tokens} tokens)"
+                )
+            return None
+
         drift_cmd = build_executor_cmd(
             drift_executor, prompt, drift_command_cfg, model=drift_model,
             analyze_session_id=resume_session_id,
             use_stdin=stdin_capable,
+            max_turns=step_max_turns,
+            step="drift_check",
         )
         drift_executor_env = resolve_executor_env(get_executor_config(drift_executor, cfg))
         drift_executor_env = _build_env(drift_driver_cfg, base_env=drift_executor_env)
         stream_kwargs = {
             "idle_timeout": cfg.get("executor_idle_timeout_seconds", 75),
             "absolute_ceiling": cfg.get("executor_absolute_ceiling_seconds", 1500),
-        } if streaming_capable else {"timeout": cfg.get("executor_absolute_ceiling_seconds", 1500)}
+            "budget_probe": check_budget,
+        } if streaming_capable else {
+            "timeout": cfg.get("executor_absolute_ceiling_seconds", 1500),
+            "budget_probe": check_budget,
+        }
         start_time = time.time()
         session_id = f"{tid}-{time.time_ns()}-{os.getpid()}-drift_check"
         print(
@@ -318,6 +915,8 @@ def run_drift_check(
             model=drift_model,
             step="drift_check",
             terminal_stream=sys.stderr,
+            meter=meter,
+            worktree_path=worktree_path,
         )
         rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
             drift_cmd,
@@ -365,7 +964,10 @@ def run_drift_check(
         if parsed is not None:
             from lanegate.context_log import record_step_cost
 
-            record_step_cost(repo_root, tid, "drift_check", drift_executor, drift_model, parsed)
+            record_step_cost(
+                repo_root, tid, "drift_check", drift_executor, drift_model, parsed,
+                dispatch_start_time=start_time,
+            )
         matches = re.findall(r'\{[^{}]*"drift_ok"[^{}]*\}', output, re.DOTALL)
         raw_for_parse = matches[-1] if matches else output
         return _record(parse_drift_check_result(raw_for_parse))
@@ -409,10 +1011,12 @@ def run_auto_fix_cycle(
     cfg: dict,
     repo_root: Path,
     worktree_path: Path,
-) -> bool:
+    pool_name: str | None = None,
+) -> bool | None:
     """
-    Run up to ``cfg.get("max_auto_fix_attempts", 1)`` fix -> drift-check ->
-    re-review cycles for a ticket whose review came back changes_requested.
+    Run up to the lower of ``max_auto_fix_attempts`` and
+    ``human_escalation.retry_limit`` fix -> drift-check -> re-review cycles
+    for a ticket whose review came back changes_requested.
     Always attempted regardless of ``autonomy`` — the caller decides what to
     do with a True result (merge unattended vs. wait for a human verdict);
     this function only runs the mechanical cycle.
@@ -421,22 +1025,40 @@ def run_auto_fix_cycle(
     ends at status=in_review, review_verdict=approved, exactly like a
     human-approved ticket — written by run_review_agent's own cmd_review
     call, no special-case write needed here). Returns False if the fix pass
-    fails, the drift-check fails (fail-closed, regardless of remaining
-    attempt budget — this gate is never bypassed, in any autonomy mode), or
-    the attempt cap is exceeded. In every False case the ticket is left at
-    status=code_complete, review_verdict=changes_requested (unchanged, so
-    cmd_blocked/cmd_merge's guard keep working) with one "## Auto-Fix Attempt
-    N" body section per attempt and an updated review_summary describing the
-    escalation reason.
+    fails for a genuine reason (agent ran but failed to commit, drift-check
+    fails, or attempt cap exceeded). Returns None if the fix agent was
+    interrupted by a rate limit or signal before it could meaningfully attempt
+    a fix — in this case the ticket is hibernated (status=hibernated) and the
+    attempt counter is NOT incremented, so the next ``lanegate run`` will
+    retry the fix from where it left off.
+    In every False case the ticket is left at status=code_complete,
+    review_verdict=changes_requested (unchanged, so cmd_blocked/cmd_merge's
+    guard keep working) with one "## Auto-Fix Attempt N" body section per
+    attempt and an updated review_summary describing the escalation reason.
     """
     from lanegate.lifecycle import record_auto_fix_attempt
     from lanegate.ticket import parse_ticket
 
     tid = ticket["id"]
+    if ticket.get("status") != "code_complete":
+        # Defensive backstop, not the primary guard: every current caller
+        # already checks this before dispatching here (a ticket that's
+        # already needs_review/hibernated/in_review has no review findings
+        # to act on, and a generic failure here would overwrite whatever
+        # specific reason moved it there). This exists so a future call
+        # site can't reintroduce that overwrite bug by forgetting the check.
+        return False
     tickets_dir = repo_root / cfg["tickets_dir"]
-    max_attempts = cfg.get("max_auto_fix_attempts", 1)
+    mechanical_limit = int(cfg.get("max_auto_fix_attempts", 1))
+    escalation_limit = int(resolve_human_escalation(cfg)["retry_limit"])
+    # max_auto_fix_attempts is the ordinary mechanical budget.  The human
+    # escalation retry_limit is a safety ceiling, so neither setting can
+    # increase the number of unattended retry attempts beyond the other.
+    max_attempts = min(mechanical_limit, escalation_limit)
 
     initial = parse_ticket(ticket["_path"]) if ticket.get("_path") else ticket
+    if initial is None:
+        initial = ticket
     if not _extract_review_findings(initial).strip():
         record_auto_fix_attempt(
             tid,
@@ -454,6 +1076,8 @@ def run_auto_fix_cycle(
 
     for attempt in range(1, max_attempts + 1):
         current = parse_ticket(ticket["_path"]) if ticket.get("_path") else ticket
+        if current is None:
+            current = ticket
         findings = _extract_review_findings(current)
 
         pre_fix_sha = _git_head_sha(worktree_path)
@@ -472,7 +1096,29 @@ def run_auto_fix_cycle(
             )
             return False
 
-        if not run_fix_agent(current, cfg, repo_root, worktree_path, findings, pre_fix_sha):
+        try:
+            run_fix_agent(
+                current, cfg, repo_root, worktree_path, findings, pre_fix_sha, pool_name=pool_name
+            )
+        except RateLimitedFixError as exc:
+            # Rate limit / interrupt — the fix agent never meaningfully ran.
+            # Hibernate the ticket WITHOUT incrementing the attempt counter so
+            # the next ``lanegate run`` can retry from where it left off,
+            # matching the behaviour of the implement/review hibernation path.
+            from lanegate.lifecycle import cmd_hibernate
+
+            reason = (
+                f"rate limit or quota interruption during fix agent "
+                f"(attempt {attempt}/{max_attempts}): {exc}"
+            )
+            print(
+                f"[autofix] {tid}: rate limit hit during fix pass — hibernating. "
+                f"Re-run: lanegate run",
+                file=sys.stderr,
+            )
+            cmd_hibernate(tid, cfg, repo_root, reason=reason)
+            return None
+        except FixFailedError:
             record_auto_fix_attempt(
                 tid,
                 cfg,
@@ -484,7 +1130,9 @@ def run_auto_fix_cycle(
             )
             return False
 
-        drift = run_drift_check(current, cfg, repo_root, worktree_path, findings, pre_fix_sha)
+        drift = run_drift_check(
+            current, cfg, repo_root, worktree_path, findings, pre_fix_sha, pool_name=pool_name
+        )
         if not drift.ok:
             record_auto_fix_attempt(
                 tid,
@@ -502,7 +1150,9 @@ def run_auto_fix_cycle(
             )
             return False
 
-        approved = run_review_agent(current, repo_root, worktree_path=worktree_path, cfg=cfg)
+        approved = run_review_agent(
+            current, repo_root, worktree_path=worktree_path, cfg=cfg, pool_name=pool_name
+        )
 
         if approved:
             record_auto_fix_attempt(
@@ -557,13 +1207,38 @@ def cmd_fix(ticket_id: str, cfg: dict, repo_root: Path) -> None:
 
     The only entry point besides the in-loop callers in orchestrate/loop.py —
     an out-of-band review (a human running ``lanegate review`` directly, or a
-    review from a separate `lanegate orchestrate` process) has no other way to
+    review from a separate `lanegate run` process) has no other way to
     reach the auto-fix machinery, since it is otherwise reachable only from
     inside ``_drain_loop`` immediately after a dispatch in the same process.
     """
     from lanegate.ticket import canonical_id
 
     tid = canonical_id(ticket_id)
+    tracking = begin_direct_action(repo_root, "fix", ticket_id=tid, executor="cli")
+    print(f"Action {tracking['action_id']}: fix running (log: {tracking['log_path']})")
+    try:
+        fixed = _cmd_fix_tracked(tid, cfg, repo_root)
+    except BaseException:
+        record_direct_action_event(
+            repo_root, tracking["action_id"], "action_end", action_type="fix", ticket_id=tid,
+            status="failed",
+        )
+        raise
+    status = "success" if fixed is True else ("rate_limited" if fixed is None else "escalated")
+    record_direct_action_event(
+        repo_root, tracking["action_id"], "action_end", action_type="fix", ticket_id=tid,
+        status=status,
+    )
+    if fixed is True:
+        print(f"Action {tracking['action_id']}: fix success")
+    elif fixed is None:
+        print(f"Action {tracking['action_id']}: fix rate_limited")
+    else:
+        print(f"Action {tracking['action_id']}: fix escalated")
+
+
+def _cmd_fix_tracked(tid: str, cfg: dict, repo_root: Path) -> bool | None:
+    """Existing fix flow, separated so its action envelope also records failures."""
     tickets_dir = repo_root / cfg["tickets_dir"]
     tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
     ticket = next((t for t in tickets if t["id"] == tid), None)
@@ -586,10 +1261,13 @@ def cmd_fix(ticket_id: str, cfg: dict, repo_root: Path) -> None:
         sys.exit(1)
 
     fixed = run_auto_fix_cycle(ticket, cfg, repo_root, Path(wt))
-    if fixed:
+    if fixed is True:
         print(f"[fix] {tid}: auto-fix cycle reached approved — awaiting human merge approval")
+    elif fixed is None:
+        print(f"[fix] {tid}: auto-fix cycle rate-limited / hibernated — retryable via lanegate run", file=sys.stderr)
     else:
         print(f"[fix] {tid}: auto-fix cycle escalated — see ticket for details", file=sys.stderr)
+    return fixed
 
 
 def _has_explicit_review_route(cfg: dict, ticket: dict) -> bool:
@@ -609,6 +1287,35 @@ def _has_explicit_review_route(cfg: dict, ticket: dict) -> bool:
     return False
 
 
+# Executor types with their own shell/command-execution capability, able to
+# self-drive `lanegate complete && lanegate review --verdict ...` from
+# inside their own session the way combined mode's appended prompt
+# instructions require (see _build_combined_prompt below). A pure
+# code-editing tool like aider has no such capability: it edits and commits
+# files, then exits -- it cannot act on instructions to shell out and run
+# CLI commands. Dispatching combined mode to one produces a ticket that
+# commits real, correct code and then permanently fails ("executor exited 0
+# but ticket status did not advance"), identically on every retry, since
+# nothing about a retry changes the executor's inability to comply.
+# Confirmed live in a fresh-install smoke test (aider + explicit reviewer:
+# aider pin). Conservative allowlist: an executor type not listed here falls
+# through to the independence ladder / split-mode dispatch instead, which is
+# always safe, rather than assuming an unverified type can self-drive.
+_COMBINED_MODE_CAPABLE_TYPES = {"claude", "claude-subagent", "claude-process", "codex", "agy"}
+assert _COMBINED_MODE_CAPABLE_TYPES <= _VALID_EXECUTOR_TYPES, (
+    "_COMBINED_MODE_CAPABLE_TYPES must stay a subset of _VALID_EXECUTOR_TYPES -- "
+    "a stale/renamed entry here would silently drop out of the allowlist instead "
+    "of raising at import time."
+)
+
+
+def combined_mode_capable(driver_name: str, cfg: dict) -> bool:
+    driver_cfg = expand_driver(driver_name, cfg)
+    resolved_type = driver_cfg.get("type", driver_name)
+    executor_type = get_executor_config(resolved_type, cfg).get("type", resolved_type)
+    return executor_type in _COMBINED_MODE_CAPABLE_TYPES
+
+
 def _is_combined_mode(
     cfg: dict,
     ticket: dict,
@@ -625,16 +1332,23 @@ def _is_combined_mode(
       3. 'self': same instance and same model, no alternative -> combined mode (return True)
 
     An explicit same-executor pin (via reviewer:, steps.review.driver, or executor_steps.review)
-    or callers without worktree context (repo_root is None) bypass the ladder and return True.
+    or callers without worktree context (repo_root is None) bypass the ladder and return True --
+    but only when the implement executor is actually capable of combined mode at all
+    (combined_mode_capable); otherwise this always returns False regardless of an explicit
+    pin, so dispatch falls through to split-mode review instead of a route that can never
+    complete.
     """
     route = _resolve_driver_route(cfg, ticket)
     if route["mode"] == "split":
         return False
 
+    impl = implementer or route["implement"]
+    if not combined_mode_capable(impl, cfg):
+        return False
+
     if _has_explicit_review_route(cfg, ticket) or repo_root is None:
         return True
 
-    impl = implementer or route["implement"]
     _, independence = resolve_independent_review_driver(
         ticket, cfg, repo_root, implementer=impl
     )

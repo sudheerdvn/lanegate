@@ -8,7 +8,7 @@ import (
 	"lanegate/tui/internal/ui"
 )
 
-// BlockedModel represents the blocked queue screen state (MVP placeholder)
+// BlockedModel represents tickets awaiting a human decision or intervention.
 type BlockedModel struct {
 	data          *client.BlockedPayload
 	selectedIndex int
@@ -59,8 +59,7 @@ func (bm *BlockedModel) SelectedIndex() int {
 	return bm.selectedIndex
 }
 
-// Render renders the blocked/review queue screen as plain text sized to
-// width. Each entry lists its id, title, branch, and review findings.
+// Render renders the needs-human-decision queue grouped by remediation type.
 func (bm *BlockedModel) Render(width int) string {
 	if bm.data == nil || len(bm.data.Blocked) == 0 {
 		return "No blocked tickets."
@@ -71,26 +70,53 @@ func (bm *BlockedModel) Render(width int) string {
 		titleWidth = 8
 	}
 
+	categoryOrder := []struct {
+		key, label string
+	}{
+		{"escalated", "Escalated"},
+		{"rejected", "Changes Requested"},
+		{"failed", "Failed"},
+		{"stuck", "Stuck"},
+		{"awaiting_merge", "Awaiting Merge"},
+		{"", "Needs Attention"}, // compatibility with older API fixtures
+	}
+	grouped := make(map[string][]int, len(categoryOrder))
+	for i, ticket := range bm.data.Blocked {
+		grouped[ticket.AttentionCategory] = append(grouped[ticket.AttentionCategory], i)
+	}
+
 	var sections []string
-	for i, t := range bm.data.Blocked {
-		var b strings.Builder
-		title := fmt.Sprintf("%s  %s", t.ID, ui.TruncateString(t.Title, titleWidth))
-		if i == bm.selectedIndex {
-			title = ui.SelectedItemStyle.Render(title)
+	for _, category := range categoryOrder {
+		indices := grouped[category.key]
+		if len(indices) == 0 {
+			continue
 		}
-		fmt.Fprintf(&b, "%s\n", title)
-		fmt.Fprintf(&b, "%s %s\n", ui.LabelStyle.Render("Branch:"), t.Branch)
-
-		if len(t.Findings) > 0 {
-			b.WriteString(ui.LabelStyle.Render("Findings:"))
-			b.WriteString("\n")
-			for _, f := range t.Findings {
-				b.WriteString(ui.WrapText("- "+f, width))
-				b.WriteString("\n")
+		var rows []string
+		for _, i := range indices {
+			t := bm.data.Blocked[i]
+			var b strings.Builder
+			title := fmt.Sprintf("%s  %s", t.ID, ui.TruncateString(t.Title, titleWidth))
+			if i == bm.selectedIndex {
+				title = ui.SelectedItemStyle.Render(title)
 			}
-		}
+			fmt.Fprintf(&b, "%s\n", title)
+			fmt.Fprintf(&b, "%s %s\n", ui.LabelStyle.Render("Branch:"), t.Branch)
+			if t.AttentionSummary != "" {
+				fmt.Fprintf(&b, "%s %s\n", ui.LabelStyle.Render("Reason:"), ui.WrapText(t.AttentionSummary, width))
+			}
 
-		sections = append(sections, strings.TrimRight(b.String(), "\n"))
+			if len(t.Findings) > 0 {
+				b.WriteString(ui.LabelStyle.Render("Findings:"))
+				b.WriteString("\n")
+				for _, f := range t.Findings {
+					b.WriteString(ui.WrapText("- "+f, width))
+					b.WriteString("\n")
+				}
+			}
+
+			rows = append(rows, strings.TrimRight(b.String(), "\n"))
+		}
+		sections = append(sections, ui.LabelStyle.Render(category.label)+"\n"+strings.Join(rows, "\n\n"))
 	}
 
 	return strings.Join(sections, "\n\n")

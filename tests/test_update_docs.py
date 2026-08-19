@@ -4,6 +4,7 @@ test_update_docs.py — unit tests for ad-hoc `lanegate update-docs` command.
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from lanegate.update_docs import (
     cmd_update_docs,
@@ -233,7 +234,7 @@ def test_no_op_when_no_new_tickets(tmp_path: Path) -> None:
     assert head_before == head_after
 
 
-def test_doc_update_commit(tmp_path: Path) -> None:
+def test_update_docs_commits_with_signoff(tmp_path: Path) -> None:
     _init_git_repo(tmp_path)
 
     docs_dir = tmp_path / "docs"
@@ -289,7 +290,15 @@ def test_doc_update_commit(tmp_path: Path) -> None:
         },
     }
 
-    res = cmd_update_docs(cfg, tmp_path, executor_fn=fake_executor)
+    calls = []
+    real_run = subprocess.run
+
+    def recording_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return real_run(cmd, **kwargs)
+
+    with patch("lanegate.update_docs.subprocess.run", side_effect=recording_run):
+        res = cmd_update_docs(cfg, tmp_path, executor_fn=fake_executor)
 
     assert res["ok"] is True
     assert res["status"] == "committed"
@@ -302,3 +311,7 @@ def test_doc_update_commit(tmp_path: Path) -> None:
     assert new_watermark is not None
     assert new_watermark != initial_watermark
     assert res["watermark"] == new_watermark
+
+    commit_calls = [cmd for cmd in calls if cmd[:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    assert "-s" in commit_calls[0]

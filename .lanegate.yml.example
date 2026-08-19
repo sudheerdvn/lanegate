@@ -19,6 +19,17 @@ executor: claude             # claude | claude-subagent | claude-process | aider
 #   lanegate orchestrate --human-review per_ticket
 # reviewer: human
 
+# AST-based skeletons/symbol-search (analyze + review) already cover Python
+# (stdlib ast) and, via tree-sitter, Go/JS/JSX/TS/TSX/Rust/Java/Ruby/C/C++/
+# PHP/C#/Swift/Kotlin out of the box. Add another language here without
+# waiting on a LaneGate release -- just `pip install tree-sitter-<lang>` and
+# map its file extension(s) to its module name. Unmapped/unparseable files
+# degrade to ripgrep, never fail.
+# tree_sitter_languages:
+#   .vue: tree_sitter_vue
+#   .ex: tree_sitter_elixir
+#   .exs: tree_sitter_elixir
+
 # --- Multi-agent dispatch (optional) ---
 #
 # Define named driver instances. Each driver is an invocation of an agent type
@@ -82,13 +93,35 @@ steps:
 # Effective batch = min(touch-disjoint candidates, max_parallel)
 max_parallel: 2
 
+# Optional per-dispatch budget caps. Use either a positive integer to apply the
+# cap to every dispatch, or a mapping for individual implement, review, fix,
+# and drift_check steps. Omitted mapping steps are uncapped; both keys default
+# to null.
+# max_turns: 50
+# max_cumulative_tokens: 1000000
+# max_turns:
+#   implement: 60
+#   review: 30
+# max_cumulative_tokens:
+#   implement: 1200000
+#   review: 300000
+
+# How many fix -> drift-check -> re-review cycles run when a review comes back
+# changes_requested. Total review runs per ticket = this value + 1, so the
+# default of 1 means at most two. This is the main LLM-cost lever in the
+# lifecycle; safeguards below are plain subprocesses and cost no tokens.
+# A drift-check failure or an empty finding list escalates to a human
+# immediately, without consuming a remaining attempt.
+max_auto_fix_attempts: 1
+
 # What to do when the executor hits a rate limit / quota error mid-run.
-# halt   (default) — hibernate the ticket, print instructions, stop the run.
-#                     You re-run `lanegate orchestrate` manually once the limit clears.
-# resume            — same hibernate, but also spawns a detached `lanegate resume-watch`
-#                     daemon that polls with capped exponential backoff and re-runs
-#                     `lanegate orchestrate` automatically once the limit clears.
-on_rate_limit: halt
+# resume (default) — hibernate the ticket, and spawn a detached
+#                     `lanegate resume-watch` daemon that polls with capped
+#                     exponential backoff and re-runs `lanegate orchestrate`
+#                     automatically once the limit clears.
+# halt              — same hibernate, but print instructions and stop the run.
+#                     You re-run `lanegate orchestrate` manually.
+on_rate_limit: resume
 
 # Backoff settings for the resume-watch daemon (only used when on_rate_limit: resume).
 # ceiling_s: null polls forever; set it (e.g. 21600 for 6h) to give up after that
@@ -148,8 +181,9 @@ notify:
 # docs/security-model.md#headless-permission-options-for-the-claude-executor.
 executors:
   claude:  { max_parallel: 3, flags: ["--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"] }
-  aider:   { max_parallel: 1, flags: ["--yes-always"] }
-  codex:   { max_parallel: 3, flags: ["--approval-policy=never"] }
+  aider:   { max_parallel: 1, context_window_tokens: 32768, repo_map: true, neutralize_touches: true, flags: ["--yes-always", "--no-gitignore"] }
+  codex:   { max_parallel: 3, flags: ["--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "--ignore-rules", "--ephemeral"] }
+  agy:     { max_parallel: 3, flags: ["--dangerously-skip-permissions", "--disable-slash-commands"] }
   ollama:  { max_parallel: 1, models: { analyze: llama3.1 } }  # text-only; see drivers: above for local coding
 
 # Optional: distribute tickets across more than one account of the same
@@ -189,8 +223,8 @@ verification:
   #     url: "http://localhost:4000"
 
 # Repo-local coding practices to include in analyze/implement/review prompts.
-# By default LaneGate also discovers common files like AGENTS.md, CLAUDE.md,
-# .github/copilot-instructions.md, .cursorrules, and CONTRIBUTING.md.
+# By default LaneGate also discovers vendor-neutral files like AGENTS.md, .lanegate/globals.md,
+# as well as CLAUDE.md, GEMINI.md, .github/copilot-instructions.md, .cursorrules, and CONTRIBUTING.md.
 # Set `project_guidance: false` to disable this prompt context.
 project_guidance:
   include_defaults: true
@@ -205,14 +239,41 @@ lock_statuses: [in_progress, code_complete, in_review]
 # Supported examples include: pytest, npm test, cargo test, go test, make lint,
 # and executable scripts such as scripts/run-tests.sh.
 safeguards:
+  # in_progress -> code_complete, run inside the ticket's isolated worktree.
+  # Keep this to the fast suite: it is your tightest feedback loop.
   pre_complete:
     - pytest
+  # The list is always re-run against merged trunk to catch two tickets that
+  # each pass alone but break combined.
   pre_merge:
     - pytest
-  # Runs from the merged control checkout during `lanegate validate`.
-  # When configured, `lanegate done` requires validation first.
-  post_merge:
-    - pytest
+  # Also run pre_merge in the ticket worktree before merging (default: true).
+  # Set false when pre_complete already verified the unchanged branch and the
+  # merged-trunk verification below is the only additional check you need.
+  pre_merge_worktree: true
+  # merged -> validated, run from the merged control checkout during
+  # `lanegate validate`. This is the only stage with a real merged tree, so
+  # it is where integration tests, migrations, and anything needing a live
+  # service or a built artifact belong.
+  #
+  # Left unset by default, deliberately. `pre_merge` already re-runs against
+  # the merged trunk, so setting post_merge to the same command just repeats
+  # an identical suite on an identical tree. Only configure it for something
+  # pre_merge structurally cannot do. Note that configuring ANY post_merge
+  # guard makes `lanegate validate` mandatory before `lanegate done`.
+  # scripts/packaging-smoke.sh is POSIX-only; use an equivalent Python guard
+  # when Windows contributors need this check locally.
+  # post_merge:
+  #   - make integration-test
+  #   - scripts/packaging-smoke.sh
+
+  # Kill a hanging guard after N seconds. No timeout by default — a wedged
+  # test suite otherwise stalls the pipeline indefinitely. Timeouts are fatal
+  # and never retried; the ticket goes to needs_review.
+  timeout_s: 600
+  # Re-run a failing guard up to N times before treating it as failed.
+  # Only the final pass/fail matters. Useful for flaky integration suites.
+  retry_on_failure: 0
 
 # ── Feature flags (optional) ─────────────────────────────────────────────────
 # Remove this section if you do not use feature flags.

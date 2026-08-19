@@ -9,7 +9,7 @@ python ci/smoke_release.py
 
 The command copies the checkout to a temporary directory, builds a wheel and sdist there, and installs the wheel into a newly-created virtual environment. It also puts its temporary Git repositories and `HOME` there. It never creates `build/`, `dist/`, or `.lanegate/` in the checkout from which it is run.
 
-The seven checks are:
+The eight checks are:
 
 1. Build a wheel and source distribution.
 2. Install the wheel non-editably into an isolated virtual environment.
@@ -18,8 +18,9 @@ The seven checks are:
 5. Run `init`, `create`, `open`, `start`, `complete`, approved `review`, and `merge` in a throwaway Git repository.
 6. Assert a first manual promotion sees a missing environment branch as pending, creates that branch, carries `main`'s commit, and makes `board` show a later source commit as pending.
 7. Run `init -i` with `guard_script: [python, guard.py]`, then run `board` to prove later commands can reload the configuration.
+8. Enable and disable a feature flag via `lanegate flag` against the smoke environment's real `flag_file`, promoting after each change so a real `post_promote` hook script observes the resulting JSON.
 
-Every failed check is printed by name and makes the command return non-zero. The build failure intentionally prevents checks 2–7 from running, because no wheel exists to exercise. This is how force-include drift is reported without masking the cause.
+Every failed check is printed by name and makes the command return non-zero. The build failure intentionally prevents checks 2–8 from running, because no wheel exists to exercise. This is how force-include drift is reported without masking the cause.
 
 ## Current CI status
 

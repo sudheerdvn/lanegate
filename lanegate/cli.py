@@ -8,10 +8,209 @@ from __future__ import annotations
 
 import argparse
 import sys
+import textwrap
 from pathlib import Path
 
 from lanegate import APP_NAME, __version__
 from lanegate.config import find_repo_root, load_config
+from lanegate.ticket import _VALID_AUTONOMY
+
+# Keep the top-level command taxonomy next to the parser registration.  A new
+# command deliberately does not fall into a catch-all group: the test suite
+# detects that omission, while --help-all remains an accurate registry view.
+COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
+    "Common commands": (
+        "board",
+        "next",
+        "create",
+        "start",
+        "complete",
+        "review",
+        "merge",
+        "run",
+    ),
+    "Ticket lifecycle and recovery": (
+        "analyze",
+        "open",
+        "validate",
+        "done",
+        "hibernate",
+        "stop",
+        "needs-review",
+        "reopen",
+        "human-review",
+        "resolve-conflict",
+        "recover-rejected",
+        "recover-rate-limited-reviews",
+        "supersede",
+        "close",
+        "fix",
+    ),
+    "Monitoring and reporting": (
+        "pipeline-status",
+        "blocked",
+        "summary",
+        "route",
+        "stats",
+        "analytics",
+        "log",
+        "logs",
+        "session-summary",
+        "watch",
+        "resume-watch",
+        "notify-watch",
+        "run-report",
+        "ps",
+    ),
+    "Setup and integration": (
+        "init",
+        "promote",
+        "flag",
+        "globals",
+        "gh-sync",
+        "projects",
+        "prompts",
+        "doctor",
+        "install-agent-tools",
+        "install-commands",
+        "update-docs",
+        "tui",
+    ),
+    "Agent and run tools": (
+        "claim-file",
+        "mcp",
+        "api",
+        "orchestrator-lock",
+        "executor",
+        "symbols",
+    ),
+}
+
+HIDDEN_TOP_LEVEL_COMMANDS = frozenset({"context-stats", "orchestrate"})
+
+_COMMAND_HELP_OVERRIDES = {
+    "start": "Claim a ticket and create its branch and worktree",
+    "merge": "Merge an approved ticket branch into main",
+    "validate": "Run configured post-merge checks",
+    "done": "Close a validated ticket",
+}
+
+
+def _subparser_action(parser: argparse.ArgumentParser) -> argparse._SubParsersAction:
+    """Return the single top-level subparser action used by LaneGate."""
+    return next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+
+
+def registered_command_names(parser: argparse.ArgumentParser) -> set[str]:
+    """Return every invocable top-level command, including suppressed aliases."""
+    return set(_subparser_action(parser).choices)
+
+
+def unassigned_command_names(parser: argparse.ArgumentParser) -> set[str]:
+    """Return registered commands not given a visible help group."""
+    assigned = {name for names in COMMAND_GROUPS.values() for name in names}
+    return registered_command_names(parser) - assigned
+
+
+def _command_help(parser: argparse.ArgumentParser) -> dict[str, str]:
+    """Return the help text argparse recorded for each top-level command."""
+    helps = {name: "" for name in registered_command_names(parser)}
+    helps.update(
+        {
+            action.dest: action.help or ""
+            for action in _subparser_action(parser)._choices_actions
+        }
+    )
+    helps.update(
+        {
+            name: description
+            for name, description in _COMMAND_HELP_OVERRIDES.items()
+            if name in helps
+        }
+    )
+    return helps
+
+
+def _format_command_rows(
+    names: tuple[str, ...], helps: dict[str, str], *, show_suppressed: bool = False
+) -> str:
+    """Format command/help pairs as an ASCII-readable, 80-column list."""
+    indent = "  "
+    name_width = 31
+    description_width = 80 - len(indent) - name_width
+    rows: list[str] = []
+    for name in names:
+        description = helps.get(name, "")
+        # argparse exposes aliases through ``choices`` but not through
+        # ``_choices_actions``. Preserve the hidden/compatibility contract for
+        # those names when rendering --help-all.
+        if not description and name in HIDDEN_TOP_LEVEL_COMMANDS:
+            description = argparse.SUPPRESS
+        if description == argparse.SUPPRESS:
+            if not show_suppressed:
+                continue
+            description = "Compatibility command (hidden from default help)"
+        wrapped = textwrap.wrap(description, width=description_width) or [""]
+        rows.append(f"{indent}{name:<{name_width}}{wrapped[0]}")
+        rows.extend(f"{' ' * (len(indent) + name_width)}{line}" for line in wrapped[1:])
+    return "\n".join(rows)
+
+
+def _format_tiered_help(parser: argparse.ArgumentParser) -> str:
+    """Render the concise top-level help without changing argparse parsing."""
+    # The tiered-help contract is 80 columns regardless of the operator's
+    # terminal width.  ``_get_formatter()`` inherits COLUMNS, which can make
+    # argparse emit wider option rows than the command sections below.
+    formatter = parser.formatter_class(prog=parser.prog, width=80)  # type: ignore[call-arg]
+    formatter.add_usage("%(prog)s [--json] <command> ...", [], [])
+    formatter.add_text(textwrap.fill(parser.description or "", width=80))
+    formatter.start_section("options")
+    formatter.add_arguments(
+        action
+        for action in parser._actions
+        if not isinstance(action, argparse._SubParsersAction)
+    )
+    formatter.end_section()
+
+    groups = []
+    helps = _command_help(parser)
+    for heading, names in COMMAND_GROUPS.items():
+        rows = _format_command_rows(names, helps)
+        if rows:
+            groups.append(f"{heading}:\n{rows}")
+    groups.append(
+        textwrap.fill(
+            f"Run '{parser.prog} --help-all' to see the complete command list, "
+            "including advanced and compatibility commands.",
+            width=80,
+        )
+    )
+    return formatter.format_help().rstrip() + "\n\n" + "\n\n".join(groups) + "\n"
+
+
+def _format_full_help(parser: argparse.ArgumentParser) -> str:
+    """Render every registered command in one flat list for discovery and tooling."""
+    command_names = tuple(sorted(registered_command_names(parser)))
+    rows = _format_command_rows(
+        command_names, _command_help(parser), show_suppressed=True
+    )
+    return (
+        f"usage: {parser.prog} [--json] <command> ...\n\n"
+        f"{textwrap.fill(parser.description or '', width=80)}\n\n"
+        f"All commands:\n{rows}\n"
+    )
+
+
+class _HelpAllAction(argparse.Action):
+    """Print the ungrouped command registry before argparse requires a command."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser._print_message(_format_full_help(parser))
+        parser.exit()
 
 
 def _get_cfg_and_root() -> tuple[dict, Path]:
@@ -40,8 +239,8 @@ def _force_utf8_output() -> None:
             pass
 
 
-def main() -> None:
-    _force_utf8_output()
+def build_parser() -> argparse.ArgumentParser:
+    """Build LaneGate's CLI parser without parsing or dispatching a command."""
     p = argparse.ArgumentParser(
         prog=APP_NAME,
         description="Git-native agentic delivery: queue → parallel agents → quality gates → staged deploy",
@@ -57,6 +256,12 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Emit structured JSON instead of human-readable text (board, next, pipeline-status, flag list)",
+    )
+    p.add_argument(
+        "--help-all",
+        action=_HelpAllAction,
+        nargs=0,
+        help="Show the complete flat list of top-level commands",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -113,16 +318,35 @@ def main() -> None:
         help="Comma-separated ticket IDs the orchestrator has already started; their touches are treated as locked when computing the next candidate",
     )
     sub.add_parser("pipeline-status", help="Commits pending at each pipeline stage")
-    sub.add_parser("blocked", help="List code_complete tickets with changes_requested review verdict")
+    sub.add_parser("blocked", help="List tickets awaiting a human decision or intervention")
+
+    summary_p = sub.add_parser(
+        "summary",
+        help="Consolidated why-is-this-stuck view for one ticket: reason, review findings, diff stat, next step",
+    )
+    summary_p.add_argument("ticket_id")
 
     route_p = sub.add_parser(
-        "route", help="Dry-run: show which executor pool a ticket would route to, and why"
+        "route", help="Show or set executor/reviewer routing for a ticket"
     )
     route_p.add_argument("ticket_id")
+    route_p.add_argument("--reviewer", help="Pin ticket reviewer (e.g. codex, claude-a, agy)")
+    route_p.add_argument("--executor", help="Pin ticket executor (e.g. codex, claude-b, agy)")
+    route_p.add_argument(
+        "--model", "--review-model", dest="model", help="Pin review model"
+    )
 
-    for name in ("start", "merge", "validate", "done"):
-        sp = sub.add_parser(name)
+    for name in ("start", "validate", "done"):
+        sp = sub.add_parser(name, help="Lifecycle action with a stable action ID and .lanegate/logs/action-*.events.jsonl audit log")
         sp.add_argument("ticket_id")
+
+    merge_p = sub.add_parser("merge", help="Merge a reviewed ticket and print its stable action tracking reference")
+    merge_p.add_argument("ticket_id")
+    merge_p.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Deprecated compatibility flag; ticket-metadata-only conflicts are reconciled automatically",
+    )
 
     hibernate_p = sub.add_parser("hibernate", help="Hibernate interrupted in-progress work")
     hibernate_p.add_argument("ticket_id", nargs="?")
@@ -161,18 +385,68 @@ def main() -> None:
     needs_review_p.add_argument("ticket_id")
     needs_review_p.add_argument("--reason", default="", help="Reason recorded in the ticket body")
 
-    reopen_p = sub.add_parser("reopen", help="Reset a failed ticket back to open for re-dispatch")
+    reopen_p = sub.add_parser(
+        "reopen", help="Reset a ticket's lifecycle status without dispatching an agent"
+    )
     reopen_p.add_argument("ticket_id")
+
+    human_review_p = sub.add_parser(
+        "human-review",
+        help="Record an audited human approval for a needs_review ticket or dismiss changes_requested findings on a code_complete ticket",
+    )
+    human_review_p.add_argument("ticket_id")
+    human_review_p.add_argument(
+        "--rationale",
+        required=True,
+        help="Human justification for approving a needs_review ticket or dismissing review findings on a code_complete ticket",
+    )
+
+    resolve_conflict_p = sub.add_parser(
+        "resolve-conflict",
+        help="Explicitly rebase a needs-review worktree and dispatch a conflict-fix agent",
+    )
+    resolve_conflict_p.add_argument("ticket_id")
+    resolve_conflict_p.add_argument(
+        "--pool", default=None, metavar="NAME", help="Draw the conflict-fix agent from this pools: entry"
+    )
+
+    recover_review_p = sub.add_parser(
+        "recover-rate-limited-reviews",
+        help="Safely restore misclassified 429 review harness failures to review-pending",
+    )
+    recover_review_p.add_argument("ticket_id", nargs="?", default=None)
+
+    recover_rejected_p = sub.add_parser(
+        "recover-rejected",
+        help="Release exhausted rejected tickets to needs_review without dispatching agents",
+    )
+    recover_rejected_p.add_argument("ticket_id", nargs="?", default=None)
+    recover_rejected_p.add_argument(
+        "--all",
+        action="store_true",
+        help="Recover every ticket with an exhausted auto-fix budget or failed drift check",
+    )
 
     supersede_p = sub.add_parser(
         "supersede",
-        help="Close a ticket whose work already exists elsewhere (TICK-284 reconciliation)",
+        help="Close a ticket whose work already exists elsewhere (reconciliation)",
     )
     supersede_p.add_argument("ticket_id")
     supersede_p.add_argument(
         "--reason",
         default="",
         help="Human justification for retiring an obsolete non-terminal ticket",
+    )
+
+    close_p = sub.add_parser(
+        "close",
+        help="Close a completed no-code ticket with recorded evidence",
+    )
+    close_p.add_argument("ticket_id")
+    close_p.add_argument(
+        "--reason",
+        required=True,
+        help="Evidence that the ticket's own close criteria were completed",
     )
 
     open_p = sub.add_parser(
@@ -183,7 +457,7 @@ def main() -> None:
 
     # complete — separate so we can add --allow-drift and --auto-update-touches
     complete_p = sub.add_parser(
-        "complete", help="Mark a ticket code_complete (blocks on undeclared file drift)"
+        "complete", help="Mark a ticket code_complete and print an action ID/log (blocks on undeclared file drift)"
     )
     complete_p.add_argument("ticket_id")
     complete_p.add_argument(
@@ -202,7 +476,7 @@ def main() -> None:
     )
 
     # review — split out to support verdict/summary/findings flags
-    review_p = sub.add_parser("review", help="Submit ticket for review (→ in_review)")
+    review_p = sub.add_parser("review", help="Submit ticket for review (→ in_review) with stable action tracking")
     review_p.add_argument("ticket_id")
     review_p.add_argument(
         "--verdict",
@@ -225,7 +499,8 @@ def main() -> None:
 
     # fix
     fix_p = sub.add_parser(
-        "fix", help="Run fix -> drift-check -> re-review for a changes_requested ticket"
+        "fix", help="Run fix -> drift-check -> re-review with a stable action ID and audit log",
+        description="Run fix -> drift-check -> re-review with a stable action ID and audit log.",
     )
     fix_p.add_argument("ticket_id")
 
@@ -249,6 +524,18 @@ def main() -> None:
         "create", help="Capture intent as a draft ticket (and analyze by default)"
     )
     create_p.add_argument("intent", help="Natural-language description of what needs to be built")
+    create_p.add_argument(
+        "--title",
+        default=None,
+        metavar="TEXT",
+        help="Full title shown on the board (defaults to a concise title derived from the intent)",
+    )
+    create_p.add_argument(
+        "--autonomy",
+        choices=tuple(sorted(_VALID_AUTONOMY)),
+        default=None,
+        help="Per-ticket autonomy override (defaults to the project setting, or supervised)",
+    )
     create_p.add_argument(
         "--no-analyze",
         dest="no_analyze",
@@ -331,6 +618,28 @@ def main() -> None:
     # doctor
     sub.add_parser("doctor", help="check optional dependencies and report install instructions")
 
+    # Structural lookup as a first-class LaneGate verb. Agents were
+    # being told to grep for signatures LaneGate can already parse; this exposes
+    # the AST/tree-sitter index it builds internally so finding a definition
+    # costs one cheap call instead of an open-ended repo search.
+    symbols_p = sub.add_parser(
+        "symbols", help="List declared symbols in files (AST/tree-sitter, no grep)"
+    )
+    symbols_p.add_argument("paths", nargs="+", help="files to index")
+
+    # globals
+    globals_p = sub.add_parser(
+        "globals", help="Inspect and manage pending global proposals (.lanegate/pending-globals.md)"
+    )
+    globals_p.add_argument(
+        "action",
+        nargs="?",
+        default="show",
+        choices=["show", "clear"],
+        help="Action: 'show' (default) or 'clear'",
+    )
+
+
     # agent-native tool installers
     install_agent_p = sub.add_parser(
         "install-agent-tools",
@@ -407,6 +716,13 @@ def main() -> None:
             help="Group entries by executor+model and show side-by-side comparison",
         )
         _ap.add_argument(
+            "--by-day",
+            dest="by_day",
+            action="store_true",
+            default=False,
+            help="Show real cost grouped by operator-local calendar day",
+        )
+        _ap.add_argument(
             "--json",
             dest="json_output",
             action="store_true",
@@ -478,17 +794,17 @@ def main() -> None:
         help="Open the selected log with an installed external viewer",
     )
 
-    # session-summary — record main-session orchestrator cost
+    # session-summary — record main-session run cost
     sess_p = sub.add_parser(
         "session-summary",
-        help="Record the main-session orchestrator token cost for a completed run",
+        help="Record the main-session token cost for a completed run",
     )
     sess_p.add_argument(
         "--session-tokens",
         type=int,
         required=True,
         dest="session_tokens",
-        help="Token count consumed by the orchestrator's main session turns",
+        help="Token count consumed by the run's main session turns",
     )
     sess_p.add_argument(
         "--tickets",
@@ -520,7 +836,7 @@ def main() -> None:
     # resume-watch
     resume_watch_p = sub.add_parser(
         "resume-watch",
-        help="Background daemon: wait out a rate limit and auto-resume `lanegate orchestrate`",
+        help="Background daemon: wait out a rate limit and auto-resume `lanegate run`",
     )
     resume_watch_p.add_argument(
         "--status",
@@ -543,11 +859,18 @@ def main() -> None:
         default=False,
         help="Print recent resume attempts and outcomes (hibernated/retrying/resumed/gave_up)",
     )
+    resume_watch_p.add_argument(
+        "--background",
+        dest="resume_watch_background",
+        action="store_true",
+        default=False,
+        help="Spawn the watcher detached and exit; survives this terminal closing (no nohup/systemd needed)",
+    )
 
     # notify-watch
     notify_watch_p = sub.add_parser(
         "notify-watch",
-        help="Background daemon: push a phone notification when orchestrate looks stuck",
+        help="Background daemon: push a phone notification when a run looks stuck",
     )
     notify_watch_p.add_argument(
         "--status",
@@ -570,10 +893,18 @@ def main() -> None:
         default=False,
         help="Send one test push via the configured notify.ntfy_topic and exit",
     )
+    notify_watch_p.add_argument(
+        "--background",
+        dest="notify_watch_background",
+        action="store_true",
+        default=False,
+        help="Spawn the watcher detached and exit; survives this terminal closing (no nohup/systemd needed)",
+    )
 
-    # orchestrate
+    # run / orchestrate
     orch_p = sub.add_parser(
-        "orchestrate",
+        "run",
+        aliases=["orchestrate"],
         help="Clear the ticket board using the configured executor",
     )
     orch_p.add_argument(
@@ -650,7 +981,7 @@ def main() -> None:
         dest="status",
         action="store_true",
         default=False,
-        help="Report active orchestration status (ticket, executor PID, elapsed time, log path)",
+        help="Report active run status (ticket, executor PID, elapsed time, log path)",
     )
     orch_p.add_argument(
         "--pool",
@@ -662,19 +993,28 @@ def main() -> None:
             "(falls back to default_pool, or plain single-executor dispatch if unset)"
         ),
     )
+    orch_p.add_argument(
+        "--executors",
+        dest="executors",
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Restrict this run to an ad-hoc comma-separated list of executors: entries, "
+            "without pre-declaring a pools: entry for the combination (e.g. --executors agy,claude-b)"
+        ),
+    )
 
     # run-report
     run_report_p = sub.add_parser(
         "run-report",
-        help="Structured summary of an orchestrate run: per-ticket outcomes, executor "
-        "swaps/cooldowns, rate-limit hibernations, and orphaned processes",
+        help="Structured run/action history; direct actions use stable action IDs and .lanegate/logs/action-*.events.jsonl",
     )
     run_report_p.add_argument(
         "--session",
         dest="session_ts",
         default=None,
         metavar="TS",
-        help="Report on a specific run session (timestamp segment of orchestrate-<TS>.log); "
+        help="Report on a specific run session (timestamp segment of the run log); "
         "defaults to the most recent run",
     )
     run_report_p.add_argument(
@@ -688,8 +1028,8 @@ def main() -> None:
     # ps
     ps_p = sub.add_parser(
         "ps",
-        help="List every live lanegate-spawned process (orchestrator, daemons, ticket "
-        "executors), flagging any that are orphaned",
+        help="List live LaneGate processes and recent direct actions",
+        description="Lists direct action IDs, recent runs, and live LaneGate processes.",
     )
     ps_p.add_argument(
         "--json",
@@ -741,7 +1081,7 @@ def main() -> None:
     # api
     api_p = sub.add_parser(
         "api",
-        help="Start a loopback-only HTTP API server (127.0.0.1 only) for the board, tickets, diff, and orchestration endpoints",
+        help="Start a loopback-only HTTP API server (127.0.0.1 only) for board, tickets, diff, and run endpoints",
     )
     api_p.add_argument(
         "--port",
@@ -773,7 +1113,7 @@ def main() -> None:
         )
     orch_sub.add_parser("status", help="Report lock state without acquiring (read-only attach)")
 
-    # executor (TICK-090): quota-aware cooldown status/reset
+    # executor: quota-aware cooldown status/reset
     executor_p = sub.add_parser(
         "executor",
         help="Inspect and manage executor instance cooldown state (rate-limit/quota failover)",
@@ -797,8 +1137,30 @@ def main() -> None:
         help="Clear cooldown for every executor instance",
     )
 
+    # argparse's default subparser list is intentionally replaced only at the
+    # top level.  Every subcommand parser retains its normal --help output.
+    p.format_help = lambda: _format_tiered_help(p)  # type: ignore[method-assign]
+    return p
+
+
+def main() -> None:
+    _force_utf8_output()
+    p = build_parser()
     args = p.parse_args()
 
+    try:
+        _dispatch(args)
+    except ValueError as exc:
+        # canonical_id() and friends raise ValueError for a malformed
+        # ticket_id (e.g. stray whitespace, path-traversal syntax) coming
+        # straight from a CLI/MCP argument. Without this, that surfaces as a
+        # raw traceback instead of the same clean "ERROR: ..." + exit 1 every
+        # other invalid-input path in this file already uses.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _dispatch(args) -> None:
     if args.cmd == "board":
         cfg, repo_root = _get_cfg_and_root()
         from lanegate.board import cmd_board
@@ -841,11 +1203,25 @@ def main() -> None:
 
         cmd_blocked(cfg, repo_root, json_output=args.json_output)
 
+    elif args.cmd == "summary":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.board import cmd_summary
+
+        cmd_summary(args.ticket_id, cfg, repo_root, json_output=args.json_output)
+
     elif args.cmd == "route":
         cfg, repo_root = _get_cfg_and_root()
         from lanegate.board import cmd_route
 
-        cmd_route(cfg, repo_root, args.ticket_id, json_output=args.json_output)
+        cmd_route(
+            cfg,
+            repo_root,
+            args.ticket_id,
+            json_output=args.json_output,
+            reviewer=getattr(args, "reviewer", None),
+            executor=getattr(args, "executor", None),
+            model=getattr(args, "model", None),
+        )
 
     elif args.cmd == "start":
         cfg, repo_root = _get_cfg_and_root()
@@ -909,11 +1285,45 @@ def main() -> None:
 
         cmd_reopen(args.ticket_id, cfg, repo_root)
 
+    elif args.cmd == "human-review":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_human_review_approve
+
+        cmd_human_review_approve(args.ticket_id, cfg, repo_root, rationale=args.rationale)
+
+    elif args.cmd == "resolve-conflict":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_resolve_conflict
+
+        cmd_resolve_conflict(args.ticket_id, cfg, repo_root, pool_name=args.pool)
+
+    elif args.cmd == "recover-rate-limited-reviews":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_recover_rate_limited_reviews
+
+        cmd_recover_rate_limited_reviews(args.ticket_id, cfg, repo_root)
+
+    elif args.cmd == "recover-rejected":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_recover_rejected
+
+        try:
+            cmd_recover_rejected(args.ticket_id, cfg, repo_root, all_tickets=args.all)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+
     elif args.cmd == "supersede":
         cfg, repo_root = _get_cfg_and_root()
         from lanegate.lifecycle import cmd_supersede
 
         cmd_supersede(args.ticket_id, cfg, repo_root, reason=args.reason)
+
+    elif args.cmd == "close":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_close
+
+        cmd_close(args.ticket_id, cfg, repo_root, reason=args.reason)
 
     elif args.cmd == "open":
         cfg, repo_root = _get_cfg_and_root()
@@ -945,7 +1355,7 @@ def main() -> None:
         from lanegate.lifecycle import MergeFailedError, cmd_merge
 
         try:
-            cmd_merge(args.ticket_id, cfg, repo_root)
+            cmd_merge(args.ticket_id, cfg, repo_root, reconcile=args.reconcile)
         except MergeFailedError:
             sys.exit(1)
 
@@ -978,19 +1388,34 @@ def main() -> None:
         cfg, repo_root = _get_cfg_and_root()
         from lanegate.create import cmd_create
 
-        ticket_id = cmd_create(args.intent, cfg, repo_root, milestone=args.milestone)
+        ticket_id = cmd_create(
+            args.intent,
+            cfg,
+            repo_root,
+            milestone=args.milestone,
+            title=args.title,
+            autonomy=args.autonomy,
+        )
         if not args.no_analyze:
             from lanegate.analyze import cmd_analyze
 
-            try:
-                cmd_analyze(ticket_id, cfg, repo_root, keep_draft=True)
-            except Exception as exc:
+            def _report_analyze_skip(detail) -> None:
                 print(
-                    f"  Ticket {ticket_id} created (draft). "
-                    f"Run `lanegate analyze {ticket_id}` when ready.",
+                    f"  ticket {ticket_id} left in draft — run `lanegate analyze {ticket_id}` "
+                    f"once your executor pool is available",
                     file=sys.stderr,
                 )
-                print(f"  (analyze skipped: {exc})", file=sys.stderr)
+                print(f"  (analyze skipped: {detail})", file=sys.stderr)
+
+            try:
+                cmd_analyze(ticket_id, cfg, repo_root, keep_draft=True)
+            except SystemExit as exc:
+                if exc.code == 130:
+                    raise
+                detail = exc.__cause__ if exc.__cause__ is not None else f"analyze exited with code {exc.code}"
+                _report_analyze_skip(detail)
+            except Exception as exc:
+                _report_analyze_skip(exc)
 
     elif args.cmd == "analyze":
         cfg, repo_root = _get_cfg_and_root()
@@ -1034,6 +1459,52 @@ def main() -> None:
 
         sys.exit(cmd_doctor())
 
+    elif args.cmd == "symbols":
+        from lanegate.analyze import file_symbols
+
+        _, repo_root = _get_cfg_and_root()
+        missing: list[str] = []
+        for raw in args.paths:
+            path = Path(raw)
+            symbols = file_symbols(path, repo_root)
+            print(f"{path.as_posix()}:")
+            if symbols:
+                for symbol in symbols:
+                    print(f"  {symbol}")
+            else:
+                # Name the reason rather than printing an empty list: "no
+                # symbols" and "no grammar installed for this language" call for
+                # completely different responses from a human or an agent.
+                if path.suffix != ".py":
+                    missing.append(path.suffix or path.name)
+                print("  (no symbols found)")
+        if missing:
+            print(
+                "\nNote: no parser available for "
+                + ", ".join(sorted(set(missing)))
+                + ". Install grammars with: pip install 'lanegate[treesitter]'",
+                file=sys.stderr,
+            )
+
+    elif args.cmd == "globals":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.pending_globals import check_pending_globals, get_pending_globals_path
+        path = get_pending_globals_path(repo_root)
+        if args.action == "clear":
+            if path.exists():
+                path.unlink()
+                print(f"Cleared {path.relative_to(repo_root) if path.is_relative_to(repo_root) else path}.")
+            else:
+                print("No pending globals file to clear.")
+        else:
+            info = check_pending_globals(repo_root)
+            if not info["has_pending"]:
+                print("No pending global proposals found in .lanegate/pending-globals.md.")
+            else:
+                print(f"=== Pending Global Proposals ({info['count']}) ===")
+                print(info["text"])
+
+
     elif args.cmd == "install-agent-tools":
         _cmd_install_agent_tools(json_output=args.json_output)
 
@@ -1064,7 +1535,7 @@ def main() -> None:
             stats_json,
         )
 
-        _, repo_root = _get_cfg_and_root()
+        cfg, repo_root = _get_cfg_and_root()
         log_paths = [Path(p) for p in args.log_paths] if args.log_paths else None
         all_projects = getattr(args, "all_projects", False)
         entries, show_project = load_entries_for_analytics(
@@ -1090,7 +1561,11 @@ def main() -> None:
                 _step_costs = _load_step_costs_from_db(_db, _proj)
                 print(
                     stats_json(
-                        entries, sessions=_sessions or None, step_costs=_step_costs or None
+                        entries,
+                        sessions=_sessions or None,
+                        step_costs=_step_costs or None,
+                        repo_root=repo_root,
+                        cfg=cfg,
                     )
                 )
             return
@@ -1099,26 +1574,41 @@ def main() -> None:
             print("No context log entries yet.")
             return
 
-        if args.compare:
-            _print_compare(entries)
-            return
-
-        if show_project:
-            _print_all_projects_table(entries)
-        else:
-            _print_basic_table(entries)
-        if args.full:
+        # step_costs (real $ and token data) is DB-backed -- only fetch it
+        # when entries themselves came from the DB, not from an explicit
+        # --log JSONL file, so the two don't describe mismatched ticket sets.
+        step_costs = None
+        db_path = None
+        project = None
+        if not log_paths:
             from lanegate.context_log import (
                 _get_default_db_path,
                 _get_project_id,
-                _load_sessions_from_db,
                 _load_step_costs_from_db,
             )
 
             db_path = _get_default_db_path()
-            project = _get_project_id(repo_root) if repo_root else None
-            sessions = _load_sessions_from_db(db_path, project)
+            project = None if show_project else (_get_project_id(repo_root) if repo_root else None)
             step_costs = _load_step_costs_from_db(db_path, project)
+
+        if args.compare:
+            _print_compare(entries, step_costs=step_costs)
+            return
+
+        if args.by_day:
+            from lanegate.context_log import _print_by_day
+
+            _print_by_day(step_costs or [])
+            return
+
+        if show_project:
+            _print_all_projects_table(entries, repo_root=repo_root, cfg=cfg, step_costs=step_costs)
+        else:
+            _print_basic_table(entries, repo_root=repo_root, cfg=cfg, step_costs=step_costs)
+        if args.full:
+            from lanegate.context_log import _load_sessions_from_db
+
+            sessions = _load_sessions_from_db(db_path, project) if db_path else None
             _print_full_panels(entries, sessions=sessions, step_costs=step_costs)
 
     elif args.cmd == "session-summary":
@@ -1172,6 +1662,7 @@ def main() -> None:
             status=args.resume_watch_status,
             stop=args.resume_watch_stop,
             history=args.resume_watch_history,
+            background=args.resume_watch_background,
         )
 
     elif args.cmd == "notify-watch":
@@ -1184,9 +1675,10 @@ def main() -> None:
             status=args.notify_watch_status,
             stop=args.notify_watch_stop,
             test=args.notify_watch_test,
+            background=args.notify_watch_background,
         )
 
-    elif args.cmd == "orchestrate":
+    elif args.cmd in ("run", "orchestrate"):
         cfg, repo_root = _get_cfg_and_root()
         if args.status:
             _cmd_orchestrate_status(repo_root, args)
@@ -1208,6 +1700,9 @@ def main() -> None:
                 recover=not args.no_recover,
                 verbose=args.verbose,
                 pool=args.pool,
+                executors=[e.strip() for e in args.executors.split(",") if e.strip()]
+                if args.executors
+                else None,
             )
 
     elif args.cmd == "run-report":
@@ -1300,7 +1795,7 @@ def _cmd_orchestrator_lock(args, repo_root: Path) -> None:
 
 
 def _cmd_orchestrate_status(repo_root: Path, args) -> None:
-    """Report active orchestration status: ticket, executor PID, elapsed time, log path."""
+    """Report active run status: ticket, executor PID, elapsed time, log path."""
     from lanegate.orchestrate import _normalize_active_status
 
     status = _normalize_active_status(repo_root)
@@ -1319,7 +1814,7 @@ def _cmd_orchestrate_status(repo_root: Path, args) -> None:
             state = status.get("reconciliation_state") or "unknown"
             heartbeats = status.get("heartbeat_count") or 0
 
-            print("Active orchestration:")
+            print("Active LaneGate run:")
             print(f"  Ticket:     {tid}")
             print(f"  Executor:   PID {pid} (status: {state})")
             print(f"  Elapsed:    {elapsed}")
@@ -1327,7 +1822,7 @@ def _cmd_orchestrate_status(repo_root: Path, args) -> None:
             print(f"  Log:        {log_path}")
             print(f"  Audit:      {audit_path}")
         else:
-            print("No active orchestration run.")
+            print("No active LaneGate run.")
             state = status.get("reconciliation_state") or "none"
             if state != "none" and state != "no-active-run":
                 print(f"Last state: {state}")

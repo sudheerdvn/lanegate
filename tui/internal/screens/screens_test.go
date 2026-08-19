@@ -15,6 +15,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
 	"lanegate/tui/internal/client"
 	"lanegate/tui/internal/ui"
 )
@@ -179,6 +182,45 @@ func TestBoardModel_Render_DeterministicStatusOrder(t *testing.T) {
 		if got := bm.Render(narrowWidth); got != first {
 			t.Fatalf("Render output is not deterministic across repeated calls (map iteration order leaking through)")
 		}
+	}
+}
+
+func TestBoardModel_ToggleGrouping_GroupsAllTicketsByMilestone(t *testing.T) {
+	bm := NewBoardModel()
+	var payload client.BoardPayload
+	loadFixture(t, "board/board_basic.json", &payload)
+	bm.SetData(&payload)
+	if !bm.SelectTicket("TICK-149") {
+		t.Fatal("could not select fixture ticket TICK-149")
+	}
+
+	if got := bm.ToggleGrouping(); got != BoardGroupByMilestone {
+		t.Fatalf("ToggleGrouping() = %v, want BoardGroupByMilestone", got)
+	}
+	if got := bm.GroupingLabel(); got != "milestone" {
+		t.Errorf("GroupingLabel() = %q, want milestone", got)
+	}
+	if got := bm.SelectedTicketID(); got != "TICK-149" {
+		t.Errorf("selected ticket after grouping = %q, want TICK-149", got)
+	}
+
+	rendered := stripANSI(bm.Render(narrowWidth))
+	if !strings.Contains(rendered, "v1.5 (4)") || !strings.Contains(rendered, "v1.6 (2)") {
+		t.Errorf("milestone groups missing from rendered board:\n%s", rendered)
+	}
+	if strings.Index(rendered, "v1.5 (4)") > strings.Index(rendered, "v1.6 (2)") {
+		t.Errorf("milestone groups were not rendered in deterministic ascending order:\n%s", rendered)
+	}
+	for _, id := range []string{"TICK-150", "TICK-151", "TICK-149", "TICK-148", "TICK-147", "TICK-146"} {
+		if !strings.Contains(rendered, id) {
+			t.Errorf("milestone view missing ticket %s:\n%s", id, rendered)
+		}
+	}
+
+	line, ok := bm.SelectedTicketRenderedLine(narrowWidth)
+	lines := strings.Split(rendered, "\n")
+	if !ok || line < 0 || line >= len(lines) || !strings.Contains(lines[line], "TICK-149") {
+		t.Errorf("selected milestone row = line %d (ok=%t), want TICK-149:\n%s", line, ok, rendered)
 	}
 }
 
@@ -350,6 +392,29 @@ func TestBlockedModel_Render_ContainsFindings(t *testing.T) {
 	}
 }
 
+func TestBlockedModel_Render_GroupsByAttentionCategory(t *testing.T) {
+	bm := NewBlockedModel()
+	bm.SetData(&client.BlockedPayload{Blocked: []client.BlockedTicket{
+		{ID: "TICK-1", Title: "Escalated", AttentionCategory: "escalated", AttentionSummary: "Manual check required"},
+		{ID: "TICK-2", Title: "Rejected", AttentionCategory: "rejected", AttentionSummary: "Reviewer found a regression", Findings: []string{"Add a regression test"}},
+		{ID: "TICK-3", Title: "Stuck", AttentionCategory: "stuck", AttentionSummary: "Executor requires re-authentication"},
+		{ID: "TICK-4", Title: "Awaiting merge", AttentionCategory: "awaiting_merge", AttentionSummary: "Approved; awaiting human merge decision"},
+	}})
+
+	got := stripANSI(bm.Render(narrowWidth))
+	for _, want := range []string{
+		"Escalated", "Changes Requested", "Stuck", "Awaiting Merge",
+		"Manual check required", "Reviewer found a regression", "Add a regression test",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Render output missing %q:\n%s", want, got)
+		}
+	}
+	if !bm.MoveSelection(2) || bm.SelectedTicketID() != "TICK-3" {
+		t.Errorf("selection after grouped navigation = %q, want TICK-3", bm.SelectedTicketID())
+	}
+}
+
 // --- DiffModel ---
 
 func TestDiffModel_SetDataGetData(t *testing.T) {
@@ -489,6 +554,59 @@ func TestRunModel_Render_ActiveShowsWorkerAndRunID(t *testing.T) {
 	}
 }
 
+func TestRunModel_Render_BetweenDispatchesShowsAnalyzePhase(t *testing.T) {
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{
+		RunID:           "TICK-001-1700000000-1-implement",
+		Status:          "between-dispatches",
+		ProcessAlive:    true,
+		OrchestratorPID: 12321,
+		Orchestration:   &client.Orchestration{Active: true, State: "between-dispatches"},
+		Analysis: &client.AnalysisStatus{
+			TicketID: "TICK-002",
+			Phase:    "model_requested",
+			Executor: "claude",
+			Model:    "claude-haiku-4-5-20251001",
+		},
+	})
+
+	got := stripANSI(rm.Render(narrowWidth))
+	if strings.Contains(got, "No active orchestration run.") {
+		t.Errorf("Render showed no-active-run placeholder:\n%s", got)
+	}
+	for _, want := range []string{"BETWEEN-DISPATCHES", "TICK-002", "Waiting for model…", "executor=claude"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Render output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunModel_Render_BatchStatus(t *testing.T) {
+	rm := NewRunModel()
+	reason := "selected TICK-366 has parallel_safe=false"
+	rm.SetData(&client.RunPayload{
+		RunID:             "run-1",
+		Status:            "running",
+		BatchLine:         "[orchestrate] batch: 1 running of cap 3, 2 peers (3 open tickets total)",
+		UnderfilledReason: &reason,
+	})
+
+	got := stripANSI(rm.Render(narrowWidth))
+	for _, want := range []string{"Batch:", "Under-filled:", reason} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Render output missing %q:\n%s", want, got)
+		}
+	}
+
+	rm.SetData(&client.RunPayload{RunID: "run-1", Status: "running"})
+	got = stripANSI(rm.Render(narrowWidth))
+	for _, unwanted := range []string{"Batch:", "Under-filled:"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("Render output unexpectedly contains %q:\n%s", unwanted, got)
+		}
+	}
+}
+
 func TestRunModel_Render_ResumeWatchShowsRateLimitedInstance(t *testing.T) {
 	// Without this, resume-watch's own phase/elapsed_time is instance-agnostic:
 	// the Run screen would say "waiting" with no way to tell claude-a from
@@ -519,6 +637,55 @@ func TestRunModel_Render_CompletedRunHasNoActiveWorkers(t *testing.T) {
 	got := rm.Render(narrowWidth)
 	if !strings.Contains(got, "(no active workers)") {
 		t.Errorf("Render output missing no-workers placeholder:\n%s", got)
+	}
+}
+
+// TestRunModel_Render_LiveOutcomesFillsInAsTicketsFinish is a TICK-464
+// regression test: SetLiveBatchTickets must drive an incrementally-populated
+// per-ticket outcome table on the active Run screen, excluding tickets that
+// are still in progress and showing the failure reason once known.
+func TestRunModel_Render_LiveOutcomesFillsInAsTicketsFinish(t *testing.T) {
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{RunID: "run-live", Status: "running"})
+
+	failReason := "pytest exit 1"
+	rm.SetLiveBatchTickets([]client.TicketOutcome{
+		{TicketID: "TICK-201", Executor: "claude-a", Outcome: "in_progress"},
+		{TicketID: "TICK-202", Executor: "codex-a", Outcome: "success", DurationSeconds: 30.2},
+		{TicketID: "TICK-203", Executor: "claude-b", Outcome: "failure", DurationSeconds: 5.0, FailureReason: &failReason},
+	})
+
+	got := stripANSI(rm.Render(narrowWidth))
+	if !strings.Contains(got, "Live Outcomes") {
+		t.Errorf("Render output missing Live Outcomes section:\n%s", got)
+	}
+	if strings.Contains(got, "TICK-201") {
+		t.Errorf("Render output should exclude still in_progress TICK-201:\n%s", got)
+	}
+	for _, want := range []string{
+		"TICK-202", "codex-a", "success", "30.2s",
+		"TICK-203", "claude-b", "failure", "5.0s",
+		"TICK-203 failure reason: pytest exit 1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Render output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunModel_Render_LiveOutcomesEmptyWhenNoTicketHasFinished ensures no
+// empty "Live Outcomes" table is shown before any dispatched ticket in the
+// current batch has reached an outcome.
+func TestRunModel_Render_LiveOutcomesEmptyWhenNoTicketHasFinished(t *testing.T) {
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{RunID: "run-live", Status: "running"})
+	rm.SetLiveBatchTickets([]client.TicketOutcome{
+		{TicketID: "TICK-201", Executor: "claude-a", Outcome: "in_progress"},
+	})
+
+	got := rm.Render(narrowWidth)
+	if strings.Contains(got, "Live Outcomes") {
+		t.Errorf("Render output should not show Live Outcomes before any ticket finishes:\n%s", got)
 	}
 }
 
@@ -749,16 +916,24 @@ func TestRunModel_ActivityFallsBackToLifecycleWhenEventsMissing(t *testing.T) {
 }
 
 func TestRunModel_AuditModeRendersPaginatedRawLogsOnlyWhenExplicit(t *testing.T) {
+	previousProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(previousProfile)
+
 	rm := NewRunModel()
 	var payload client.RunPayload
 	loadFixture(t, "run/run_active.json", &payload)
 	rm.SetData(&payload)
 	rm.SetMode(RunModeAudit)
 	rm.SetAuditLogs(&client.RunLogsPayload{
-		RunID: "run-active", Events: []client.LogEvent{{Message: "raw executor protocol line"}}, TotalCount: 2, Offset: 0, Limit: 1,
+		RunID: "run-active", Events: []client.LogEvent{{Message: "raw executor protocol line", Style: "bold blue"}}, TotalCount: 2, Offset: 0, Limit: 1,
 	})
 
-	got := stripANSI(rm.Render(narrowWidth))
+	rendered := rm.Render(narrowWidth)
+	if !strings.Contains(rendered, "\x1b[1;34m") {
+		t.Errorf("audit render did not apply API style metadata:\n%s", rendered)
+	}
+	got := stripANSI(rendered)
 	for _, want := range []string{"Raw Audit Log", "raw executor protocol line"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("audit render missing %q:\n%s", want, got)
@@ -768,6 +943,121 @@ func TestRunModel_AuditModeRendersPaginatedRawLogsOnlyWhenExplicit(t *testing.T)
 	// footer instead of the scrolling body — see TestUpdate_RunAuditKeyGatesRawLogsAndPages.
 	if rm.AuditOffset() != 0 || rm.AuditTotal() != 2 || len(rm.AuditEvents()) != 1 {
 		t.Errorf("audit pagination state = offset %d total %d events %d, want 0/2/1", rm.AuditOffset(), rm.AuditTotal(), len(rm.AuditEvents()))
+	}
+}
+
+func TestRunModel_AuditModePreservesStyleInLiveTailAndHistory(t *testing.T) {
+	previousProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(previousProfile)
+
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{RunID: "run-active"})
+	rm.SetMode(RunModeAudit)
+	rm.AppendLogEvent(client.LogEvent{ID: "2", Message: "diff --git a/a b/a", Style: "bold blue"})
+	rm.SetHistoryPageWithMetadata(
+		"run-active", 0, []string{"@@ -1 +1 @@"}, []string{"info"}, []string{"magenta"},
+	)
+
+	rendered := rm.Render(narrowWidth)
+	if !strings.Contains(rendered, "\x1b[1;34m") {
+		t.Errorf("live tail did not preserve bold-blue style:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "\x1b[35m") {
+		t.Errorf("history did not preserve magenta style:\n%s", rendered)
+	}
+}
+
+func TestRunModel_AuditModePrettyPrintsJSONMessagesAndPassesNonJSONThrough(t *testing.T) {
+	jsonMsg := `{"tool":"edit","args":{"file":"x.py","line":10}}`
+	rm := NewRunModel()
+	var payload client.RunPayload
+	loadFixture(t, "run/run_active.json", &payload)
+	rm.SetData(&payload)
+	rm.SetMode(RunModeAudit)
+	rm.SetAuditLogs(&client.RunLogsPayload{
+		RunID: "run-active", Events: []client.LogEvent{{Message: jsonMsg}}, TotalCount: 1, Offset: 0, Limit: 1,
+	})
+
+	got := stripANSI(rm.Render(narrowWidth))
+	if !strings.Contains(got, "\"tool\"") || !strings.Contains(got, "\"args\"") {
+		t.Errorf("expected pretty-printed JSON fragments present:\n%s", got)
+	}
+	lines := strings.Split(got, "\n")
+	toolIdx, argsIdx := -1, -1
+	for i, line := range lines {
+		if strings.Contains(line, "\"tool\"") {
+			toolIdx = i
+		}
+		if strings.Contains(line, "\"args\"") {
+			argsIdx = i
+		}
+	}
+	if toolIdx == -1 || argsIdx == -1 || toolIdx == argsIdx {
+		t.Errorf("expected \"tool\" and \"args\" on separate lines (indented multi-line output), got:\n%s", got)
+	}
+
+	rmPlain := NewRunModel()
+	rmPlain.SetData(&payload)
+	rmPlain.SetMode(RunModeAudit)
+	plainMsg := "raw executor protocol line"
+	rmPlain.SetAuditLogs(&client.RunLogsPayload{
+		RunID: "run-active", Events: []client.LogEvent{{Message: plainMsg}}, TotalCount: 1, Offset: 0, Limit: 1,
+	})
+	gotPlain := stripANSI(rmPlain.Render(narrowWidth))
+	if !strings.Contains(gotPlain, ui.WrapText(plainMsg, narrowWidth)) {
+		t.Errorf("expected non-JSON message to render via unchanged WrapText output:\n%s", gotPlain)
+	}
+}
+
+func TestRunModelAuditSemanticFormatting(t *testing.T) {
+	previousProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	defer lipgloss.SetColorProfile(previousProfile)
+
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{RunID: "run-active"})
+	rm.SetMode(RunModeAudit)
+	rm.SetAuditLogs(&client.RunLogsPayload{
+		RunID: "run-active",
+		Events: []client.LogEvent{
+			{Message: "executor failed (exit 1)", Level: "error"},
+			{Message: "executor finished (exit 0)", Level: "success"},
+			{Message: "executor retrying (attempt 2)", Level: "warning"},
+		},
+		TotalCount: 3,
+		Limit:      3,
+	})
+
+	rendered := rm.Render(narrowWidth)
+	if !strings.Contains(rendered, "\x1b[31m✗") {
+		t.Errorf("error audit entry missing red ANSI styling:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "\x1b[32m✓") {
+		t.Errorf("success audit entry missing green ANSI styling:\n%s", rendered)
+	}
+	// The audit glyph set is unified with ActivitySymbol/ActivityStyle
+	// (TICK-478), so a warning-level entry renders "~" in the waiting
+	// color rather than the audit-only "!" glyph it used before.
+	if !strings.Contains(rendered, "\x1b[33m~") {
+		t.Errorf("warning audit entry missing unified activity glyph/styling:\n%s", rendered)
+	}
+	if got := formatAuditEvent(client.LogEvent{Message: "diff --git a/a b/a", Level: "info", Style: "bold blue"}, narrowWidth); !strings.Contains(got, "\x1b[1;34m") {
+		t.Errorf("style metadata did not override info-level styling:\n%s", got)
+	}
+	if copied, count := rm.CopyText(); count != 3 || copied != "executor failed (exit 1)\nexecutor finished (exit 0)\nexecutor retrying (attempt 2)" {
+		t.Errorf("CopyText = %q (%d items), want unmodified messages", copied, count)
+	}
+
+	rmHistory := NewRunModel()
+	rmHistory.SetData(&client.RunPayload{RunID: "run-active"})
+	rmHistory.SetMode(RunModeAudit)
+	rmHistory.SetHistoryPageWithLevels(
+		"run-active", 0, []string{"older executor failed (exit 1)"}, []string{"error"},
+	)
+	historyRendered := rmHistory.Render(narrowWidth)
+	if !strings.Contains(historyRendered, "\x1b[31m✗") {
+		t.Errorf("historical audit entry missing red ANSI styling:\n%s", historyRendered)
 	}
 }
 
@@ -814,10 +1104,17 @@ func TestRunModel_Render_HistoryAndSelectedRunDetail(t *testing.T) {
 		},
 	})
 
-	got := stripANSI(rm.Render(narrowWidth))
+	if got := stripANSI(rm.Render(narrowWidth)); strings.Contains(got, "Run History") {
+		t.Errorf("Render should be live-run-only, got history output:\n%s", got)
+	}
+	got := stripANSI(rm.RenderHistory(narrowWidth))
 	for _, want := range []string{
 		"Run History",
+		"TYPE",
+		"LANE",
+		"TICKETS",
 		"run-20260730T100000Z-11111111",
+		"TICK-101,TICK-102",
 		"FAILURE",
 		"Selected Run: run-20260730T100000Z-11111111",
 		"Terminal Reason: failure",
@@ -837,7 +1134,7 @@ func TestRunModel_Render_HistoryAndSelectedRunDetail(t *testing.T) {
 	if !rm.OpenSelectedHistory() {
 		t.Fatal("OpenSelectedHistory returned false")
 	}
-	detail := stripANSI(rm.Render(narrowWidth))
+	detail := stripANSI(rm.RenderHistory(narrowWidth))
 	for _, want := range []string{
 		"TICK-101 failure reason: pytest exit 1",
 		"TICK-102 review reason: needs operational docs",
@@ -845,6 +1142,98 @@ func TestRunModel_Render_HistoryAndSelectedRunDetail(t *testing.T) {
 		if !strings.Contains(detail, want) {
 			t.Errorf("historical detail missing %q:\n%s", want, detail)
 		}
+	}
+}
+
+// TestRunModel_HistoricalDetail_ShowsLiveWorkersWhenSelectedRunIsCurrent
+// covers a run that appears in the Run History list before it has finished
+// (e.g. terminal_reason "running"/"between-dispatches"): opening its detail
+// view must still surface the live Workers/Resolved Dispatch/Batch info
+// from rm.data, not just the (yet-incomplete) BatchTickets outcome summary.
+func TestRunModel_HistoricalDetail_ShowsLiveWorkersWhenSelectedRunIsCurrent(t *testing.T) {
+	rm := NewRunModel()
+	rm.SetData(&client.RunPayload{
+		RunID:  "run-live",
+		Status: "between-dispatches",
+		Workers: []client.RunWorker{
+			{TicketID: "TICK-468", ExecutorPID: 3428693, State: "between-dispatches", ReconciliationState: "orchestrator_live", ResolvedDriver: "codex-implement", ResolvedExecutor: "claude-b", ResolvedModel: "claude-sonnet-5"},
+		},
+		BatchLine: "[orchestrate] batch: 1 running of cap 3, 2 peers (3 open tickets total)",
+	})
+	rm.SetHistory(&client.RunHistoryPayload{Runs: []client.RunSummaryPayload{{
+		RunID:  "run-live",
+		Reason: "running",
+		BatchTickets: []client.TicketOutcome{
+			{TicketID: "TICK-464", Executor: "claude-b", Outcome: "skipped", DurationSeconds: 830.0},
+		},
+	}}})
+
+	if !rm.OpenSelectedHistory() {
+		t.Fatal("OpenSelectedHistory returned false")
+	}
+	detail := stripANSI(rm.RenderHistory(narrowWidth))
+	for _, want := range []string{
+		"Workers",
+		"TICK-468",
+		"3428693",
+		"Resolved Dispatch",
+		"route=codex-implement executor=claude-b model=claude-sonnet-5",
+		"Batch:",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("historical detail of live run missing %q:\n%s", want, detail)
+		}
+	}
+}
+
+// TestRunModel_RenderHistorySection_LargeBatchKeepsReasonAndOutcomesVisible
+// covers a regression where a run with many dispatched tickets (a common
+// batch size on this project) made the TICKETS column so wide that the
+// REASON/OUTCOMES columns were pushed past the terminal width — Table.Render
+// doesn't wrap or truncate rows to fit, so those columns silently scrolled
+// out of view instead of erroring.
+func TestRunModel_RenderHistorySection_LargeBatchKeepsReasonAndOutcomesVisible(t *testing.T) {
+	rm := NewRunModel()
+	tickets := make([]client.TicketOutcome, 0, 17)
+	for i := 1; i <= 17; i++ {
+		tickets = append(tickets, client.TicketOutcome{
+			TicketID: fmt.Sprintf("TICK-%d", 400+i),
+			Executor: "claude-b",
+			Outcome:  "success",
+		})
+	}
+	rm.SetHistory(&client.RunHistoryPayload{Runs: []client.RunSummaryPayload{{
+		RunID:        "run-large-batch",
+		Timestamp:    "2026-07-30T10:00:00Z",
+		Reason:       "stopped",
+		BatchTickets: tickets,
+	}}})
+
+	got := stripANSI(rm.RenderHistory(narrowWidth))
+	lines := strings.Split(got, "\n")
+	// The table's STARTED column now shows a formatted local timestamp
+	// rather than the raw run id (which the detail lines below the table
+	// still echo verbatim), so find the row by its all-caps REASON — the
+	// table renders "STOPPED" while "Terminal Reason:" below renders the
+	// lowercase raw value, keeping this match unique to the table row.
+	var row string
+	for _, line := range lines {
+		if strings.Contains(line, "STOPPED") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("history table row for run-large-batch not found:\n%s", got)
+	}
+	if !strings.Contains(row, "STOPPED") {
+		t.Errorf("history row REASON column missing/pushed out of view: %q", row)
+	}
+	if !strings.Contains(row, "17 success") {
+		t.Errorf("history row OUTCOMES column missing/pushed out of view: %q", row)
+	}
+	if !strings.Contains(row, "+13 more") {
+		t.Errorf("history row TICKETS column should be truncated with a count, got: %q", row)
 	}
 }
 
@@ -885,6 +1274,40 @@ func TestRunModel_MoveSelection(t *testing.T) {
 	}
 	if rm.MoveSelection(1) {
 		t.Error("MoveSelection(1) past end returned true, want false")
+	}
+}
+
+func TestHistoryRunType_DistinguishesResumeWatchFromManualLane(t *testing.T) {
+	if got := historyRunType("run-123", "resume-watch"); got != "AUTO" {
+		t.Errorf("historyRunType(run-123, resume-watch) = %q, want AUTO", got)
+	}
+	if got := historyRunType("run-123", "manual"); got != "LANE" {
+		t.Errorf("historyRunType(run-123, manual) = %q, want LANE", got)
+	}
+	if got := historyRunType("action-20260812T100000Z", "manual"); got != "MANUAL" {
+		t.Errorf("historyRunType(action-..., manual) = %q, want MANUAL", got)
+	}
+	if got := historyRunType("action-20260812T100000Z", "resume-watch"); got != "MANUAL" {
+		t.Errorf("historyRunType(action-..., resume-watch) = %q, want MANUAL", got)
+	}
+
+	rm := NewRunModel()
+	rm.SetHistory(&client.RunHistoryPayload{
+		Runs: []client.RunSummaryPayload{
+			{
+				RunID:       "run-20260815T120000Z",
+				Timestamp:   "2026-08-15T12:00:00Z",
+				Reason:      "success",
+				TriggeredBy: "resume-watch",
+				BatchTickets: []client.TicketOutcome{
+					{TicketID: "TICK-001", Outcome: "success"},
+				},
+			},
+		},
+	})
+	rendered := rm.RenderHistoryTable(80)
+	if !strings.Contains(rendered, "AUTO") {
+		t.Errorf("RenderHistoryTable for resume-watch run missing AUTO in output:\n%s", rendered)
 	}
 }
 
@@ -1321,7 +1744,7 @@ func TestGolden_RunHistoryMixedOutcomesNarrow(t *testing.T) {
 			{TicketID: "TICK-3", Executor: "codex-a", Outcome: "changes_requested", DurationSeconds: 30},
 		},
 	}}})
-	compareGolden(t, "run_history_mixed_outcomes_narrow.golden", stripANSI(rm.Render(narrowWidth)))
+	compareGolden(t, "run_history_mixed_outcomes_narrow.golden", stripANSI(rm.RenderHistory(narrowWidth)))
 }
 
 func TestGolden_RunIdleNarrow(t *testing.T) {

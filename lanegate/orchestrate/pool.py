@@ -1,12 +1,14 @@
 """Executor pool selection/invocation: driver resolution, prompt dispatch,
 worktree commit helpers.
 
-TICK-255/TICK-276: extracted from orchestrate/__init__.py as pure code
+Extracted from orchestrate module as pure code
 movement -- see docs/internal/module-split-proposal.md.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+import json
 import os
 import re
 import subprocess
@@ -15,12 +17,19 @@ import threading
 import time
 from pathlib import Path
 
-from lanegate.config import ConfigError, resolve_model
+from lanegate.budget import DispatchMeter, metering_supported_for
+from lanegate.config import (
+    ConfigError,
+    resolve_model,
+    resolve_trunk_branch,
+    validate_model_for_executor,
+)
 from lanegate.executor import (
     _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
     get_executor_config,
     parse_structured_result,
+    reject_ollama_for_code_step,
     resolve_executor_env,
     resolved_dispatch_metadata,
 )
@@ -32,14 +41,21 @@ from lanegate.executor_events import (
     phase_for_step,
     redact_transcript_text,
 )
+from lanegate.reviewer import get_worktree_diff
+from lanegate.ticket import branch_name
 
 from .audit import (
     _capture_executor_audit_bundle,
     _iso_from_epoch,
+    _load_audit_manifest,
+    _manifest_capture,
+    _run_git_snapshot,
+    _save_audit_manifest,
     _utc_now_iso,
+    _write_bounded_text,
     _write_json_atomic,
 )
-from .run_report import _append_run_event, _stream_subprocess
+from .run_report import INTERNAL_RUN_ENV, _append_run_event, _stream_subprocess
 from .status import (
     _remove_executor_markers,
     _write_active_status,
@@ -50,7 +66,7 @@ from .status import (
 _DEFAULT_HEARTBEAT_SECONDS = 30.0
 
 # Sentinel exit code returned by invoke_executor() when executor-env
-# resolution (resolve_executor_env, TICK-088 named-instance api_key_env)
+# resolution (resolve_executor_env, named-instance api_key_env)
 # raises ConfigError before any subprocess is even launched. Chosen to match
 # BSD sysexits.h's EX_CONFIG so it reads as "configuration error" in logs,
 # and to avoid colliding with 429 (rate limit) or any real subprocess exit
@@ -59,6 +75,109 @@ _DEFAULT_HEARTBEAT_SECONDS = 30.0
 # run_fix_agent's fix-pass dispatch) fail this one ticket via their existing
 # "executor exited nonzero" handling instead of raising past them.
 _CONFIG_ERROR_EXIT_CODE = 78
+
+
+class WorktreeGuardViolation(RuntimeError):
+    """Raised when a tool call targets a path outside its assigned worktree."""
+
+
+def _assert_path_in_worktree(tool_name: str, path: str | Path, worktree_root: Path) -> None:
+    """Assert that a candidate path resolves inside the given worktree root.
+
+    Raises RuntimeError with a [worktree-guard] prefix if the resolved path
+    is not a descendant of (or equal to) the resolved worktree root.
+    Exempts intentionally-symlinked paths planted by lanegate (.lanegate/notes
+    and graphify-out) which point to shared control stores.
+    """
+    candidate = Path(path)
+    worktree_root_path = Path(worktree_root)
+    if not candidate.is_absolute():
+        candidate = worktree_root_path / candidate
+
+    normalized_candidate = Path(os.path.normpath(candidate))
+    normalized_root = Path(os.path.normpath(worktree_root_path))
+
+    try:
+        rel_path = normalized_candidate.relative_to(normalized_root)
+        if rel_path.parts[:2] == (".lanegate", "notes") or rel_path.parts[:1] == ("graphify-out",):
+            return
+    except ValueError:
+        pass
+
+    resolved_path = candidate.resolve()
+    resolved_root = worktree_root_path.resolve()
+
+    try:
+        resolved_path.relative_to(resolved_root)
+        return
+    except ValueError:
+        pass
+
+    for exempt_rel in (Path(".lanegate") / "notes", Path("graphify-out")):
+        symlink_path = worktree_root_path / exempt_rel
+        if symlink_path.is_symlink() or symlink_path.exists():
+            try:
+                resolved_target = symlink_path.resolve()
+                resolved_path.relative_to(resolved_target)
+                return
+            except (ValueError, OSError):
+                pass
+
+    raise WorktreeGuardViolation(
+        f"[worktree-guard] {tool_name} tool call targeting path outside worktree: {path}"
+    )
+
+
+def _check_line_for_worktree_boundary(line: str, worktree_root: Path) -> None:
+    """Extract tool calls from JSON event line and assert worktree path boundaries."""
+    if not line or not line.strip():
+        return
+    try:
+        data = json.loads(line.strip())
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+
+    raw_blocks = data.get("content_block")
+    if raw_blocks is None:
+        msg = data.get("message")
+        raw_blocks = msg.get("content") if isinstance(msg, dict) else None
+
+    if raw_blocks is None:
+        blocks = [data]
+    elif isinstance(raw_blocks, list):
+        blocks = raw_blocks
+    elif isinstance(raw_blocks, dict):
+        blocks = [raw_blocks]
+    else:
+        blocks = [data]
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        tool_name = block.get("name") or data.get("name") or ""
+        if not isinstance(tool_name, str):
+            tool_name = str(tool_name)
+
+        inputs = block.get("input") or block.get("inputs") or data.get("input") or {}
+        if isinstance(inputs, dict):
+            target_path = (
+                inputs.get("file_path")
+                or inputs.get("path")
+                or inputs.get("TargetFile")
+                or inputs.get("target_file")
+                or inputs.get("filename")
+                or inputs.get("TargetPath")
+                or inputs.get("target_path")
+                or inputs.get("file")
+                or inputs.get("AbsolutePath")
+            )
+            if target_path and tool_name.lower() in (
+                "write", "edit", "create", "filewrite", "replace_file_content",
+                "write_to_file", "write_file", "edit_file"
+            ):
+                _assert_path_in_worktree(tool_name, str(target_path), worktree_root)
 
 
 def _unpack_stream_result(result) -> tuple[int, str, str, str | None]:
@@ -160,13 +279,20 @@ def _resolve_driver_route(cfg: dict, ticket: dict | None = None) -> dict[str, st
     }
 
 
-def _resolve_drift_driver_name(ticket: dict, cfg: dict) -> str:
+def _resolve_drift_driver_name(
+    ticket: dict, cfg: dict, repo_root: Path | None = None, *, pool_name: str | None = None
+) -> str:
     """Resolve drift checks through review unless a drift route is explicit.
 
     Drift checks audit a fix independently, so they use the same review route
     (including a ticket reviewer override) by default.  Either current
     ``steps.drift_check.driver`` or legacy ``executor_steps.drift_check`` can
-    explicitly select a different drift executor.
+    explicitly select a different drift executor. When ``pool_name`` and
+    ``repo_root`` are given, the review route is resolved through the pool
+    (via ``resolve_pool_executor``, step="review") so an ``orchestrate --pool``
+    override reaches drift-check the same way it reaches review itself —
+    still deferring to a per-ticket ``reviewer:`` pin, which that resolver
+    honors before consulting the pool.
     """
     drift_check_driver = ((cfg.get("steps") or {}).get("drift_check") or {}).get("driver")
     if drift_check_driver:
@@ -174,6 +300,14 @@ def _resolve_drift_driver_name(ticket: dict, cfg: dict) -> str:
     drift_check_driver = (cfg.get("executor_steps") or {}).get("drift_check")
     if drift_check_driver:
         return drift_check_driver
+    if pool_name and repo_root is not None:
+        from lanegate.orchestrate.loop import resolve_pool_executor
+
+        pooled_review_driver = resolve_pool_executor(
+            "review", ticket, cfg, repo_root, pool_name=pool_name, healthy_only=True
+        )
+        if pooled_review_driver:
+            return pooled_review_driver
     review_driver = resolve_driver("review", ticket, cfg)
     # ``human``/``none``/``auto-none`` are final-review gates, not executable
     # drift-check agents.  Preserve the established implementation-route
@@ -216,6 +350,8 @@ def make_event_line_handler(
     step: str,
     terminal_stream=None,
     on_event=None,
+    meter=None,
+    worktree_path: Path | None = None,
 ):
     """Build an ``on_line`` callback that turns raw stdout into executor events.
 
@@ -227,6 +363,14 @@ def make_event_line_handler(
     change.  ``on_event`` is the per-caller extra: ``invoke_executor`` uses it
     to mirror progress into its live status file, which review-class steps do
     not maintain.
+
+    ``meter``, when given a :class:`~lanegate.budget.DispatchMeter`,
+    receives both the raw line and its normalized event. It needs both: the raw
+    line carries turn envelopes, usage figures and the session id that
+    normalization deliberately discards, while only the normalized event
+    classifies what the turn was spent doing. It never affects the dispatch —
+    it only records what the run cost so an expensive ticket can be attributed
+    afterwards.
     """
     phase = phase_for_step(step)
     last_activity_ts = time.time()
@@ -238,28 +382,43 @@ def make_event_line_handler(
         ev = normalize_executor_event(
             line, executor=executor, model=model, current_phase=phase
         )
-        if not ev:
-            return
-        now = time.time()
-        ev.activity_age = round(now - last_activity_ts, 1)
-        last_activity_ts = now
-        _append_run_event(
-            repo_root,
-            session_ts,
-            "executor_progress",
-            ticket_id=ticket_id,
-            progress=ev.to_dict(),
-        )
-        if on_event is not None:
-            on_event(ev)
-        if terminal_stream is not None:
-            terminal_stream.write(format_executor_event_status(ticket_id, ev) + "\n")
-            terminal_stream.flush()
+        if meter is not None:
+            # Metering must never be able to disturb the run it is measuring,
+            # and must see every line — including the ones that normalize to
+            # nothing but still carry usage or the session id.
+            try:
+                meter.observe(line, ev)
+                if ev:
+                    ev.turns = meter.turns
+                    ev.cumulative_tokens = meter.tokens
+                    ev.current_context_tokens = meter.last_turn_tokens
+            except Exception:
+                pass
+        if ev:
+            now = time.time()
+            ev.activity_age = round(now - last_activity_ts, 1)
+            last_activity_ts = now
+            _append_run_event(
+                repo_root,
+                session_ts,
+                "executor_progress",
+                ticket_id=ticket_id,
+                progress=ev.to_dict(),
+            )
+            if on_event is not None:
+                on_event(ev)
+            if terminal_stream is not None:
+                terminal_stream.write(format_executor_event_status(ticket_id, ev) + "\n")
+                terminal_stream.flush()
+
+        if worktree_path is not None:
+            _check_line_for_worktree_boundary(line, worktree_path)
 
     def activity_probe() -> float:
         return last_activity_ts
 
     handle_line.activity_probe = activity_probe  # type: ignore[attr-defined]
+    handle_line.meter = meter  # type: ignore[attr-defined]
     return handle_line
 
 
@@ -336,6 +495,86 @@ def capture_review_step_run(
             file=sys.stderr,
         )
         return None
+
+
+def _last_lifecycle_event_epoch(ticket: dict, event_name: str) -> float | None:
+    """Return the newest valid epoch timestamp for a ticket lifecycle event."""
+    for record in reversed(ticket.get("lifecycle_events") or []):
+        if record.get("event") != event_name:
+            continue
+        try:
+            return datetime.strptime(record["at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=UTC
+            ).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def capture_manual_implement_step_run(
+    repo_root: Path,
+    worktree_path: Path,
+    ticket: dict,
+    cfg: dict,
+    *,
+    safeguards_passed: bool,
+    safeguard_reason: str | None,
+) -> Path | None:
+    """Capture evidence for a hand-implemented ticket completing outside dispatch."""
+    tid = ticket["id"]
+    finished_at = time.time()
+    started_at = _last_lifecycle_event_epoch(ticket, "implementation_started") or finished_at
+    trunk = resolve_trunk_branch(cfg, repo_root)
+    branch = ticket.get("branch") or branch_name(tid)
+    before_sha = _run_git_snapshot(worktree_path, ["merge-base", trunk, "HEAD"]).strip()
+    after_sha = _run_git_snapshot(worktree_path, ["rev-parse", "HEAD"]).strip()
+    status = {
+        "schema_version": 1,
+        "ticket_id": tid,
+        "executor": "manual",
+        "resolved_driver": "manual",
+        "resolved_executor": "manual",
+        "resolved_model": None,
+        "executor_pid": None,
+        "executor_session": f"{tid}-{int(finished_at)}-manual",
+        "step": "implement",
+        "mode": "manual",
+        "worktree": str(worktree_path),
+        "log_path": None,
+        "prompt_path": None,
+        "started_at": started_at,
+        "started_at_iso": _iso_from_epoch(started_at),
+        "finished_at": finished_at,
+        "finished_at_iso": _utc_now_iso(),
+        "elapsed_seconds": int(finished_at - started_at),
+        "exit_code": 0,
+        "state": "finished",
+        "last_event": "executor_finished",
+        "reconciliation_state": "finished",
+        "before_sha": before_sha,
+        "after_sha": after_sha,
+        "safeguards_passed": safeguards_passed,
+        "safeguard_reason": safeguard_reason,
+    }
+    try:
+        bundle_path = _capture_executor_audit_bundle(repo_root, worktree_path, status)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(
+            f"WARNING: could not capture manual implement run directory for {tid}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        diff_text = get_worktree_diff(worktree_path, branch, base=trunk)
+    except Exception:
+        diff_text = ""
+    if diff_text.strip():
+        detail = _write_bounded_text(bundle_path / "diff.patch", diff_text)
+        manifest = _load_audit_manifest(bundle_path)
+        _manifest_capture(manifest, "diff.patch", detail)
+        _save_audit_manifest(bundle_path, manifest)
+    return bundle_path
 
 
 def _invoke_ollama(prompt: str, driver_cfg: dict, worktree_path: Path) -> int:
@@ -424,6 +663,21 @@ def resolve_dispatch(
     effective_cfg = dict(cfg, executor=executor) if executor != cfg.get("executor") else cfg
     model_ticket = _ticket_for_model_resolution(ticket, executor_type)
     model = driver_cfg.get("model") or resolve_model(effective_cfg, step, ticket=model_ticket)
+    if model is not None:
+        # Catch a resolved model from the wrong vendor family loudly, at the
+        # point of dispatch, instead of silently handing it to an executor
+        # that can't use it (e.g. a top-level `models:` block authored for
+        # cfg's own executor leaking a claude-*/gemini-* name into a pool
+        # member with no per-executor override of its own).
+        validate_model_for_executor(
+            model, executor_type, context_label=f"executor '{executor}'",
+            # A `drivers:` entry can carry `provider` directly on itself
+            # (e.g. `drivers: {fast-ollama: {type: aider, provider: ollama}}`)
+            # rather than on an `executors:` instance -- executor_cfg alone
+            # misses that route, since it's looked up by resolved type/name,
+            # not by the driver's own key.
+            provider=executor_cfg.get("provider") or driver_cfg.get("provider"),
+        )
 
     # A named driver maps to its underlying executor type, while a named
     # executor (including a pool assignment) remains visible as that instance.
@@ -449,6 +703,18 @@ def resolve_dispatch(
     return result
 
 
+def _get_step_budget_cap(cfg: dict, step: str, cap_key: str) -> int | None:
+    val = cfg.get(cap_key)
+    if isinstance(val, dict):
+        v = val.get(step)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            return int(v)
+        return None
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+        return int(val)
+    return None
+
+
 def invoke_executor(
     ticket: dict,
     cfg: dict,
@@ -460,7 +726,8 @@ def invoke_executor(
     step: str = "implement",
     repo_root: Path | None = None,
     executor_override: str | None = None,
-) -> tuple[int, str]:
+    no_resume: bool = False,
+) -> tuple[int, str, str]:
     """
     Run the configured executor on a ticket in its worktree.
 
@@ -486,15 +753,17 @@ def invoke_executor(
             to worktree_path for direct/unit-test invocations.
         executor_override: When provided, use this named executor instance
             instead of resolving one via resolve_driver(). Used by pool
-            dispatch (TICK-089) to route a specific ticket to a specific pool
+            dispatch to route a specific ticket to a specific pool
             instance without writing an arbitrary instance name onto the
             ticket's own frontmatter (which would trip the pre-existing
             validate_ticket gap described in TICK-247).
+        no_resume: When True (or when cfg['no_resume'] is set), bypass session
+            resumption via --resume (TICK-572 escape hatch).
 
     Returns (exit_code, captured_stdout, captured_stderr) tuple.
     """
     from lanegate.executor import build_implement_prompt
-    from lanegate.orchestrate import _pid_alive
+    from lanegate.pidutil import pid_alive as _pid_alive
 
     status_root = repo_root if repo_root is not None else worktree_path
     status_root = Path(status_root)
@@ -513,14 +782,20 @@ def invoke_executor(
     prompt_path = _write_prompt_file(worktree_path, ticket["id"], step, prompt)
 
     touches = list(ticket.get("touches") or [])
-    # Resolve executor (bare type or named instance, TICK-088) once so the
+    # Resolve executor (bare type or named instance) once so the
     # same instance config drives both cmd construction and env injection.
+    # Bound ahead of the try so the except block's message below has a name
+    # to report even when resolve_dispatch() itself raises ConfigError
+    # (e.g. a model/provider mismatch caught before dispatch["executor"] is
+    # ever assigned).
+    executor = executor_override or "unresolved"
     try:
         dispatch = resolve_dispatch(ticket, cfg, step=step, executor_override=executor_override)
         driver_cfg = dispatch["driver_cfg"]
         executor = dispatch["executor"]
         executor_cfg = get_executor_config(executor, cfg)
         executor_type = executor_cfg.get("type", executor)
+        reject_ollama_for_code_step(step, executor_type)
         # Resolve the model for this ticket's step after knowing the effective
         # executor type. Per-ticket model overrides from old analysis runs are
         # executor-specific in practice: a Claude model name should not be
@@ -535,8 +810,14 @@ def invoke_executor(
             return rc, "", ""
         executor_env = resolve_executor_env(executor_cfg)
         executor_env = _build_env(driver_cfg, base_env=executor_env)
+        # Nested lifecycle commands issued by an executor belong to this
+        # orchestrate session, not to standalone manual-action history rows.
+        # Always materialize an env copy: resolve_executor_env deliberately
+        # returns None when no credentials need injecting.
+        executor_env = dict(executor_env) if executor_env is not None else dict(os.environ)
+        executor_env[INTERNAL_RUN_ENV] = "1"
         command_cfg = _cfg_with_driver_command_overrides(cfg, executor, driver_cfg)
-        # TICK-188/TICK-310: thread a prior step's CLI session into this one
+        # Thread a prior step's CLI session into this one
         # via --resume so the pipeline continues one conversation rather than
         # every step starting cold (the fixed per-invocation bootstrap cost
         # only needs to be cache-written once per session, not once per
@@ -549,10 +830,16 @@ def invoke_executor(
         # specific: do not pass an Agy/Gemini or Claude conversation to a
         # Codex process merely because a pool chose a different executor for
         # the next step. Legacy tickets without origin metadata start fresh.
-        if step == "implement":
+        # TICK-572: Session-origin / cwd mismatch hypothesis: analyze session
+        # originates in the main checkout root before any worktree exists.
+        # Resuming it via --resume could preserve the original checkout as cwd.
+        # _assert_path_in_worktree guards against out-of-bounds writes, and
+        # no_resume allows bypassing --resume session reuse entirely.
+        skip_resume = no_resume or bool(cfg.get("no_resume"))
+        if not skip_resume and step == "implement":
             resume_candidate = ticket.get("analyze_session_id")
             resume_origin = "analyze"
-        elif step == "fix":
+        elif not skip_resume and step == "fix":
             resume_origin = "fix" if ticket.get("fix_session_id") else "implement"
             resume_candidate = ticket.get(f"{resume_origin}_session_id")
         else:
@@ -581,6 +868,8 @@ def invoke_executor(
                     f"[orchestrate] {ticket['id']}: not resuming session for {step} — {reason}\n"
                 )
                 log_stream.flush()
+        step_max_turns = _get_step_budget_cap(cfg, step, "max_turns")
+        step_max_tokens = _get_step_budget_cap(cfg, step, "max_cumulative_tokens")
         prompt_stdin = None
         if executor_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"}):
             cmd = build_executor_cmd(
@@ -588,6 +877,7 @@ def invoke_executor(
                 analyze_session_id=resume_session_id,
                 worktree_path=worktree_path,
                 use_stdin=True,
+                max_turns=step_max_turns,
             )
             prompt_stdin = prompt
         else:
@@ -595,6 +885,7 @@ def invoke_executor(
                 executor, prompt, command_cfg, model=model, touches=touches,
                 analyze_session_id=resume_session_id,
                 worktree_path=worktree_path,
+                max_turns=step_max_turns,
             )
     except ConfigError as exc:
         # Fail this one ticket via the ordinary nonzero-exit-code path rather
@@ -678,16 +969,43 @@ def invoke_executor(
     resolved_model = dispatch.get("resolved_model")
     event_phase = phase_for_step(step)
 
-    def _mirror_event_into_status(ev) -> None:
-        update_status(
-            last_executor_event=ev.to_dict(),
-            last_event="executor_progress",
-            phase=ev.phase,
-            activity=ev.activity,
-        )
+    budget_exceeded_flag = False
+    budget_exceeded_detail = ""
 
+    def _check_budget() -> str | None:
+        nonlocal budget_exceeded_flag, budget_exceeded_detail
+        if meter is not None:
+            if step_max_turns is not None and meter.turns >= step_max_turns:
+                budget_exceeded_flag = True
+                budget_exceeded_detail = f"max_turns cap reached ({meter.turns}/{step_max_turns} turns, {meter.tokens} tokens)"
+                return budget_exceeded_detail
+            if step_max_tokens is not None and meter.tokens >= step_max_tokens:
+                budget_exceeded_flag = True
+                budget_exceeded_detail = f"max_cumulative_tokens cap reached ({meter.tokens}/{step_max_tokens} tokens, {meter.turns} turns)"
+                return budget_exceeded_detail
+        return None
+
+    def _mirror_event_into_status(ev) -> None:
+        status_updates = {
+            "last_executor_event": ev.to_dict(),
+            "last_event": "executor_progress",
+            "phase": ev.phase,
+            "activity": ev.activity,
+        }
+        if getattr(ev, "turns", None) is not None:
+            status_updates["turns"] = ev.turns
+        if getattr(ev, "cumulative_tokens", None) is not None:
+            status_updates["cumulative_tokens"] = ev.cumulative_tokens
+        update_status(**status_updates)
+        _check_budget()
+
+    # Only streaming executors emit anything countable; for the rest the meter
+    # stays at zero rather than reporting a misleading turn count of one.
+    meter = (
+        DispatchMeter(step=step) if metering_supported_for(executor_type) else None
+    )
     handle_line = make_event_line_handler(
-        repo_root,
+        status_root,
         session_ts,
         tid,
         executor=resolved_driver,
@@ -695,6 +1013,8 @@ def invoke_executor(
         step=step,
         terminal_stream=terminal_stream,
         on_event=_mirror_event_into_status,
+        meter=meter,
+        worktree_path=worktree_path,
     )
     last_activity = handle_line.activity_probe
 
@@ -723,6 +1043,10 @@ def invoke_executor(
                 activity_age=round(time.time() - last_activity(), 1),
                 is_stall=is_stall,
             )
+            if meter is not None:
+                fb_ev.turns = meter.turns
+                fb_ev.cumulative_tokens = meter.tokens
+                fb_ev.current_context_tokens = meter.last_turn_tokens
             heartbeat_at = time.time()
             pid_is_live = (
                 isinstance(current_status.get("executor_pid"), int)
@@ -730,17 +1054,21 @@ def invoke_executor(
             )
             if pid_is_live:
                 last_verified_heartbeat_ts = heartbeat_at
-            status = update_status(
-                last_heartbeat_at=heartbeat_at,
-                last_heartbeat_at_iso=_utc_now_iso(),
-                heartbeat_count=int(current_status.get("heartbeat_count") or 0) + 1,
-                elapsed_seconds=elapsed,
-                last_event="executor_heartbeat",
-                last_executor_event=fb_ev.to_dict(),
-                reconciliation_state="live" if pid_is_live else "stale",
-            )
+            hb_status = {
+                "last_heartbeat_at": heartbeat_at,
+                "last_heartbeat_at_iso": _utc_now_iso(),
+                "heartbeat_count": int(current_status.get("heartbeat_count") or 0) + 1,
+                "elapsed_seconds": elapsed,
+                "last_event": "executor_heartbeat",
+                "last_executor_event": fb_ev.to_dict(),
+                "reconciliation_state": "live" if pid_is_live else "stale",
+            }
+            if meter is not None:
+                hb_status["turns"] = meter.turns
+                hb_status["cumulative_tokens"] = meter.tokens
+            status = update_status(**hb_status)
             _append_run_event(
-                repo_root,
+                status_root,
                 session_ts,
                 "executor_progress",
                 ticket_id=tid,
@@ -777,13 +1105,15 @@ def invoke_executor(
             "absolute_ceiling": float(cfg.get("executor_absolute_ceiling_seconds", 1500)),
             "liveness_probe": last_verified_heartbeat,
             "progress_probe": last_activity,
+            "budget_probe": _check_budget,
         }
         if streaming_capable
-        else {"timeout": exec_timeout}
+        else {"timeout": exec_timeout, "budget_probe": _check_budget}
     )
+    kill_reason = None
     try:
         if log_stream is not None:
-            rc, captured_stdout, captured_stderr, _kill_reason = _unpack_stream_result(_stream_subprocess(
+            rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
                 cmd,
                 str(worktree_path),
                 out_stream=log_stream,
@@ -795,7 +1125,7 @@ def invoke_executor(
                 **stream_kwargs,
             ))
         else:
-            rc, captured_stdout, captured_stderr, _kill_reason = _unpack_stream_result(_stream_subprocess(
+            rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
                 cmd,
                 str(worktree_path),
                 stdin_text=prompt_stdin,
@@ -807,6 +1137,37 @@ def invoke_executor(
     finally:
         heartbeat_stop.set()
         hb.join(timeout=1)
+
+    _check_budget()
+    if budget_exceeded_flag or kill_reason == "budget_exceeded":
+        if rc == 0:
+            rc = 1
+        detail = budget_exceeded_detail or (
+            f"max_turns/tokens cap reached ({meter.turns if meter else 0} turns, {meter.tokens if meter else 0} tokens)"
+        )
+        msg = f"[orchestrate] {tid}: dispatch aborted early — budget cap exceeded: {detail}\n"
+        if log_stream is not None:
+            log_stream.write(msg)
+            log_stream.flush()
+        if terminal_stream is not None:
+            terminal_stream.write(msg)
+            terminal_stream.flush()
+        sys.stderr.write(msg)
+    if kill_reason == "worktree_violation":
+        if rc == 0:
+            rc = 1
+        msg = (
+            f"[orchestrate] {tid}: dispatch aborted — this is a LaneGate worktree-isolation "
+            f"bug (the executor wrote outside its assigned worktree), not a merge conflict or "
+            f"user error\n"
+        )
+        if log_stream is not None:
+            log_stream.write(msg)
+            log_stream.flush()
+        if terminal_stream is not None:
+            terminal_stream.write(msg)
+            terminal_stream.flush()
+        sys.stderr.write(msg)
     elapsed = int(time.time() - start_time)
     final_status = update_status(
         state="finished",
@@ -834,9 +1195,36 @@ def invoke_executor(
     if parsed is not None:
         from lanegate.context_log import record_step_cost
 
-        record_step_cost(status_root, tid, step, executor, model, parsed)
+        record_step_cost(
+            status_root, tid, step, executor, model, parsed, dispatch_start_time=start_time
+        )
 
-    # TICK-310: persist this call's session id so a later step (fix
+    # Report what this dispatch cost and, when it was expensive,
+    # attribute it. This never changes the outcome of the step -- an expensive
+    # run still succeeds or fails on its own merits -- but a 130-turn implement
+    # that nobody sees is how a project quietly burns a daily quota.
+    if meter is not None and meter.turns:
+        _append_run_event(
+            status_root,
+            session_ts,
+            "executor_metrics",
+            ticket_id=tid,
+            metrics={"step": step, "executor": resolved_driver, **meter.summary()},
+        )
+        diagnosis = meter.diagnose(cfg)
+        cost_line = f"[orchestrate] {tid} {step} cost: {meter.format_usage()}\n"
+        if diagnosis is not None:
+            cost_line += (
+                f"[orchestrate] {tid} {step} is expensive "
+                f"({diagnosis['verdict']}): {diagnosis['summary']}\n"
+                f"[orchestrate]   {diagnosis['detail']}\n"
+            )
+        for stream in (log_stream, terminal_stream):
+            if stream is not None:
+                stream.write(cost_line)
+                stream.flush()
+
+    # Persist this call's session id so a later step (fix
     # resuming implement; a second fix pass resuming the first) knows
     # what to --resume. Only implement/fix originate a resumable chain
     # today -- analyze has its own session-capture path (analyze.py),
@@ -861,6 +1249,14 @@ def invoke_executor(
         # back would silently discard the agent's own self-reported update.
         fresh_ticket = parse_ticket(ticket["_path"]) or ticket
         new_session_id = parsed.get("session_id") if parsed is not None else None
+        if not new_session_id and meter is not None:
+            # A dispatch killed by a wall-clock watchdog never emits the final
+            # result envelope `parsed` comes from, so previously its
+            # session id was lost and any continuation had to start a cold
+            # conversation -- re-reading the repo and re-deriving everything the
+            # dead session already knew. The id seen on the stream is the same
+            # conversation, so prefer losing nothing over losing all of it.
+            new_session_id = meter.session_id
         if new_session_id:
             fresh_ticket[f"{step}_session_id"] = new_session_id
         # resolved_driver, not the bare `executor` type: a pool of
@@ -998,7 +1394,7 @@ def commit_worktree_changes(
         return False
 
     commit = subprocess.run(
-        ["git", "commit", "-m", message or f"feat: implement {ticket_id}"],
+        ["git", "commit", "-s", "-m", message or f"feat: implement {ticket_id}"],
         cwd=str(worktree_path),
         capture_output=True,
         text=True, encoding="utf-8",

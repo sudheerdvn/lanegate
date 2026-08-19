@@ -14,8 +14,14 @@ Tool catalogue:
   stats()                          — median time-in-status analytics
   flag_list(env?)                  — feature flags for an environment
   flag_set(name, value, env?)      — enable/disable a feature flag
+  create(intent, title?, milestone?, autonomy?) — write a draft ticket from
+                                    natural-language intent; stays in draft, the
+                                    board-clearing loop analyzes it when it runs
+  analyze(ticket_id, keep_draft?)  — populate touches/close_criteria for a draft
+                                    ticket (draft → open unless keep_draft)
   start(ticket_id)                 — claim ticket, create worktree
-  orchestrate(...)                 — preview/run the board-clearing loop
+  run(...)                         — preview/run the board-clearing loop
+  orchestrate(...)                 — compatibility alias for run(...)
   complete(ticket_id)              — mark code done (→ code_complete)
   review(ticket_id, verdict?, summary?, findings?) — agent review gate (→ in_review or stays code_complete)
   merge(ticket_id)                 — merge to main, remove worktree
@@ -23,7 +29,9 @@ Tool catalogue:
   hibernate(ticket_id, reason?, reset?) — pause in_progress ticket with context snapshot
   needs_review(ticket_id, reason?) — escalate in_progress → needs_review
   fail(ticket_id, reason?)         — mark ticket failed, release worktree
-  reopen(ticket_id)                — reopen a failed ticket → open
+  reopen(ticket_id)                — restore an eligible ticket status; never dispatches an agent
+  resolve_conflict(ticket_id, pool?) — explicitly rebase and resolve a needs-review conflict
+  close(ticket_id, reason)         — close a completed no-code ticket with recorded evidence
   validate(ticket_id)              — advance merged → validated
   done(ticket_id)                  — advance validated/merged → done
 """
@@ -41,6 +49,11 @@ from mcp.server.fastmcp import FastMCP
 from lanegate import APP_NAME
 from lanegate.config import find_repo_root, load_config
 from lanegate.lifecycle import MergeFailedError
+from lanegate.orchestrate.run_report import (
+    begin_direct_action,
+    record_direct_action_event,
+    suppress_direct_action_tracking,
+)
 
 _mcp = FastMCP(APP_NAME)
 
@@ -131,8 +144,12 @@ def _load_ticket_summary(cfg: dict, repo_root: Path, ticket_id: str | None = Non
     tickets_dir = repo_root / cfg["tickets_dir"]
     tickets, quarantined = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
     if ticket_id:
-        wanted = canonical_id(ticket_id)
-        tickets = [t for t in tickets if t.get("id") == wanted]
+        try:
+            wanted = canonical_id(ticket_id)
+        except ValueError:
+            tickets = []
+        else:
+            tickets = [t for t in tickets if t.get("id") == wanted]
     counts: dict[str, int] = {}
     for ticket in tickets:
         status = ticket.get("status", "unknown")
@@ -173,12 +190,42 @@ def _latest_log_paths(repo_root: Path, limit: int) -> list[Path]:
     return sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
-def _capture_action(fn, *args, **kwargs) -> dict:
-    """Run a command function, capture its stdout/stderr, handle SystemExit and MergeFailedError."""
+_UNSET: Any = object()
+
+
+def _capture_action(fn, *args, ticket_id: str | None = _UNSET, **kwargs) -> dict:
+    """Run a command function, capture its stdout/stderr, handle SystemExit and MergeFailedError.
+
+    ``ticket_id`` defaults to ``args[0]``, the convention every lifecycle tool
+    (start, complete, merge, ...) relies on. Callers whose first positional arg
+    isn't a ticket id — e.g. `create`'s free-form intent string, which would
+    otherwise get written verbatim into the tracked action's ticket_id field —
+    should pass an explicit override (including ``None``) instead.
+    """
     out = io.StringIO()
     err = io.StringIO()
+    repo_root = args[2] if len(args) >= 3 and isinstance(args[2], Path) else None
+    action_type = fn.__name__.removeprefix("cmd_").lstrip("_")
+    if ticket_id is _UNSET:
+        ticket_id = str(args[0]) if args else None
+    tracking = (
+        begin_direct_action(repo_root, action_type, ticket_id=ticket_id, executor="mcp")
+        if repo_root is not None
+        else None
+    )
+
+    def with_tracking(result: dict, status: str) -> dict:
+        if tracking is not None and repo_root is not None:
+            record_direct_action_event(
+                repo_root, tracking["action_id"], "action_end", action_type=action_type,
+                ticket_id=ticket_id, status=status,
+            )
+            result.update(tracking)
+            result["status"] = status
+        return result
+
     try:
-        with redirect_stdout(out), redirect_stderr(err):
+        with suppress_direct_action_tracking(), redirect_stdout(out), redirect_stderr(err):
             fn(*args, **kwargs)
         output, output_truncated, output_bytes = _truncate_text(
             out.getvalue().strip(), _MAX_ACTION_OUTPUT_BYTES
@@ -186,7 +233,7 @@ def _capture_action(fn, *args, **kwargs) -> dict:
         stderr, stderr_truncated, stderr_bytes = _truncate_text(
             err.getvalue().strip(), _MAX_ACTION_OUTPUT_BYTES
         )
-        return {
+        return with_tracking({
             "ok": True,
             "output": output,
             "stderr": stderr,
@@ -195,8 +242,8 @@ def _capture_action(fn, *args, **kwargs) -> dict:
             "output_truncated": output_truncated,
             "stderr_truncated": stderr_truncated,
             "limits": {"max_output_bytes": _MAX_ACTION_OUTPUT_BYTES},
-        }
-    except (SystemExit, MergeFailedError) as exc:
+        }, "success")
+    except (SystemExit, MergeFailedError, ValueError) as exc:
         output, output_truncated, output_bytes = _truncate_text(
             out.getvalue().strip(), _MAX_ACTION_OUTPUT_BYTES
         )
@@ -206,7 +253,7 @@ def _capture_action(fn, *args, **kwargs) -> dict:
         result = {
             "ok": False,
             "output": output,
-            "error": str(exc) if isinstance(exc, MergeFailedError) else (stderr or output),
+            "error": str(exc) if isinstance(exc, (MergeFailedError, ValueError)) else (stderr or output),
             "stderr": stderr,
             "output_bytes": output_bytes,
             "stderr_bytes": stderr_bytes,
@@ -216,7 +263,7 @@ def _capture_action(fn, *args, **kwargs) -> dict:
         }
         if isinstance(exc, SystemExit):
             result["exit_code"] = exc.code
-        return result
+        return with_tracking(result, "failed")
 
 
 def _capture_json(fn, *args, **kwargs) -> Any:
@@ -276,6 +323,23 @@ def repo_status(ticket_id: str | None = None) -> dict:
         "orchestrator_lock": orchestrator_lock_status(repo_root),
         "latest_log": str(latest[0]) if latest else None,
     }
+
+
+@_mcp.tool()
+def summary(ticket_id: str) -> dict:
+    """Return a consolidated why-is-this-stuck view for one ticket.
+
+    Aggregates the full escalation/failure reason, review verdict/summary/findings,
+    the needs_review cause + recovery command, and a diff file-stat -- everything
+    otherwise scattered across the ticket body and worktree.
+
+    Args:
+        ticket_id: Ticket identifier, e.g. "TICK-007".
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.ticket import get_ticket_summary
+
+    return get_ticket_summary(ticket_id, cfg, repo_root)
 
 
 @_mcp.tool()
@@ -369,7 +433,7 @@ def start(ticket_id: str) -> dict:
     cfg, repo_root = _cfg_and_root()
     from lanegate.lifecycle import cmd_start
 
-    return _capture_action(cmd_start, ticket_id, cfg, repo_root)
+    return _capture_action(cmd_start, ticket_id, cfg, repo_root, executor="mcp")
 
 
 @_mcp.tool()
@@ -415,16 +479,17 @@ def review(
     result = _capture_action(
         _cmd_review, ticket_id, cfg, repo_root, verdict=verdict, summary=summary, findings=findings
     )
-    tickets_dir = repo_root / cfg["tickets_dir"]
-    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    tid = canonical_id(ticket_id)
-    ticket = next((t for t in tickets if t["id"] == tid), None)
-    if ticket:
-        result["status"] = ticket.get("status")
-        if ticket.get("review_verdict"):
-            result["verdict"] = ticket["review_verdict"]
-        if ticket.get("review_summary"):
-            result["summary"] = ticket["review_summary"]
+    if result["ok"]:
+        tickets_dir = repo_root / cfg["tickets_dir"]
+        tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+        tid = canonical_id(ticket_id)
+        ticket = next((t for t in tickets if t["id"] == tid), None)
+        if ticket:
+            result["status"] = ticket.get("status")
+            if ticket.get("review_verdict"):
+                result["verdict"] = ticket["review_verdict"]
+            if ticket.get("review_summary"):
+                result["summary"] = ticket["review_summary"]
     return result
 
 
@@ -461,6 +526,85 @@ def promote(env_name: str) -> dict:
     from lanegate.promote import cmd_promote
 
     return _capture_action(cmd_promote, env_name, cfg, repo_root)
+
+
+@_mcp.tool()
+def create(
+    intent: str,
+    title: str | None = None,
+    milestone: str | None = None,
+    autonomy: str | None = None,
+) -> dict:
+    """Write a draft ticket from natural-language intent.
+
+    Leaves the ticket in draft — the board-clearing loop (`run`/`orchestrate`)
+    analyzes drafts automatically before dispatching, so no analyze pass is
+    triggered here. Run `analyze` directly if you need touches/close_criteria
+    populated immediately.
+
+    Args:
+        intent:     Natural-language description of the change to make.
+        title:      Explicit ticket title; derived from intent when omitted.
+        milestone:  Explicit milestone; falls back to config/interactive default when omitted.
+        autonomy:   Optional autonomy override for the ticket.
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.create import cmd_create
+    from lanegate.ticket import canonical_id, load_all_tickets
+
+    created_ids: list[str] = []
+
+    def _create(intent, cfg, repo_root):
+        ticket_id = cmd_create(
+            intent, cfg, repo_root, milestone=milestone, title=title, autonomy=autonomy
+        )
+        created_ids.append(ticket_id)
+
+    _create.__name__ = "cmd_create"
+    result = _capture_action(_create, intent, cfg, repo_root, ticket_id=None)
+    if created_ids:
+        tid = canonical_id(created_ids[0])
+        tickets_dir = repo_root / cfg["tickets_dir"]
+        tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+        ticket = next((t for t in tickets if t["id"] == tid), None)
+        result["ticket_id"] = tid
+        result["status"] = ticket.get("status") if ticket else "draft"
+        result["touches"] = ticket.get("touches", []) if ticket else []
+        result["close_criteria"] = ticket.get("close_criteria", []) if ticket else []
+    return result
+
+
+@_mcp.tool()
+def analyze(ticket_id: str, keep_draft: bool = False) -> dict:
+    """Populate a draft ticket's touches/close_criteria (draft → open unless keep_draft).
+
+    The MCP-native way for an agent to advance a ticket created via `create`
+    without waiting for the board-clearing loop's own draft-analysis pass, or
+    dispatching a full `run`.
+
+    Args:
+        ticket_id:  Ticket identifier, e.g. "TICK-007".
+        keep_draft: When True, populate touches/close_criteria but leave status as draft.
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.analyze import cmd_analyze
+    from lanegate.ticket import canonical_id, load_all_tickets
+
+    result = _capture_action(cmd_analyze, ticket_id, cfg, repo_root, keep_draft=keep_draft)
+    if result.get("ok"):
+        try:
+            tid = canonical_id(ticket_id)
+            tickets_dir = repo_root / cfg["tickets_dir"]
+            tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+            ticket = next((t for t in tickets if t["id"] == tid), None)
+            if ticket:
+                result["ticket_id"] = tid
+                result["status"] = ticket.get("status")
+                result["touches"] = ticket.get("touches", [])
+                result["close_criteria"] = ticket.get("close_criteria", [])
+        except ValueError:
+            pass
+    return result
 
 
 # ── Extended lifecycle tools ──────────────────────────────────────────────────
@@ -505,6 +649,23 @@ def needs_review(ticket_id: str, reason: str = "") -> dict:
 
 
 @_mcp.tool()
+def human_review_approve(ticket_id: str, rationale: str) -> dict:
+    """Record an audited human approval for a needs_review ticket: status → code_complete.
+
+    Args:
+        ticket_id: Ticket identifier, e.g. "TICK-007".
+        rationale: Required explanation for human review approval.
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.lifecycle import cmd_human_review_approve
+
+    result = _capture_action(cmd_human_review_approve, ticket_id, cfg, repo_root, rationale=rationale, actor="agent")
+    if result["ok"]:
+        result["status"] = "code_complete"
+    return result
+
+
+@_mcp.tool()
 def fail(ticket_id: str, reason: str = "") -> dict:
     """Mark a ticket as failed: status → failed, worktree released.
 
@@ -525,7 +686,7 @@ def fail(ticket_id: str, reason: str = "") -> dict:
 
 @_mcp.tool()
 def reopen(ticket_id: str) -> dict:
-    """Reopen a failed ticket: status → open so it can be dispatched again.
+    """Restore an eligible ticket lifecycle status without dispatching an agent.
 
     Args:
         ticket_id: Ticket identifier, e.g. "TICK-007".
@@ -537,6 +698,37 @@ def reopen(ticket_id: str) -> dict:
     if result["ok"]:
         result["status"] = "open"
     return result
+
+
+@_mcp.tool()
+def close(ticket_id: str, reason: str) -> dict:
+    """Close a completed no-code ticket with evidence of its own outcome.
+
+    This is not supersession: it records that the ticket's stated close
+    criteria were completed. Tickets with a worktree must proceed through
+    the code review and merge lifecycle instead.
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.lifecycle import cmd_close
+
+    result = _capture_action(cmd_close, ticket_id, cfg, repo_root, reason=reason)
+    if result["ok"]:
+        result["status"] = "closed"
+    return result
+
+
+@_mcp.tool()
+def resolve_conflict(ticket_id: str, pool_name: str | None = None) -> dict:
+    """Explicitly rebase a needs-review worktree and resolve conflicts with an agent.
+
+    Args:
+        ticket_id: Ticket identifier, e.g. "TICK-007".
+        pool_name: Optional executor pool for the conflict-fix agent.
+    """
+    cfg, repo_root = _cfg_and_root()
+    from lanegate.lifecycle import cmd_resolve_conflict
+
+    return _capture_action(cmd_resolve_conflict, ticket_id, cfg, repo_root, pool_name=pool_name)
 
 
 @_mcp.tool()
@@ -572,14 +764,14 @@ def done(ticket_id: str) -> dict:
 
 
 @_mcp.tool()
-def orchestrate(
+def run(
     max_parallel: int | None = None,
     dry_run: bool = True,
     human_review: str = "none",
     milestone: str | None = None,
     all_milestones: bool = False,
 ) -> dict:
-    """Run or preview orchestration through a bounded-output wrapper.
+    """Run or preview the board-clearing loop through a bounded-output wrapper.
 
     Defaults to dry-run so an attached agent can inspect the plan before starting
     executor work. Set dry_run=False to perform the run.
@@ -603,6 +795,18 @@ def orchestrate(
     result["dry_run"] = dry_run
     result["human_review"] = human_review
     return result
+
+
+@_mcp.tool()
+def orchestrate(
+    max_parallel: int | None = None,
+    dry_run: bool = True,
+    human_review: str = "none",
+    milestone: str | None = None,
+    all_milestones: bool = False,
+) -> dict:
+    """Compatibility alias for :func:`run`; prefer the ``run`` tool."""
+    return run(max_parallel, dry_run, human_review, milestone, all_milestones)
 
 
 # ── Analytics tool ────────────────────────────────────────────────────────────

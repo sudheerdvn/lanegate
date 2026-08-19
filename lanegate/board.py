@@ -12,21 +12,38 @@ import datetime
 import json
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 from lanegate.concurrency import locked_touches, touches_overlap
-from lanegate.config import resolve_executor_route, resolve_ticket_pool, resolve_trunk_branch
+from lanegate.config import (
+    ConfigError,
+    resolve_autonomy,
+    resolve_executor_route,
+    resolve_ticket_pool,
+    resolve_trunk_branch,
+    validate_model_for_executor,
+)
 from lanegate.executor import discover_ollama_context, get_executor_config
-from lanegate.git import PendingCommits, pending_commits
-from lanegate.lifecycle import resolve_reviewer
+from lanegate.git import PendingCommits, pending_commits, verify_local_branch
+from lanegate.lifecycle import rejected_auto_fix_recovery_reason, resolve_reviewer
 from lanegate.ticket import (
     _STANDARD_STATUSES,
     TERMINAL_STATUSES,
+    _active_rate_limit_hibernation,
+    _active_reviewer_cooldown_hibernation,
+    attention_category,
     attention_summary,
     branch_name,
     canonical_id,
+    classify_needs_review_cause,
+    get_ticket_summary,
     group_by_status,
     load_all_tickets,
+    needs_attention,
+    needs_review_recovery_advice,
+    reviewer_cooldown_retry_pending,
     unresolved_dependencies,
+    validate_ticket,
 )
 
 
@@ -34,7 +51,7 @@ def _time_in_status(ticket: dict) -> str:
     """Return a human-readable age string for how long a ticket has been in its current status.
 
     Returns "—" when status_changed_at is absent or unparseable (graceful handling
-    for tickets created before TICK-082).
+    for tickets created before this field existed).
     """
     raw = ticket.get("status_changed_at")
     if not raw:
@@ -57,19 +74,49 @@ def _time_in_status(ticket: dict) -> str:
         return "—"
 
 
-def _pending_payload(env: dict, pending: PendingCommits, base: str) -> dict:
-    """Build a pipeline JSON entry without disguising Git errors as empty ranges."""
-    result = {
+def _missing_branch_message(branch: str, base: str) -> str:
+    return (
+        f"branch {branch!r} does not exist — create it "
+        f"(git branch {branch} {base}) or remove it from environments in .lanegate.yml"
+    )
+
+
+def _environment_pending(
+    repo_root: Path, env: dict, base: str
+) -> tuple[PendingCommits, str | None]:
+    """Return pending commits plus a friendly missing-branch diagnostic, if applicable."""
+    branch = env["branch"]
+    pending = pending_commits(repo_root, branch, base)
+    if pending.ok:
+        return pending, None
+
+    # Keep pending_commits' diagnostic for every unexpected range-query failure.
+    # Only replace it after Git specifically confirms that the environment branch
+    # itself is absent.
+    branch_ref = verify_local_branch(repo_root, branch)
+    if branch_ref.ok and not branch_ref.text:
+        return pending, _missing_branch_message(branch, base)
+    return pending, None
+
+
+def _pending_payload(
+    env: dict, pending: PendingCommits, base: str, missing_branch_error: str | None = None
+) -> dict:
+    """Build a pipeline JSON entry without disguising Git errors as empty ranges.
+
+    Only the count is embedded, matching what text-mode board already shows — the full
+    commit list isn't consumed anywhere and a large promotion backlog (thousands of
+    commits) would otherwise blow past MCP tool output limits on every board call.
+    """
+    return {
         "env": env["name"],
         "base": base,
         "head": env["branch"],
         "trigger": env.get("trigger", "manual"),
         "pending_state": "ok" if pending.ok else "unknown",
-        "pending_error": pending.error,
-        "commits": pending.commits,
+        "pending_error": missing_branch_error or pending.error,
+        "pending_count": len(pending.commits) if pending.ok else None,
     }
-    result["pending_count"] = len(pending.commits) if pending.ok else None
-    return result
 
 
 def latest_dispatch_executors(repo_root: Path) -> dict[str, str]:
@@ -117,16 +164,45 @@ def latest_dispatch_executors(repo_root: Path) -> dict[str, str]:
     return dispatches
 
 
+# Full-history fields that the terminal board never displays (directly, or via the
+# condensed attention_summary/needs_review_cause helpers below) -- kept out of the
+# board/MCP JSON payload since they only grow over a ticket's lifetime and can dwarf
+# everything else on tickets with a long review/rework history. Full detail is still
+# available per-ticket via get_ticket_detail() / GET /api/tickets/{id}.
+_BOARD_EXCLUDED_FIELDS = frozenset({
+    "change_notes",
+    "lifecycle_events",
+    "acceptance_matrix",
+    "close_criteria",
+    "review_findings",
+    "human_review_rationale",
+    "human_review_actor",
+    "acceptance_contract_audit",
+})
+
+
 def _ticket_data(
     t: dict,
     cfg: dict | None = None,
     *,
     dispatched_executor: str | None = None,
 ) -> dict:
-    data = {k: v for k, v in t.items() if not k.startswith("_")}
-    summary = attention_summary(t)
+    data = {
+        k: v
+        for k, v in t.items()
+        if not k.startswith("_") and k not in _BOARD_EXCLUDED_FIELDS
+    }
+    attention_ticket = _attention_ticket(t, cfg)
+    category = attention_category(attention_ticket)
+    data["needs_attention"] = bool(category)
+    if category:
+        data["attention_category"] = category
+    summary = attention_summary(attention_ticket)
     if summary:
         data["attention_summary"] = summary
+    if t.get("status") == "needs_review":
+        data["needs_review_cause"] = classify_needs_review_cause(t)
+        data["needs_review_recovery"] = needs_review_recovery_advice(t)
     if cfg is not None:
         route = resolve_executor_route(cfg, t)
         data["reviewer"] = resolve_reviewer(t, cfg)
@@ -142,7 +218,7 @@ def _ticket_data(
             if dispatched_executor:
                 data["executor_instance"] = dispatched_executor
                 return data
-            # TICK-088: surface the resolved named executor instance (e.g.
+            # surface the resolved named executor instance (e.g.
             # "claude-1") rather than the bare type for in-progress tickets.
             # get_executor_config always returns an "instance" key, falling
             # back to the bare type when no named instance is configured.
@@ -176,11 +252,11 @@ def _render_board_tickets(
 def _ticket_flags(t: dict) -> str:
     parts = []
     if t.get("equivalent_ticket_id"):
-        # TICK-284: reconciliation found this ticket's intent already
+        # reconciliation found this ticket's intent already
         # covered by an already-merged ticket.
         parts.append(f"superseded-by:{t['equivalent_ticket_id']}")
     elif t.get("replacement_commit"):
-        # TICK-284: this ticket's own branch was already an ancestor of
+        # this ticket's own branch was already an ancestor of
         # main -- the work landed through some other path.
         parts.append(f"superseded-by:{t['replacement_commit'][:8]}")
     if t.get("feature_flag"):
@@ -195,12 +271,12 @@ def _ticket_flags(t: dict) -> str:
     if route and route.get("mode") == "split":
         parts.append(f"exec:{route['implement']}->{route['review']} split")
     elif t.get("executor_instance"):
-        # TICK-088: in-progress, combined-mode tickets show the resolved
+        # in-progress, combined-mode tickets show the resolved
         # named executor instance (e.g. "claude-1"); falls back to the bare
         # type when no named instance is configured, via _ticket_data.
         parts.append(f"exec:{t['executor_instance']}")
     if "routed_pool" in t:
-        # TICK-091: only present when routing:/default_pool is configured
+        # only present when routing:/default_pool is configured
         # for this project (see _ticket_data) — keeps non-routing boards clean.
         parts.append(f"pool:{t['routed_pool']}")
     if not t.get("milestone"):
@@ -288,12 +364,17 @@ def _review_detail_lines(tickets: list[dict]) -> list[str]:
     return lines
 
 
-def _next_step_lines(tickets: list[dict], milestone: str | None = None) -> list[str]:
+def _next_step_lines(
+    tickets: list[dict], milestone: str | None = None, cfg: dict | None = None
+) -> list[str]:
+    cfg = cfg or {}
     actionable = [
         t
         for t in tickets
-        if t.get("status")
-        in {"in_progress", "hibernated", "needs_review", "code_complete", "failed"}
+        if (
+            t.get("status") in {"in_progress", "code_complete", "hibernated"}
+            or needs_attention(t)
+        )
         and (milestone is None or t.get("milestone") == milestone)
     ]
     lines: list[str] = []
@@ -302,33 +383,106 @@ def _next_step_lines(tickets: list[dict], milestone: str | None = None) -> list[
         status = ticket.get("status")
         verdict = ticket.get("review_verdict")
         reason = attention_summary(ticket)
+        if not reason:
+            reason = ticket.get("review_pending_reason") or ""
+
+        is_rate_limited = _active_rate_limit_hibernation(ticket)
+
         if status == "in_progress":
             lines.append(
                 f"  {tid}: implementation running or claimed - "
-                "check: lanegate orchestrate --status"
+                "check: lanegate run --status"
             )
+        elif status == "hibernated" and ticket.get("review_pending"):
+            if _active_reviewer_cooldown_hibernation(ticket):
+                lines.append(
+                    f"  {tid}: review_pending (reviewer cooldown) - independent "
+                    "reviewer temporarily unavailable; auto-retries after "
+                    f"{ticket.get('review_retry_after')} - next: lanegate run"
+                )
+            elif is_rate_limited:
+                lines.append(
+                    f"  {tid}: review_pending (rate-limited) - reviewer rate limited; "
+                    "next: lanegate run (auto-recovers on quota reset)"
+                )
+            else:
+                lines.append(
+                    f"  {tid}: review_pending - reviewer did not return a verdict; "
+                    "next: lanegate run"
+                )
+            if reason:
+                lines.append(f"    reason: {reason}")
+        elif status == "hibernated" and is_rate_limited:
+            lines.append(
+                f"  {tid}: hibernated (rate-limited) - rate limit interrupted execution; "
+                "next: lanegate run (auto-resumes on quota reset)"
+            )
+            if reason:
+                lines.append(f"    reason: {reason}")
+        elif status != "code_complete" and not needs_attention(ticket):
+            # code_complete is exempt: the top-level `actionable` filter above
+            # always includes it (same as in_progress/hibernated), but
+            # needs_attention()/attention_category() never returns true for
+            # a plain code_complete ticket -- nothing is "stuck", it's just
+            # waiting for review. Without this exemption the `code_complete`
+            # branch below is unreachable and a freshly-completed ticket gets
+            # silently dropped from Next Steps instead of pointing at
+            # `lanegate review <id> --verdict approved` / `lanegate run`.
+            continue
         elif status == "hibernated":
-            lines.append(f"  {tid}: hibernated - next: lanegate orchestrate")
+            lines.append(
+                f"  {tid}: hibernated - inspect log/worktree, then: "
+                f"lanegate reopen {tid} && lanegate run"
+            )
+            if reason:
+                lines.append(f"    reason: {reason}")
         elif status == "needs_review":
-            lines.append(
-                f"  {tid}: needs_review - inspect worktree, then: "
-                f"lanegate reopen {tid} && lanegate orchestrate"
-            )
+            # Do not let a stale rate-limit hibernation marker override a
+            # later hard-blocked escalation.  The classifier prioritizes the
+            # active explicit reason and is the source of truth for all
+            # needs_review guidance.
+            cause = classify_needs_review_cause(ticket)
+            advice = needs_review_recovery_advice(ticket)
+            lines.append(f"  {tid}: needs_review ({cause}) - {advice}")
             if reason:
                 lines.append(f"    reason: {reason}")
-        elif status == "code_complete" and verdict == "changes_requested":
-            lines.append(
-                f"  {tid}: changes_requested - address feedback, then: "
-                f"lanegate review {tid} --verdict approved"
-            )
+        elif verdict == "changes_requested":
+            recovery_reason = rejected_auto_fix_recovery_reason(ticket, cfg)
+            if recovery_reason:
+                lines.append(
+                    f"  {tid}: exhausted rejected review - after manual fixes, request "
+                    f"a fresh independent review: lanegate review {tid}"
+                )
+                lines.append(
+                    f"    To release its touch lock without re-reviewing: "
+                    f"lanegate recover-rejected {tid}"
+                )
+            else:
+                lines.append(
+                    f"  {tid}: changes_requested - address feedback, then request "
+                    f"a fresh independent review: lanegate review {tid}"
+                )
             if reason:
                 lines.append(f"    reason: {reason}")
+        elif status == "in_review" and verdict == "approved":
+            lines.append(f"  {tid}: approved - awaiting human merge decision: lanegate merge {tid}")
         elif status == "code_complete":
-            lines.append(f"  {tid}: code_complete - next: lanegate review {tid} --verdict approved")
+            lines.append(
+                f"  {tid}: code_complete - awaiting review; next: lanegate run "
+                f"(dispatches an independent reviewer), or lanegate review {tid} "
+                "--verdict approved to self-approve without one"
+            )
+        elif status == "merged" and ticket.get("post_merge_diagnostic"):
+            lines.append(
+                f"  {tid}: post_merge_diagnostic - fix the diagnostic, then "
+                f"lanegate validate {tid}"
+            )
+            if reason:
+                lines.append(f"    reason: {reason}")
         elif status == "failed":
             lines.append(
                 f"  {tid}: failed - inspect log/worktree, then: "
-                f"lanegate reopen {tid} && lanegate orchestrate"
+                f"lanegate reopen {tid} && lanegate run"
             )
             if reason:
                 lines.append(f"    reason: {reason}")
@@ -396,23 +550,44 @@ def _print_board_text(
         console.print(f"[bold yellow]{label} ({len(group)})[/bold yellow]")
         console.print(table)
         if status == "draft":
-            ids = " / ".join(t["id"] for t in sorted(group, key=lambda x: x.get("priority", 99)))
-            console.print(
-                f"[dim]  Draft tickets need touches before they can be started. "
-                f"Run `lanegate analyze <id>` (auto-populate) or `lanegate open <id>` "
-                f"(if you already set touches manually). Tickets: {ids}[/dim]\n"
-            )
+            sorted_group = sorted(group, key=lambda x: x.get("priority", 99))
+            # analyze can populate touches without flipping draft -> open (e.g.
+            # `lanegate create --no-analyze` followed by a separate analyze
+            # call). A draft that already has touches just needs `open`; only
+            # one still lacking touches needs `analyze` -- collapsing both
+            # into one blanket "analyze (auto-populate) or open (if you
+            # already set touches manually)" message told a ticket that had
+            # just been auto-analyzed to re-run analyze, and mischaracterized
+            # its already-populated touches as something the user set by hand.
+            ready = [t["id"] for t in sorted_group if t.get("touches")]
+            needs_touches = [t["id"] for t in sorted_group if not t.get("touches")]
+            if ready:
+                console.print(
+                    f"[dim]  Touches already populated — run `lanegate open <id>` "
+                    f"to start: {' / '.join(ready)}[/dim]"
+                )
+            if needs_touches:
+                console.print(
+                    f"[dim]  No touches yet — run `lanegate analyze <id>` to "
+                    f"populate them: {' / '.join(needs_touches)}[/dim]"
+                )
+            console.print()
         if status == "in_review":
             console.print("[bold]Review[/bold]")
             for line in _review_detail_lines(group):
-                console.print(f"[dim]{line}[/dim]")
+                # soft_wrap=True: see the missing_branch_error print above --
+                # same wrap-induced ANSI-splitting risk for any long detail line.
+                console.print(f"[dim]{line}[/dim]", soft_wrap=True)
             console.print()
 
-    next_lines = _next_step_lines(all_tickets, milestone=milestone)
+    next_lines = _next_step_lines(all_tickets, milestone=milestone, cfg=cfg)
     if next_lines:
         console.print("[bold]Next Steps[/bold]")
         for line in next_lines:
-            console.print(f"[dim]{line}[/dim]")
+            # soft_wrap=True: same wrap-induced ANSI-splitting risk as above --
+            # next-step guidance strings are long enough to wrap at typical
+            # console widths, which re-emits the [dim] style's SGR codes mid-word.
+            console.print(f"[dim]{line}[/dim]", soft_wrap=True)
         console.print()
 
     other_statuses = set(grouped) - printed
@@ -436,8 +611,18 @@ def _print_board_text(
             base = env.get("from", resolve_trunk_branch(cfg, repo_root))
             head = env["branch"]
             trigger = env.get("trigger", "manual")
-            pending = pending_commits(repo_root, head, base)
-            if not pending.ok:
+            pending, missing_branch_error = _environment_pending(repo_root, env, base)
+            if missing_branch_error:
+                # soft_wrap=True: this is a single diagnostic line. Without it, Rich
+                # word-wraps at console.width and re-emits the style's SGR codes
+                # around the wrap point, splitting words mid-string with invisible
+                # ANSI bytes -- breaks plain-text substring checks (tests, grep)
+                # without changing anything a human sees.
+                console.print(
+                    f"  {base} → {head} : [yellow]{missing_branch_error}[/yellow]",
+                    soft_wrap=True,
+                )
+            elif not pending.ok:
                 console.print(
                     f"  {base} → {head} : [yellow]unknown[/yellow] "
                     f"(could not determine pending commits: {pending.error})"
@@ -451,6 +636,12 @@ def _print_board_text(
                 )
             else:
                 console.print(f"  {base} → {head} : [green]up to date[/green]")
+
+    from lanegate.pending_globals import check_pending_globals, format_pending_globals_notice
+    pg_info = check_pending_globals(repo_root)
+    if pg_info["has_pending"]:
+        console.print(f"\n{format_pending_globals_notice(pg_info, rich_markup=True)}")
+
         console.print()
 
 
@@ -475,8 +666,8 @@ def _board_json_payload(cfg: dict, repo_root: Path, grouped: dict) -> dict:
     pipeline = []
     for env in cfg.get("environments", []):
         base = env.get("from", resolve_trunk_branch(cfg, repo_root))
-        head = env["branch"]
-        pipeline.append(_pending_payload(env, pending_commits(repo_root, head, base), base))
+        pending, missing_branch_error = _environment_pending(repo_root, env, base)
+        pipeline.append(_pending_payload(env, pending, base, missing_branch_error))
     return {"tickets": result_tickets, "pipeline": pipeline}
 
 
@@ -682,6 +873,14 @@ def cmd_next(
     for t in tickets:
         if t.get("status") not in ("open", "hibernated"):
             continue
+        if t.get("status") == "open" and not t.get("touches"):
+            continue
+        if (
+            t.get("status") == "hibernated"
+            and t.get("review_pending")
+            and reviewer_cooldown_retry_pending(t)
+        ):
+            continue
         if milestone is not None and t.get("milestone") != milestone:
             continue
         if unresolved_dependencies(t.get("depends_on"), status_map):
@@ -728,7 +927,7 @@ def cmd_next(
 
     if not candidates:
         print("No unblocked open tickets (or hibernated tickets).")
-        next_lines = _next_step_lines(tickets, milestone=milestone)
+        next_lines = _next_step_lines(tickets, milestone=milestone, cfg=cfg)
         if next_lines:
             print("\nNext steps:")
             for line in next_lines:
@@ -761,20 +960,141 @@ def cmd_next(
             )
 
 
-def cmd_route(cfg: dict, repo_root: Path, ticket_id: str, json_output: bool = False) -> None:
-    """Dry-run: show which pool `ticket_id` would be routed to, and why (TICK-091)."""
+def _fail_json_or_text(json_output: bool, message: str, *, payload: dict | None = None) -> NoReturn:
+    """Print an error and exit(1) -- the shared tail of every board command's
+    not-found/validation-failure path, as `{"error": ...}` JSON or `ERROR: ...`
+    text depending on ``json_output``. ``payload`` overrides the default
+    ``{"error": message}`` JSON body for a caller (e.g. cmd_summary) that
+    already has a richer error dict to print.
+    """
+    if json_output:
+        print(json.dumps(payload if payload is not None else {"error": message}, indent=2, default=str))
+    else:
+        print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_route(
+    cfg: dict,
+    repo_root: Path,
+    ticket_id: str,
+    json_output: bool = False,
+    reviewer: str | None = None,
+    executor: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Show or update which pool `ticket_id` would be routed to, and why."""
     tickets_dir = repo_root / cfg["tickets_dir"]
     all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
     tid = canonical_id(ticket_id)
-    ticket = next((t for t in all_tickets if canonical_id(t.get("id", "")) == tid), None)
+    ticket = None
+    for t in all_tickets:
+        try:
+            if canonical_id(t.get("id", "")) == tid:
+                ticket = t
+                break
+        except ValueError:
+            continue
 
     if ticket is None:
-        message = f"ticket {tid} not found"
-        if json_output:
-            print(json.dumps({"error": message}, indent=2))
-        else:
-            print(f"ERROR: {message}", file=sys.stderr)
-        sys.exit(1)
+        _fail_json_or_text(json_output, f"ticket {tid} not found")
+
+    updated = False
+    msg_parts = []
+    updated_ticket = dict(ticket)
+    if reviewer is not None:
+        updated_ticket["reviewer"] = reviewer
+        msg_parts.append(f"reviewer → {reviewer}")
+        updated = True
+    if executor is not None:
+        recorded_implementer = ticket.get("implement_session_executor")
+        if recorded_implementer and executor != recorded_implementer:
+            _fail_json_or_text(
+                json_output,
+                f"cannot change executor for {tid} after implementation; "
+                f"recorded implementer is {recorded_implementer!r}",
+            )
+        updated_ticket["executor"] = executor
+        msg_parts.append(f"executor → {executor}")
+        updated = True
+    if model is not None:
+        updated_ticket["review_model_pin"] = model
+        msg_parts.append(f"model → {model}")
+        updated = True
+
+    if updated:
+        validation_errors = validate_ticket(updated_ticket, cfg)
+        effective_review_model = updated_ticket.get("review_model_pin")
+        if (
+            (model is not None or reviewer is not None or executor is not None)
+            and effective_review_model
+            and not validation_errors
+        ):
+            # ``resolve_reviewer`` describes the configured/default route,
+            # but it is not necessarily who will execute a review.  In a
+            # mixed pool the review dispatcher excludes the implementer and
+            # can consequently select a different executor family.  Validate
+            # against that same candidate so a Claude pin cannot later be
+            # handed to Codex (or vice versa).
+            if updated_ticket.get("reviewer"):
+                resolved_reviewer = updated_ticket["reviewer"]
+            else:
+                from lanegate.orchestrate.review import (
+                    _implementer_identity,
+                    resolve_independent_review_driver,
+                )
+
+                resolved_reviewer, _ = resolve_independent_review_driver(
+                    updated_ticket,
+                    cfg,
+                    repo_root,
+                    implementer=_implementer_identity(updated_ticket),
+                )
+            # No currently healthy reviewer means there is no dispatch target
+            # to validate.  The review path will keep the ticket pending and
+            # validates again immediately before any eventual launch.
+            if resolved_reviewer is None:
+                resolved_reviewer = resolve_reviewer(updated_ticket, cfg)
+            drivers = cfg.get("drivers") or {}
+            driver_cfg = (
+                drivers.get(resolved_reviewer, {})
+                if isinstance(drivers, dict)
+                else {}
+            )
+            if isinstance(driver_cfg, dict) and driver_cfg:
+                reviewer_type = driver_cfg.get("type", resolved_reviewer)
+            else:
+                reviewer_type = get_executor_config(resolved_reviewer, cfg).get(
+                    "type", resolved_reviewer
+                )
+            try:
+                validate_model_for_executor(
+                    str(effective_review_model), str(reviewer_type), "review routing"
+                )
+            except ConfigError as exc:
+                validation_errors.append(str(exc))
+        if validation_errors:
+            message = "; ".join(validation_errors)
+            _fail_json_or_text(
+                json_output,
+                f"invalid routing update for {tid}: {message}",
+                payload={"error": message},
+            )
+
+        from lanegate.ticket import write_ticket
+        from lanegate.lifecycle import _commit_generated_ticket_write
+
+        original_ticket_text = ticket["_path"].read_text(encoding="utf-8")
+        ticket = updated_ticket
+        write_ticket(ticket)
+        note = f"route {tid} " + ", ".join(msg_parts)
+        try:
+            _commit_generated_ticket_write(repo_root, ticket["_path"], tid, note, cfg)
+        except SystemExit:
+            ticket["_path"].write_text(original_ticket_text, encoding="utf-8")
+            raise
+        if not json_output:
+            print(f"Updated routing for {tid}: " + ", ".join(msg_parts))
 
     pool_name, reason = resolve_ticket_pool(cfg, ticket)
     route = resolve_executor_route(cfg, ticket)
@@ -857,8 +1177,8 @@ def cmd_pipeline_status(cfg: dict, repo_root: Path, json_output: bool = False) -
         result = []
         for env in envs:
             base = env.get("from", resolve_trunk_branch(cfg, repo_root))
-            head = env["branch"]
-            result.append(_pending_payload(env, pending_commits(repo_root, head, base), base))
+            pending, missing_branch_error = _environment_pending(repo_root, env, base)
+            result.append(_pending_payload(env, pending, base, missing_branch_error))
         print(json.dumps(result, indent=2, default=str))
         return
 
@@ -872,9 +1192,11 @@ def cmd_pipeline_status(cfg: dict, repo_root: Path, json_output: bool = False) -
         base = env.get("from", resolve_trunk_branch(cfg, repo_root))
         head = env["branch"]
         trigger = env.get("trigger", "manual")
-        pending = pending_commits(repo_root, head, base)
+        pending, missing_branch_error = _environment_pending(repo_root, env, base)
 
-        if not pending.ok:
+        if missing_branch_error:
+            print(f"{base} → {head}   {missing_branch_error}")
+        elif not pending.ok:
             print(
                 f"{base} → {head}   unknown — could not determine pending commits: {pending.error}"
             )
@@ -890,99 +1212,157 @@ def cmd_pipeline_status(cfg: dict, repo_root: Path, json_output: bool = False) -
         print()
 
 
+def _attention_ticket(ticket: dict, cfg: dict | None) -> dict:
+    """Add resolved autonomy for the ticket-only attention predicate."""
+    if cfg is None:
+        return ticket
+    return {**ticket, "_effective_autonomy": resolve_autonomy(cfg, ticket)}
+
+
+def _needs_attention_entry(ticket: dict, trunk_branch: str) -> dict:
+    """Build the shared JSON row used by the CLI and API attention queue."""
+    bid = ticket["id"]
+    branch = ticket.get("branch") or branch_name(bid)
+    return {
+        "id": bid,
+        "title": ticket.get("title", ""),
+        "branch": branch,
+        "diff_cmd": f"git diff {trunk_branch}...{branch}",
+        "findings": ticket.get("review_findings") or [],
+        "attention_summary": attention_summary(ticket),
+        "attention_category": attention_category(ticket),
+        "priority": ticket.get("priority"),
+        "milestone": ticket.get("milestone"),
+    }
+
+
+def _needs_attention_tickets(tickets: list[dict], cfg: dict) -> list[dict]:
+    return [
+        attention_ticket
+        for ticket in tickets
+        if needs_attention(attention_ticket := _attention_ticket(ticket, cfg))
+    ]
+
+
 def get_blocked_queue(cfg: dict, repo_root: Path) -> dict:
-    """Return blocked tickets (changes_requested) as JSON-serializable dict (API endpoint)."""
+    """Return the needs-human-decision queue as JSON-serializable data."""
     tickets_dir = repo_root / cfg["tickets_dir"]
     all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
 
-    blocked = [
-        t
-        for t in all_tickets
-        if t.get("status") == "code_complete" and t.get("review_verdict") == "changes_requested"
-    ]
-
     trunk_branch = resolve_trunk_branch(cfg, repo_root)
-    result = []
-    for t in blocked:
-        bid = t["id"]
-        branch = t.get("branch") or branch_name(bid)
-        diff_cmd = f"git diff {trunk_branch}...{branch}"
-        entry = {
-            "id": bid,
-            "title": t.get("title", ""),
-            "branch": branch,
-            "diff_cmd": diff_cmd,
-            "findings": t.get("review_findings") or [],
-            "priority": t.get("priority"),
-            "milestone": t.get("milestone"),
-        }
-        result.append(entry)
-    return {"blocked": result}
+    return {"blocked": [_needs_attention_entry(t, trunk_branch) for t in _needs_attention_tickets(all_tickets, cfg)]}
 
 
 def cmd_blocked(cfg: dict, repo_root: Path, json_output: bool = False) -> None:
-    """List code_complete or in_review tickets with review_verdict=changes_requested."""
+    """List tickets awaiting a human decision or intervention."""
     tickets_dir = repo_root / cfg["tickets_dir"]
     all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
 
-    blocked = [
-        t
-        for t in all_tickets
-        if t.get("status") in ("code_complete", "in_review")
-        and t.get("review_verdict") == "changes_requested"
-    ]
+    blocked = _needs_attention_tickets(all_tickets, cfg)
 
     trunk_branch = resolve_trunk_branch(cfg, repo_root)
     if json_output:
-        result = []
-        for t in blocked:
-            bid = t["id"]
-            branch = t.get("branch") or branch_name(bid)
-            diff_cmd = f"git diff {trunk_branch}...{branch}"
-            entry = {
-                "id": bid,
-                "title": t.get("title", ""),
-                "branch": branch,
-                "diff_cmd": diff_cmd,
-                "findings": t.get("review_findings") or [],
-                "attention_summary": attention_summary(t),
-            }
-            result.append(entry)
-        print(json.dumps(result, indent=2, default=str))
+        print(json.dumps([_needs_attention_entry(t, trunk_branch) for t in blocked], indent=2, default=str))
         return
 
     if not blocked:
-        print("No blocked tickets.")
+        print("No tickets need human attention.")
         return
 
-    print("Blocked tickets (changes_requested):\n")
-    for t in blocked:
-        bid = t["id"]
-        title = t.get("title", "")
-        branch = t.get("branch") or branch_name(bid)
-        diff_cmd = f"git diff {trunk_branch}...{branch}"
-        findings = t.get("review_findings") or []
-        reason = attention_summary(t)
-        priority = t.get("priority")
-        milestone = t.get("milestone")
+    labels = {
+        "escalated": "Escalated",
+        "rejected": "Changes requested",
+        "failed": "Failed",
+        "stuck": "Stuck",
+        "awaiting_merge": "Awaiting merge",
+        "merged_diagnostic": "Post-merge verification diagnostic",
+    }
+    print("Needs-human-decision tickets:\n")
+    for category in labels:
+        grouped = [ticket for ticket in blocked if attention_category(ticket) == category]
+        if not grouped:
+            continue
+        print(f"{labels[category]}:")
+        for t in grouped:
+            bid = t["id"]
+            title = t.get("title", "")
+            branch = t.get("branch") or branch_name(bid)
+            diff_cmd = f"git diff {trunk_branch}...{branch}"
+            findings = t.get("review_findings") or []
+            reason = attention_summary(t)
+            priority = t.get("priority")
+            milestone = t.get("milestone")
 
-        # Construct the header line
-        header = f"{bid} — {title}"
-        if milestone:
-            if priority is not None:
-                header += f" ({milestone}, priority {priority})"
-            else:
-                header += f" ({milestone})"
-        elif priority is not None:
-            header += f" (priority {priority})"
+            # Construct the header line
+            header = f"{bid} — {title}"
+            if milestone:
+                if priority is not None:
+                    header += f" ({milestone}, priority {priority})"
+                else:
+                    header += f" ({milestone})"
+            elif priority is not None:
+                header += f" (priority {priority})"
 
-        print(header)
-        print(f"  Branch: {branch}   {diff_cmd}")
-        if reason:
-            print(f"  Reason: {reason}")
+            print(header)
+            print(f"  Branch: {branch}   {diff_cmd}")
+            if reason:
+                print(f"  Reason: {reason}")
 
-        if findings:
-            print("  Findings:")
-            for idx, finding in enumerate(findings, 1):
-                print(f"    [{idx}] {finding}")
+            if findings:
+                print("  Findings:")
+                for idx, finding in enumerate(findings, 1):
+                    print(f"    [{idx}] {finding}")
+            print()
         print()
+
+
+def cmd_summary(ticket_id: str, cfg: dict, repo_root: Path, json_output: bool = False) -> None:
+    """Print the consolidated why-is-this-stuck view for a single ticket."""
+    data = get_ticket_summary(ticket_id, cfg, repo_root)
+
+    if data.get("error"):
+        _fail_json_or_text(json_output, data["error"], payload=data)
+
+    if json_output:
+        print(json.dumps(data, indent=2, default=str))
+        return
+
+    header = f"{data['id']} — {data.get('title', '')}"
+    meta = [f"status: {data.get('status')}"]
+    if data.get("needs_review_cause"):
+        meta.append(f"cause: {data['needs_review_cause']}")
+    if data.get("milestone"):
+        meta.append(f"milestone: {data['milestone']}")
+    if data.get("priority") is not None:
+        meta.append(f"priority: {data['priority']}")
+    print(header)
+    print("  " + "   ".join(meta))
+    print()
+
+    if data.get("reason"):
+        print("Reason:")
+        for line in data["reason"].splitlines():
+            print(f"  {line}")
+        print()
+
+    if data.get("review_verdict"):
+        print(f"Review verdict: {data['review_verdict']}")
+    if data.get("review_summary"):
+        print(f"Review summary: {data['review_summary']}")
+    findings = data.get("review_findings") or []
+    if findings:
+        print("Review findings:")
+        for idx, finding in enumerate(findings, 1):
+            print(f"  [{idx}] {finding}")
+    if data.get("review_verdict") or data.get("review_summary") or findings:
+        print()
+
+    if data.get("diff_error"):
+        print(f"Diff: {data['diff_error']}")
+    elif data.get("diff_stat"):
+        print("Diff:")
+        print(data["diff_stat"])
+    print()
+
+    if data.get("next_step"):
+        print(f"Next: {data['next_step']}")
