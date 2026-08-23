@@ -51,6 +51,85 @@ receive a stable `action-<timestamp>` reference immediately. Their structured
 events live in `.lanegate/logs/action-*.events.jsonl`; `lanegate ps` and the
 TUI/API run history list these actions alongside board-clearing runs.
 
+### System Diagram
+
+```mermaid
+flowchart TB
+    subgraph Entry["Entry Points"]
+        CLI["cli.py"]
+        MCP["mcp.py (FastMCP)"]
+        API["api.py (loopback HTTP + SSE)"]
+        TUI["Go TUI"]
+    end
+    TUI --> API --> Board
+
+    subgraph Analysis["Analysis Axis"]
+        Create["create.py"]
+        Analyze["analyze.py"]
+    end
+
+    subgraph Execution["Execution Axis"]
+        Board["board.py"]
+        Lifecycle["lifecycle/ (start · complete · review · merge · validate · done)"]
+        Claim["claim_file.py"]
+        Concurrency["concurrency.py (touches lock, TOCTOU-safe)"]
+        Worktree["worktree.py"]
+    end
+
+    subgraph Delivery["Delivery Axis"]
+        Promote["promote.py"]
+        Flags["flags.py"]
+    end
+
+    subgraph Run["Run Layer — orchestrate/"]
+        Loop["loop.py"]
+        Pool["pool.py"]
+        Guards["guards.py"]
+        Autofix["autofix.py"]
+        ReviewMod["review.py"]
+    end
+
+    Support["executor.py · reviewer.py · safeguards.py · config.py"]
+
+    subgraph Storage["Storage"]
+        Tickets[("tickets_dir/*.md")]
+        Git[("git worktrees + branches")]
+        SQLite[("context_log.py SQLite")]
+    end
+
+    subgraph Executors["Executors (agent-agnostic)"]
+        ClaudeExec["claude / claude-subagent"]
+        Codex["codex"]
+        Aider["aider"]
+        Ollama["ollama"]
+        Human["manual human"]
+    end
+
+    CLI --> Create & Analyze & Board & Lifecycle & Promote & Loop
+    MCP --> Create & Analyze & Board & Lifecycle & Promote & Loop
+
+    Create --> Tickets
+    Analyze --> Tickets
+    Concurrency --> Tickets
+    Lifecycle --> Tickets
+    Lifecycle --> Git
+    Lifecycle --> Concurrency
+    Board --> Tickets
+    Claim --> Concurrency
+    Worktree --> Git
+
+    Loop --> Board
+    Loop --> Pool
+    Pool --> Executors
+    Executors --> Git
+    ReviewMod --> Support
+    Autofix --> Executors
+    Guards --> Loop
+
+    Promote --> Git
+    Promote --> Flags
+```
+
 ---
 
 ## 2. V1.5 Interface Boundaries
@@ -165,6 +244,33 @@ Lock held?:       no      no        YES             YES            YES        no
 ```
 
 Side-states (not part of main flow, no lock held): `hibernated`, `needs_review`, `blocked`, `backlog`, `deferred`, `failed`, `closed` (set by `lanegate supersede`, for a ticket whose work already exists elsewhere).
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: create
+    draft --> open: analyze
+    open --> in_progress: start
+    in_progress --> code_complete: complete
+    code_complete --> in_review: review
+    in_review --> merged: merge (approved)
+    in_review --> in_progress: fix (changes_requested)
+    merged --> validated: validate
+    validated --> done: done
+
+    in_progress --> hibernated
+    hibernated --> in_progress: start (resume)
+    in_progress --> needs_review
+    needs_review --> in_progress: start
+    open --> blocked
+    open --> backlog
+    open --> deferred
+    in_progress --> failed
+    open --> closed: supersede
+
+    classDef locked fill:#f7dede,stroke:#b23b3b,stroke-width:2px,color:#1a1a1a
+    class in_progress,code_complete,in_review locked
+```
+*(red = lock held, per the table above)*
 
 Three guards enforce the lock:
 
