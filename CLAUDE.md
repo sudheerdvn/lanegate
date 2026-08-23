@@ -1,4 +1,4 @@
-Local-first, git-native workflow for coding agents: tickets, worktrees, review gates, staged deploys. Read `README.md` for the CLI/workflow overview and `docs/ARCHITECTURE.md` for module structure before assuming either from context.
+Local-first, git-native workflow for coding agents: tickets, worktrees, review gates, staged deploys. Read `README.md` for the CLI/workflow overview and `docs/architecture.md` for module structure before assuming either from context.
 
 ## Response Style — be terse
 

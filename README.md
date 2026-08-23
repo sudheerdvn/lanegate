@@ -233,7 +233,7 @@ checkout on a single machine: LaneGate holds the lock from `in_progress` through
 releasing only at `merged`, which reduces edit collisions when multiple agents work in
 parallel. It is not semantic dependency analysis — two touch-disjoint tickets can still break
 each other through a shared API — so treat it as a coordination boundary, not a correctness
-proof. See [docs/ARCHITECTURE.md § Touches Lock Invariants](docs/ARCHITECTURE.md#6-touches-lock-invariants)
+proof. See [docs/architecture.md § Touches Lock Invariants](docs/architecture.md#6-touches-lock-invariants)
 for the full model, including lockfile-pairing guidance per ecosystem and the concurrency
 bugs fixed versus the original orchestrator.
 
@@ -277,7 +277,7 @@ V1 has shipped. Next is the housekeeping wave gating the public repo (Python myp
 - `docs/troubleshooting.md` — FAQ and debug steps: executor hangs, stuck tickets, worktree cleanup, lock files, MCP setup, and more
 - `SECURITY.md` — security policy, reporting vulnerabilities, and what LaneGate does and does not do
 - `docs/security-model.md` — full threat model, trust boundaries, executor permission matrix, MCP trust model, V1 limitations, and safe usage recommendations
-- `docs/ARCHITECTURE.md` — built architecture, module map, and design invariants
+- `docs/architecture.md` — built architecture, module map, and design invariants
 - `docs/config-reference.md` — supported `.lanegate.yml` keys and defaults
 - `docs/executor-capabilities.md` — capability matrix comparing Claude, Codex, Aider, and Ollama across headless support, prompt transport, local model support, auto-commit behavior, and sandbox status
 - `docs/v2-interface-boundaries.md` — V1.5 layer boundaries (Python core / local API / UI add-on / optional runner), the `lanegate api` endpoint contract and what's built vs. still design-only, and the Go TUI spike result

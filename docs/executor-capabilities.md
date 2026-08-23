@@ -199,7 +199,7 @@ For the threat model and safe usage recommendations that apply to all executors,
 
 ## Model recommendation for `review`, `fix`, and `drift_check`
 
-When `autonomy: full` enables the auto-fix loop (see [ARCHITECTURE.md §7](ARCHITECTURE.md)), three steps run without a human in the loop between the original implementation and a merge-eligible `approved` verdict: `review` (judges the diff), `fix` (patches it), and `drift_check` (the safety gate that verifies the fix didn't drift from the ticket's intent). Because nothing else catches a mistake at these steps, configure a stronger model for them than for `implement`:
+When `autonomy: full` enables the auto-fix loop (see [architecture.md §7](architecture.md)), three steps run without a human in the loop between the original implementation and a merge-eligible `approved` verdict: `review` (judges the diff), `fix` (patches it), and `drift_check` (the safety gate that verifies the fix didn't drift from the ticket's intent). Because nothing else catches a mistake at these steps, configure a stronger model for them than for `implement`:
 
 ```yaml
 models:
