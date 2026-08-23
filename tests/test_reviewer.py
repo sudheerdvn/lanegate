@@ -31,11 +31,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from lanegate.reviewer import ReviewResult, build_fix_prompt, build_review_prompt, parse_review_result
+from lanegate.reviewer import (
+    ReviewResult,
+    build_drift_check_prompt,
+    build_fix_prompt,
+    build_review_prompt,
+    parse_review_result,
+)
 from lanegate.prompts import get_payload_budget
 
 
@@ -281,6 +288,14 @@ class TestParseDriftCheckResultHappyPath:
         result = parse_drift_check_result(raw)
         assert result.ok is False
         assert result.reason == "touched unrelated file foo.py"
+
+    def test_unescaped_interior_quote_in_reason_is_repaired(self):
+        from lanegate.reviewer import parse_drift_check_result
+
+        raw = '{"drift_ok": false, "reason": "reviewer said the flag "--force" is ignored"}'
+        result = parse_drift_check_result(raw)
+        assert result.ok is False
+        assert result.reason == 'reviewer said the flag "--force" is ignored'
 
 
 class TestParseDriftCheckResultFailClosed:
@@ -1400,6 +1415,45 @@ class TestReviewPromptBounded:
         assert "SECRET_CRITERIA_MARKER" not in serialized
         assert "SECRET_NOTE_MARKER" not in serialized
 
+    def test_describe_review_payload_reflects_non_tool_reviewer_when_type_and_diff_passed(
+        self, tmp_path
+    ):
+        """Without reviewer_type/diff forwarded, is_non_tool_reviewer(None) is
+        always False, so a project actually configured with reviewer: aider
+        gets audited against the tool-capable prompt shape and undercounts
+        the (potentially large) inlined GIT DIFF section -- defeating the
+        audit's purpose for exactly the configs TICK-644 targets."""
+        from lanegate.reviewer import describe_review_payload
+
+        ticket = _review_ticket()
+        diff_text = "diff --git a/foo.py b/foo.py\n" + ("+added line\n" * 200)
+
+        default_components = describe_review_payload(
+            ticket, project_root=tmp_path, diff=diff_text,
+        )
+        default_branch_diff = next(c for c in default_components if c["label"] == "branch-diff")
+        assert default_branch_diff["reason"] == "tool-capable-reviewer"
+        assert default_branch_diff["bytes"] == 0
+
+        aider_components = describe_review_payload(
+            ticket, project_root=tmp_path, reviewer_type="aider", diff=diff_text,
+        )
+        aider_branch_diff = next(c for c in aider_components if c["label"] == "branch-diff")
+        assert aider_branch_diff["reason"] == "non-tool-reviewer"
+        assert aider_branch_diff["bytes"] > 0
+
+    def test_is_non_tool_reviewer_unknown_type_matches_documented_safe_default(self):
+        """An unregistered executor type string must return False (assume
+        tool-capable), same as None -- not fall through to has_capability's
+        own "unknown means False" default, which would flip the result to
+        True and misdescribe an unregistered type as non-tool-capable."""
+        from lanegate.reviewer import is_non_tool_reviewer
+
+        assert is_non_tool_reviewer(None) is False
+        assert is_non_tool_reviewer("mystery-driver") is False
+        assert is_non_tool_reviewer("aider") is True
+        assert is_non_tool_reviewer("claude") is False
+
     def test_describe_review_payload_accounting_deterministic(self, tmp_path):
         from lanegate.reviewer import describe_review_payload
 
@@ -1452,6 +1506,28 @@ class TestFixPromptBounded:
         instruction_layer = prompt[:untrusted_start]
         assert "bounded excerpt" in instruction_layer
 
+    def test_truncated_multi_file_diff_names_omitted_files(self, tmp_path):
+        first = (
+            "diff --git a/first.py b/first.py\n"
+            "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+        second = (
+            "diff --git a/second.py b/second.py\n"
+            "--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-old2\n+new2\n"
+        )
+        budget = len(first.encode("utf-8"))
+        ticket = _review_ticket()
+        cfg = {"payload_budgets": {"fix": budget}}
+
+        prompt = build_fix_prompt(
+            ticket, diff=first + second, findings="fix it", project_root=tmp_path, cfg=cfg
+        )
+
+        assert "diff --git a/second.py" not in prompt
+        assert "-old2" not in prompt
+        assert "second.py" in prompt
+        assert "was truncated" in prompt
+
     def test_fix_prompt_omits_unrelated_architecture_doc(self, tmp_path):
         _write_large_arch_doc(tmp_path)
         ticket = _review_ticket(title="Fix a CSS typo", touches=["src/css_widget_thing.py"])
@@ -1497,6 +1573,62 @@ class TestFixPromptBounded:
         assert "SECRET_TITLE_MARKER" not in serialized
         assert "SECRET_DIFF_MARKER" not in serialized
         assert "SECRET_FINDINGS_MARKER" not in serialized
+
+
+class TestDriftCheckPromptBounded:
+    def test_truncated_original_diff_names_omitted_files(self, tmp_path):
+        first = (
+            "diff --git a/first.py b/first.py\n"
+            "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+        second = (
+            "diff --git a/second.py b/second.py\n"
+            "--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-old2\n+new2\n"
+        )
+        budget = len(first.encode("utf-8"))
+        ticket = _review_ticket()
+        cfg = {"payload_budgets": {"fix": budget}}
+
+        prompt = build_drift_check_prompt(
+            ticket,
+            original_diff=first + second,
+            fix_diff="+ x = 1",
+            findings="do the fix",
+            project_root=tmp_path,
+            cfg=cfg,
+        )
+
+        assert "diff --git a/second.py" not in prompt
+        assert "-old2" not in prompt
+        assert "second.py" in prompt
+        assert "ORIGINAL DIFF was truncated" in prompt
+
+    def test_truncated_fix_diff_names_omitted_files(self, tmp_path):
+        first = (
+            "diff --git a/first.py b/first.py\n"
+            "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+        second = (
+            "diff --git a/second.py b/second.py\n"
+            "--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-old2\n+new2\n"
+        )
+        budget = len(first.encode("utf-8"))
+        ticket = _review_ticket()
+        cfg = {"payload_budgets": {"fix": budget}}
+
+        prompt = build_drift_check_prompt(
+            ticket,
+            original_diff="+ x = 1",
+            fix_diff=first + second,
+            findings="do the fix",
+            project_root=tmp_path,
+            cfg=cfg,
+        )
+
+        assert "diff --git a/second.py" not in prompt
+        assert "-old2" not in prompt
+        assert "second.py" in prompt
+        assert "FIX DIFF was truncated" in prompt
 
 
 def test_review_prompt_now_includes_file_skeletons(tmp_path):
@@ -1644,3 +1776,127 @@ def test_f22_review_prompt_ignores_worktree_overrides(tmp_path):
     assert "ATTACKER DRIFT INSTRUCTION" not in drift_prompt
     assert "ATTACKER GUIDANCE" not in drift_prompt
     assert "CONTROL GUIDANCE" in drift_prompt
+
+
+class TestNonToolReviewerDiffInlining:
+    """TICK-644: aider/ollama run a single-turn invocation with no tool-dispatch
+    loop, so telling them to "run git diff yourself" makes them emit a dead-end
+    <tool_call> and never produce a JSON verdict. Non-tool reviewer types get
+    the diff pre-rendered into the prompt and different instructions instead.
+    """
+
+    def _ticket(self):
+        return {
+            "id": "TICK-001",
+            "title": "t",
+            "touches": [],
+            "close_criteria": "c",
+            "_body": "b",
+        }
+
+    def test_default_reviewer_stays_tool_capable(self, tmp_path):
+        """No reviewer_type (and any tool-capable type) keeps the original
+        "run it yourself" instructions and never inlines a diff, even when one
+        is passed in."""
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            diff="+++ some diff content should not leak here",
+        )
+        assert "Run `git diff main...HEAD`" in prompt
+        assert "full git, file, and test-execution tool access" in prompt
+        assert "GIT DIFF" not in prompt
+        assert "some diff content should not leak here" not in prompt
+
+    def test_claude_reviewer_type_stays_tool_capable(self, tmp_path):
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            reviewer_type="claude", diff="+++ diff",
+        )
+        assert "full git, file, and test-execution tool access" in prompt
+        assert "GIT DIFF" not in prompt
+
+    @pytest.mark.parametrize("reviewer_type", ["aider", "ollama"])
+    def test_non_tool_reviewer_inlines_diff_and_suppresses_tool_instructions(
+        self, tmp_path, reviewer_type
+    ):
+        diff_text = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            reviewer_type=reviewer_type, diff=diff_text,
+        )
+        assert "GIT DIFF" in prompt
+        assert diff_text in prompt
+        assert "Run `git diff main...HEAD`" not in prompt
+        assert "full git, file, and test-execution tool access" not in prompt
+        assert "using your existing git/file/test-execution tool access" not in prompt
+        assert "do not have shell" in prompt or "do not have" in prompt
+
+    def test_non_tool_reviewer_without_diff_does_not_crash_or_leak_empty_section(self, tmp_path):
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            reviewer_type="aider", diff=None,
+        )
+        assert "GIT DIFF" not in prompt
+        assert "no branch diff could be extracted" in prompt
+        assert "Run `git diff main...HEAD`" not in prompt
+
+    def test_repo_root_project_override_supports_non_tool_reviewer(self):
+        """This repo's own prompts/review.md is a project-level override of
+        the packaged template. It must use {{ diff_access_note }} /
+        {{ repro_execution_note }} placeholders like the packaged template
+        does, not hardcoded "run git diff yourself" text -- otherwise this
+        repo's own dogfooded reviews with an aider/ollama reviewer would
+        regress to the TICK-644 dead-end-<tool_call> bug even though the
+        packaged template is fixed."""
+        repo_root = Path(__file__).resolve().parents[1]
+        assert (repo_root / "prompts" / "review.md").exists()
+        diff_text = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+        prompt = build_review_prompt(
+            self._ticket(), project_root=repo_root, cfg={},
+            reviewer_type="aider", diff=diff_text,
+        )
+        assert "GIT DIFF" in prompt
+        assert diff_text in prompt
+        assert "Run `git diff main...HEAD`" not in prompt
+        assert "full git, file, and test-execution tool access" not in prompt
+        assert "using your existing git/file/test-execution tool access" not in prompt
+
+    def test_non_tool_reviewer_diff_is_truncated_to_budget(self, tmp_path):
+        budget = 60
+        cfg = {"payload_budgets": {"review": budget}}
+        oversized_diff = "z" * 500
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg=cfg,
+            reviewer_type="aider", diff=oversized_diff,
+        )
+        assert oversized_diff not in prompt
+
+    def test_truncated_multi_file_diff_names_omitted_files_and_does_not_split_a_file(
+        self, tmp_path
+    ):
+        # Regression: observed live on a real project's re-review — a
+        # re-review's diff was byte-clipped mid-file by the old
+        # truncate_to_budget, silently dropping the exact file the fix had
+        # just landed in -- with nothing in the prompt telling the reviewer
+        # (or a human reading the transcript) that anything was missing. The
+        # reviewer re-reported the original, now-stale findings verbatim.
+        first = (
+            "diff --git a/first.py b/first.py\n"
+            "--- a/first.py\n+++ b/first.py\n@@ -1 +1 @@\n-old\n+new\n"
+        )
+        second = (
+            "diff --git a/second.py b/second.py\n"
+            "--- a/second.py\n+++ b/second.py\n@@ -1 +1 @@\n-old2\n+new2\n"
+        )
+        budget = len(first.encode("utf-8"))
+        cfg = {"payload_budgets": {"review": budget}}
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg=cfg,
+            reviewer_type="aider", diff=first + second,
+        )
+        assert first in prompt
+        assert "diff --git a/second.py" not in prompt
+        assert "-old2" not in prompt  # no partial hunk from the dropped file
+        assert "second.py" in prompt  # named in the truncation note
+        assert "was truncated" in prompt
+        assert "Do not treat their absence as evidence" in prompt

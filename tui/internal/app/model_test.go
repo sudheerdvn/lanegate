@@ -1384,6 +1384,58 @@ func TestUpdate_RunHistorySelectionOpensHistoricalActivityOnEnter(t *testing.T) 
 	}
 }
 
+// TestUpdate_LeavingHistoryDetailViaNumberKeyClosesIt reproduces a reported
+// bug (TICK-643): opening a historical run's detail, then navigating away
+// with a number key instead of Esc, left historyDetail set — so jumping
+// straight back to History (screen 6) reopened the stale detail view
+// instead of showing the run list, making screen 6 look identical to the
+// live Run screen (5).
+func TestUpdate_LeavingHistoryDetailViaNumberKeyClosesIt(t *testing.T) {
+	fc := &fakeClient{
+		board:      &client.BoardPayload{},
+		run:        &client.RunPayload{RunID: "run-live", Status: "running"},
+		runEvents:  &client.RunEventsPayload{RunID: "run-old", Events: []client.ExecutorEvent{{TicketID: "TICK-OLD", Progress: client.ExecutorProgress{Activity: "completed"}}}},
+		runHistory: &client.RunHistoryPayload{Runs: []client.RunSummaryPayload{{RunID: "run-live"}, {RunID: "run-old"}}},
+	}
+	m := readyModel(t, fc)
+	updated, cmd := m.Update(key("6"))
+	m = updated.(*Model)
+	updated, _ = m.Update(cmd())
+	m = updated.(*Model)
+
+	updated, cmd = m.Update(key("down"))
+	m = updated.(*Model)
+	updated, cmd = m.Update(key("enter"))
+	m = updated.(*Model)
+	updated, _ = m.Update(cmd())
+	m = updated.(*Model)
+	if !m.run.IsHistoryDetail() {
+		t.Fatal("setup: Enter should have opened the historical detail")
+	}
+
+	// Leave History via a number key (not Esc) ...
+	updated, cmd = m.Update(key("5"))
+	m = updated.(*Model)
+	if cmd != nil {
+		updated, _ = m.Update(cmd())
+		m = updated.(*Model)
+	}
+	// ... then jump straight back into History via its number key.
+	updated, cmd = m.Update(key("6"))
+	m = updated.(*Model)
+	if cmd != nil {
+		updated, _ = m.Update(cmd())
+		m = updated.(*Model)
+	}
+
+	if m.run.IsHistoryDetail() {
+		t.Fatal("re-entering History via its number key must show the run list, not a stale detail view")
+	}
+	if got := m.currentBody(); !strings.Contains(got, "Run History") || strings.Contains(got, "TICK-OLD") {
+		t.Fatalf("History body after re-entry = %q, want the run list (not the run-old detail)", got)
+	}
+}
+
 // TestUpdate_RunLogStream_ReconnectsOnDrop drives the Run screen's live log
 // stream through two full read cycles: the first stream yields one event and
 // then EOF, which client.ReconnectingStream must transparently recover from

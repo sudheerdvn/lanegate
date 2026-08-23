@@ -63,6 +63,7 @@ from lanegate.ticket import (
     _clean_attention_reason,
     _has_non_rate_limit_hard_error,
     branch_name,
+    is_lanegate_notes_file,
     is_paired_test_file,
     load_all_tickets,
     milestone_near_miss_warnings,
@@ -577,6 +578,7 @@ def _analyze_drafts(
     tickets_dir=None,
     ticket_ids: set[str] | None = None,
     pool_name: str | None = None,
+    session_ts: str | None = None,
 ) -> bool:
     """Analyze eligible draft tickets, one at a time, until one is dispatchable.
 
@@ -640,6 +642,10 @@ def _analyze_drafts(
             print(
                 f"WARNING: analyze failed for {t['id']}: {code} — skipping",
                 file=sys.stderr,
+            )
+            _append_run_event(
+                repo_root, session_ts, "ticket_outcome",
+                ticket_id=t["id"], outcome="failure", reason=reason,
             )
             if comparison_reason and comparison_reason == last_failure_reason:
                 repeat_count += 1
@@ -1342,6 +1348,7 @@ def recover_scope_only_needs_review_tickets(
         committed = _committed_files(wt)
         unexpected = committed - declared
         unexpected = {path for path in unexpected if not is_paired_test_file(path, declared)}
+        unexpected = {path for path in unexpected if not is_lanegate_notes_file(path)}
         if not unexpected or unexpected != recorded_missing:
             print(
                 f"[orchestrate] {tid}: scope recovery skipped — worktree diff no longer "
@@ -2465,7 +2472,7 @@ def _drain_loop(
             else:
                 if _analyze_drafts(
                     cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir,
-                    ticket_ids=ticket_ids, pool_name=pool_name,
+                    ticket_ids=ticket_ids, pool_name=pool_name, session_ts=session_ts,
                 ):
                     interrupt_halt = True
                     break
@@ -3463,6 +3470,7 @@ def _drain_loop(
                     # A committed file that's the natural paired test file
                     # for an already-touched module is not scope drift.
                     unexpected = {f for f in unexpected if not is_paired_test_file(f, allowed)}
+                    unexpected = {f for f in unexpected if not is_lanegate_notes_file(f)}
                     if unexpected:
                         if cfg.get("auto_claim_touches") is True:
                             from lanegate.claim_file import claim_files
@@ -4055,7 +4063,7 @@ def _drain_loop(
                             # ready tickets must never wait behind drafts.
                             if _analyze_drafts(
                                 cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir,
-                                ticket_ids=ticket_ids, pool_name=pool_name,
+                                ticket_ids=ticket_ids, pool_name=pool_name, session_ts=session_ts,
                             ):
                                 interrupt_halt = True
                                 break

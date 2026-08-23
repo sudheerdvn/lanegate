@@ -1381,6 +1381,233 @@ def test_compute_payload_composition_stats_aggregates_metrics(tmp_path: Path) ->
         assert "reason" in c
 
 
+def test_compute_payload_composition_stats_resolves_reviewer_type_and_diff(
+    tmp_path: Path,
+) -> None:
+    """The review step's describe fn must resolve reviewer_type/diff for the
+    ticket the same way run_review_agent() does and forward them into
+    describe_review_payload() -- otherwise a project configured with
+    reviewer: aider is always audited against the tool-capable prompt shape
+    (is_non_tool_reviewer(None) is always False) and undercounts the
+    inlined GIT DIFF section for exactly the configs TICK-644 targets."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    ticket = {
+        "id": "TICK-101",
+        "title": "Test payload composition",
+        "touches": ["lanegate/cli.py"],
+        "close_criteria": "Done.",
+        "_body": "Implement prompt composition.",
+        "branch": "tick-101",
+    }
+    cfg = {
+        "reviewer": "aider-review",
+        "executors": {"aider-review": {"type": "aider"}},
+    }
+    captured_kwargs = {}
+    real_describe = None
+
+    def fake_describe(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        from lanegate.reviewer import describe_review_payload
+
+        return describe_review_payload(*args, **kwargs)
+
+    with (
+        patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py b/x.py\n+x\n"),
+        patch("lanegate.reviewer.describe_review_payload", side_effect=fake_describe),
+    ):
+        compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path, cfg=cfg)
+
+    assert captured_kwargs.get("reviewer_type") == "aider"
+    assert captured_kwargs.get("diff") == "diff --git a/x.py b/x.py\n+x\n"
+
+
+def test_compute_payload_composition_stats_resolves_reviewer_via_steps_block(
+    tmp_path: Path,
+) -> None:
+    """resolve_executor() (used by an earlier version of this fix) never
+    looks at cfg["steps"][step]["driver"] -- the newer routing block
+    run_review_agent() actually resolves through, via resolve_pool_executor
+    -> resolve_driver. A project routed with `steps: {review: {driver:
+    aider-local-review}}` (exactly the style .lanegate.yml.example
+    documents for a fully-local VRAM-tiered split) must be audited against
+    that driver's real type, not silently fall back to the global
+    executor default."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    ticket = {
+        "id": "TICK-102",
+        "title": "Test steps-routed reviewer resolution",
+        "touches": ["lanegate/cli.py"],
+        "close_criteria": "Done.",
+        "_body": "Implement.",
+        "branch": "tick-102",
+    }
+    cfg = {
+        "executor": "claude",
+        "drivers": {"aider-local-review": {"type": "aider"}},
+        "steps": {"review": {"driver": "aider-local-review"}},
+    }
+    captured_kwargs = {}
+
+    def fake_describe(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        from lanegate.reviewer import describe_review_payload
+
+        return describe_review_payload(*args, **kwargs)
+
+    with (
+        patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py b/x.py\n+x\n"),
+        patch("lanegate.reviewer.describe_review_payload", side_effect=fake_describe),
+    ):
+        compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path, cfg=cfg)
+
+    assert captured_kwargs.get("reviewer_type") == "aider"
+
+
+def test_compute_payload_composition_stats_resolves_reviewer_via_pools_block(
+    tmp_path: Path,
+) -> None:
+    """resolve_driver() alone (used by an earlier version of this fix) never
+    does pool selection -- it only resolves the *configured* driver name
+    (ticket/cfg.reviewer/steps/executor_steps/global executor), falling
+    straight to the global `executor:` default and skipping `pools:`
+    entirely. A project actually routed through a review pool (this repo's
+    own .lanegate.yml has one) must be audited against the pool-selected
+    instance's type, not the unrelated global-executor fallback."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    ticket = {
+        "id": "TICK-103",
+        "title": "Test pool-routed reviewer resolution",
+        "touches": ["lanegate/cli.py"],
+        "close_criteria": "Done.",
+        "_body": "Implement.",
+        "branch": "tick-103",
+    }
+    cfg = {
+        "executor": "claude",
+        "pools": {"default": {"executors": ["aider-pool-review"]}},
+        "default_pool": "default",
+        "executors": {"aider-pool-review": {"type": "aider"}},
+    }
+    captured_kwargs = {}
+
+    def fake_describe(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        from lanegate.reviewer import describe_review_payload
+
+        return describe_review_payload(*args, **kwargs)
+
+    with (
+        patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py b/x.py\n+x\n"),
+        patch("lanegate.reviewer.describe_review_payload", side_effect=fake_describe),
+    ):
+        compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path, cfg=cfg)
+
+    assert captured_kwargs.get("reviewer_type") == "aider"
+
+
+def test_compute_payload_composition_stats_uses_ticket_worktree_field(tmp_path: Path) -> None:
+    """_describe_review must check ticket["worktree"] first, matching
+    run_review_agent()'s own resolution order (orchestrate/review.py) --
+    falling straight to the conventional <worktrees_dir>/<id> layout would
+    silently audit the wrong (or a nonexistent) path for any ticket whose
+    recorded worktree doesn't match that convention (a custom location, or
+    non-default naming)."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    custom_worktree = tmp_path / "somewhere-else" / "custom-dir"
+    ticket = {
+        "id": "TICK-104",
+        "title": "Test ticket.worktree field is honored",
+        "touches": ["lanegate/cli.py"],
+        "close_criteria": "Done.",
+        "_body": "Implement.",
+        "branch": "tick-104",
+        "worktree": str(custom_worktree),
+    }
+    captured_paths = []
+
+    def fake_get_worktree_diff(worktree_path, branch, base=None):
+        captured_paths.append(Path(worktree_path))
+        return "diff --git a/x.py b/x.py\n+x\n"
+
+    with patch("lanegate.reviewer.get_worktree_diff", side_effect=fake_get_worktree_diff):
+        compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path, cfg={})
+
+    assert captured_paths == [custom_worktree]
+
+
+def test_compute_payload_composition_stats_resolves_trunk_branch_once(tmp_path: Path) -> None:
+    """resolve_trunk_branch() is a git subprocess call and resolves to the
+    same value for every ticket in a single compute_payload_composition_stats
+    call (same repo, same cfg) -- it must be resolved once outside the
+    per-ticket loop, not once per ticket, or `lanegate stats`/`summary` on a
+    project with hundreds of tickets performs hundreds of redundant git
+    invocations for a value that never changes."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    tickets = [
+        {
+            "id": f"TICK-{i}",
+            "title": "t",
+            "touches": [],
+            "close_criteria": "",
+            "_body": "",
+            "branch": f"tick-{i}",
+        }
+        for i in range(5)
+    ]
+    calls = []
+
+    def fake_resolve_trunk_branch(cfg, repo_root):
+        calls.append(1)
+        return "main"
+
+    with (
+        patch("lanegate.config.resolve_trunk_branch", side_effect=fake_resolve_trunk_branch),
+        patch("lanegate.reviewer.get_worktree_diff", side_effect=Exception("no worktree")),
+    ):
+        compute_payload_composition_stats(tickets=tickets, repo_root=tmp_path, cfg={})
+
+    assert len(calls) == 1
+
+
+def test_compute_payload_composition_stats_degrades_on_reviewer_resolution_error(
+    tmp_path: Path,
+) -> None:
+    """resolve_reviewer_driver_and_type() raising for one ticket (a
+    malformed routing rule, an unresolvable pool/driver reference) must not
+    drop that ticket from the "review" step's stats entirely -- it should
+    degrade to the tool-capable default (reviewer_type=None), the same
+    best-effort contract the diff-fetch path already honors, rather than
+    letting the exception propagate up to the outer per-ticket try/except
+    that silently discards the whole ticket."""
+    from lanegate.context_log import compute_payload_composition_stats
+
+    ticket = {
+        "id": "TICK-105",
+        "title": "t",
+        "touches": [],
+        "close_criteria": "",
+        "_body": "",
+        "branch": "tick-105",
+    }
+
+    with (
+        patch(
+            "lanegate.orchestrate.review.resolve_reviewer_driver_and_type",
+            side_effect=RuntimeError("boom"),
+        ),
+        patch("lanegate.reviewer.get_worktree_diff", side_effect=Exception("no worktree")),
+    ):
+        stats = compute_payload_composition_stats(tickets=[ticket], repo_root=tmp_path, cfg={})
+
+    assert "review" in stats["steps"]
+
+
 def test_cli_analytics_json_includes_payload_composition(tmp_path: Path) -> None:
     """lgt analytics --json output includes payload_composition field."""
     import json

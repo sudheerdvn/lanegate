@@ -154,6 +154,15 @@ _VALID_DRIVER_FIELDS = {"type", "model", "bin", "flags", "base_url", "provider"}
 # Pipeline steps that may be routed to a named driver via steps:
 _VALID_PIPELINE_STEPS = {"analyze", "implement", "review"}
 
+# Valid edit_format values accepted by aider (and by model_settings overrides).
+_VALID_AIDER_EDIT_FORMATS = {
+    "whole", "diff", "diff-fenced", "udiff", "patch",
+    "editor-diff", "editor-whole",
+}
+
+# Keys allowed inside a model_settings entry (same constraints as flat keys).
+_VALID_AIDER_MODEL_SETTINGS_KEYS = {"context_window_tokens", "edit_format"}
+
 
 def _default_config() -> dict:
     return {
@@ -242,6 +251,27 @@ def _default_config() -> dict:
     }
 
 
+def _detect_origin_head_branch(repo_root: Path) -> str | None:
+    """Return the branch Git's ``origin/HEAD`` symbolic ref points at, or
+    ``None`` when undetectable (no remote configured, not a git repo, etc.).
+    """
+    try:
+        detected = subprocess.run(
+            ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8",
+        )
+    except OSError:
+        return None
+
+    ref = detected.stdout.strip() if detected.returncode == 0 else ""
+    prefix = "refs/remotes/origin/"
+    if ref.startswith(prefix) and len(ref) > len(prefix):
+        return ref.removeprefix(prefix)
+    return None
+
+
 def resolve_trunk_branch(cfg: dict, repo_root: Path) -> str:
     """Return the repository's ticket-work trunk branch.
 
@@ -256,21 +286,116 @@ def resolve_trunk_branch(cfg: dict, repo_root: Path) -> str:
             raise ConfigError("trunk_branch must be a non-empty string")
         return configured.strip()
 
+    return _detect_origin_head_branch(repo_root) or "main"
+
+
+def _current_git_branch(repo_root: Path) -> str | None:
+    """Return the currently checked-out branch name, or ``None`` if unknown.
+
+    Unlike ``resolve_trunk_branch`` (which follows ``origin/HEAD``, falling
+    back to ``"main"`` when no remote default is configured), this reports
+    what the repo is actually sitting on right now -- e.g. a project still on
+    a local feature/refactor branch with no remote set up yet (TICK-645). Used
+    only to suggest an ``init`` wizard default, never as a lifecycle base.
+    """
     try:
-        detected = subprocess.run(
-            ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8",
+            timeout=10,
         )
-    except OSError:
-        return "main"
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return branch or None
 
-    ref = detected.stdout.strip() if detected.returncode == 0 else ""
-    prefix = "refs/remotes/origin/"
-    if ref.startswith(prefix) and len(ref) > len(prefix):
-        return ref.removeprefix(prefix)
-    return "main"
+
+def _recommend_aider_edit_format(repo_root: Path) -> tuple[str, str | None]:
+    """Suggest an aider edit_format default from the largest tracked file.
+
+    "whole" makes the model rewrite the entire file every turn: reliable on
+    small files, but local models routinely truncate or hallucinate output
+    past a few hundred lines -- a real incident hit exactly this on a
+    ~1200-line file, output-token-exhausted mid-rewrite (TICK-645). "diff"
+    avoids that at the cost of small local models sometimes emitting a
+    malformed hunk instead (docs/executor-capabilities.md, aider "Known
+    caveats") -- a real but distinct failure mode this cannot detect, so it
+    only weighs in on the large-file risk, which is the one a fresh `init`
+    run can actually observe in the repo as it stands today.
+
+    Returns ``(recommended_format, note)`` -- *note* is ``None`` when nothing
+    in the repo crosses the threshold (nothing to warn about either way).
+    """
+    from lanegate.executor import _repo_tracked_files
+
+    # stat() every tracked file first (cheap metadata, no content read) and
+    # only line-count the largest 3000 by byte size -- scanning the first
+    # 3000 in `git ls-files` order (effectively tree/alphabetical order)
+    # instead missed a large file sorting after that cutoff (e.g. under
+    # vendor/... or zz_generated...) on any repo with >3000 tracked files,
+    # silently recommending "whole" with no warning even though that file
+    # would break it.
+    sized: list[tuple[int, str]] = []
+    for rel_path in _repo_tracked_files(repo_root):
+        path = repo_root / rel_path
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        sized.append((size, rel_path))
+    sized.sort(key=lambda item: item[0], reverse=True)
+
+    # A tracked file at or above this size is such an outlier for a tracked
+    # text file that opening and line-counting it is itself slow and risky
+    # -- it may not even be text (a vendored binary or lockfile). Silently
+    # excluding it from consideration (the prior behavior) meant the single
+    # riskiest file in the repo could never be the one that triggers the
+    # warning this function exists to give; recommend 'diff' directly from
+    # its size instead of reading it.
+    if sized and sized[0][0] > 2_000_000:
+        size, rel_path = sized[0]
+        note = (
+            f"Detected `{rel_path}` at {size:,} bytes — too large to safely "
+            "line-count, but 'whole' rewrites the entire file every turn "
+            "and a file this size makes truncated or hallucinated output "
+            "all but certain; defaulting to 'diff'. Note 'diff' has its "
+            "own risk for small local models: they can emit a malformed "
+            "hunk instead (see docs/executor-capabilities.md, aider "
+            "\"Known caveats\")."
+        )
+        return "diff", note
+
+    # sized is sorted largest-first, so the biggest candidates are examined
+    # first; once any file crosses the 'diff' threshold below, further
+    # line-counting can't change the recommendation, only which filename
+    # gets cited -- stop there instead of opening and reading the rest of
+    # up to 3000 files synchronously inside the interactive wizard.
+    max_lines, max_path = 0, None
+    for _size, rel_path in sized[:3000]:
+        path = repo_root / rel_path
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = sum(1 for _ in f)
+        except OSError:
+            continue
+        if lines > max_lines:
+            max_lines, max_path = lines, rel_path
+            if max_lines >= 300:
+                break
+
+    if max_lines >= 300:
+        note = (
+            f"Detected `{max_path}` at {max_lines} lines — 'whole' rewrites the "
+            "entire file every turn, and local models routinely truncate or "
+            "hallucinate content somewhere past ~300-500 lines of output; "
+            "defaulting to 'diff'. Note 'diff' has its own risk for small "
+            "local models: they can emit a malformed hunk instead (see "
+            "docs/executor-capabilities.md, aider \"Known caveats\")."
+        )
+        return "diff", note
+    return "whole", None
 
 
 
@@ -724,6 +849,77 @@ def _validate_executor_instances(cfg: dict) -> None:
             raise ConfigError(
                 f"executors['{name}'].api_key_env must be a string, got {api_key_env!r}"
             )
+
+
+def _validate_aider_model_settings(cfg: dict) -> None:
+    """Validate executors.aider.model_settings (optional per-model override block).
+
+    Each key is a model string; each value must be a mapping of the same
+    constraint-bounded keys that the flat aider executor config accepts:
+    - context_window_tokens: positive integer
+    - edit_format: non-empty string from _VALID_AIDER_EDIT_FORMATS
+
+    Unknown sub-keys are rejected to match the flat-key validator's behaviour
+    in executor.py (which raises ConfigError for invalid edit_format/context types).
+    """
+    executors = cfg.get("executors") or {}
+    if not isinstance(executors, dict):
+        return
+
+    # Resolve the aider executor entry — may be keyed by 'aider' (legacy flat
+    # override) or by a named instance whose 'type' is 'aider'.
+    aider_cfgs: list[tuple[str, dict]] = []
+    for name, entry in executors.items():
+        if not isinstance(entry, dict):
+            continue
+        exec_type = entry.get("type", name)
+        if exec_type == "aider":
+            aider_cfgs.append((name, entry))
+
+    for executor_name, aider_cfg in aider_cfgs:
+        model_settings = aider_cfg.get("model_settings")
+        if model_settings is None:
+            continue
+        if not isinstance(model_settings, dict):
+            raise ConfigError(
+                f"executors['{executor_name}'].model_settings must be a mapping "
+                "of model-string → settings"
+            )
+        for model_key, overrides in model_settings.items():
+            if not isinstance(model_key, str):
+                raise ConfigError(
+                    f"executors['{executor_name}'].model_settings keys must be strings"
+                )
+            if not isinstance(overrides, dict):
+                raise ConfigError(
+                    f"executors['{executor_name}'].model_settings[{model_key!r}] "
+                    "must be a mapping"
+                )
+            unknown = set(overrides.keys()) - _VALID_AIDER_MODEL_SETTINGS_KEYS
+            if unknown:
+                raise ConfigError(
+                    f"executors['{executor_name}'].model_settings[{model_key!r}]: "
+                    f"unknown key(s) {sorted(unknown)} — "
+                    f"valid keys are {sorted(_VALID_AIDER_MODEL_SETTINGS_KEYS)}"
+                )
+            ctx = overrides.get("context_window_tokens")
+            if ctx is not None:
+                if not isinstance(ctx, int) or isinstance(ctx, bool) or ctx <= 0:
+                    raise ConfigError(
+                        "executors.aider.context_window_tokens must be a positive integer"
+                    )
+            ef = overrides.get("edit_format")
+            if ef is not None:
+                if not isinstance(ef, str) or not ef:
+                    raise ConfigError(
+                        "executors.aider.edit_format must be a non-empty string"
+                    )
+                if ef not in _VALID_AIDER_EDIT_FORMATS:
+                    raise ConfigError(
+                        f"executors.aider.model_settings[{model_key!r}].edit_format "
+                        f"{ef!r} is not a valid aider edit format; "
+                        f"valid values are {sorted(_VALID_AIDER_EDIT_FORMATS)}"
+                    )
 
 
 def _validate_concurrency(cfg: dict) -> None:
@@ -2044,6 +2240,7 @@ def load_config(
     _validate_environments(cfg["environments"])
     _validate_concurrency(cfg)
     _validate_executor_instances(cfg)
+    _validate_aider_model_settings(cfg)
     _validate_pools(cfg)
     _validate_routing(cfg)
     _validate_executor(cfg)
@@ -2308,440 +2505,554 @@ def suggested_safeguards_yaml(detections: list[TestRunnerDetection]) -> str:
     return "\n".join(lines)
 
 
-def interactive_init(
-    repo_root: Path, *, use_defaults: bool = False, force_interactive: bool = False
-) -> dict | None:
-    """
-    Walk through every core config option and write .lanegate.yml to repo_root.
-
-    Returns the config dict on success, or None if .lanegate.yml already exists.
-
-    Parameters
-    ----------
-    repo_root:
-        Directory where .lanegate.yml will be written.
-    use_defaults:
-        Skip all prompts and write a minimal config (also activated when stdin is
-        not a TTY).
-    force_interactive:
-        Show prompts even when stdin is not a TTY (overrides the TTY check).
-    """
-    global _stdin_exhausted_warned
-    _stdin_exhausted_warned = False
-    config_path = repo_root / CONFIG_FILENAME
-
-    if config_path.exists():
+def _init_core_options(repo_root: Path) -> tuple[dict, str, str, bool]:
+    """Prompt for ticket_prefix/tickets_dir/worktrees_dir/executor/reviewer/max_parallel."""
+    print("\nConfiguring core options (press Enter to accept the default):\n")
+    ticket_prefix = _prompt("ticket_prefix", "TICK")
+    tickets_dir = _prompt("tickets_dir", f".{APP_NAME}/tickets")
+    worktrees_dir = _prompt("worktrees_dir", f".{APP_NAME}/worktrees")
+    print(f"  (valid: {', '.join(sorted(_VALID_EXECUTOR_TYPES))})")
+    executor_raw = _prompt("executor", "claude")
+    # Validate executor; fall back to claude on invalid input
+    executor = executor_raw if executor_raw in _VALID_EXECUTOR_TYPES else "claude"
+    if executor != executor_raw:
         print(
-            f"ERROR: {CONFIG_FILENAME} already exists at {repo_root}. "
-            "Remove it first to re-initialise.",
-            file=sys.stderr,
+            f"  Warning: '{executor_raw}' is not a recognised executor; "
+            f"using 'claude'. (Valid: {sorted(_VALID_EXECUTOR_TYPES)})"
         )
-        return None
-
-    detected_trunk_branch = resolve_trunk_branch({}, repo_root)
-
-    non_interactive = use_defaults or (not force_interactive and not sys.stdin.isatty())
-    if non_interactive and not use_defaults:
+    print(f"  (valid: {', '.join(sorted(_VALID_REVIEWERS))})")
+    print(
+        f"  Tip: pick a reviewer different from executor ('{executor}') for an "
+        "independent review. Leave this blank to let LaneGate decide at "
+        "dispatch time (uses a different pool instance/model when one is "
+        "available, otherwise escalates to a human review gate rather than "
+        "silently self-reviewing) -- typing a value here, even one matching "
+        "the executor, pins it and always wins over that safe fallback."
+    )
+    reviewer_raw, reviewer_input = _prompt_raw(
+        "reviewer", executor, display_default="auto"
+    )
+    reviewer = reviewer_raw if reviewer_raw in _VALID_REVIEWERS else executor
+    if reviewer_input and reviewer != reviewer_raw:
         print(
-            "Note: stdin is not a TTY — using defaults. "
-            "Run `lanegate init --interactive` to configure interactively.",
-            file=sys.stderr,
+            f"  Warning: '{reviewer_raw}' is not a recognised reviewer; "
+            f"treating it like a blank answer (auto). (Valid: {sorted(_VALID_REVIEWERS)})"
         )
-
-    if non_interactive:
-        # Minimal defaults, no environments, no flag_file
-        cfg: dict = {
-            "ticket_prefix": "TICK",
-            "tickets_dir": f".{APP_NAME}/tickets",
-            "worktrees_dir": f".{APP_NAME}/worktrees",
-            "executor": "claude",
-            "max_parallel": 2,
-            "commit_status_changes": True,
-            "github_pr": False,
-            "executors": {
-                "claude": {
-                    "flags": list(_SCOPED_CLAUDE_HEADLESS_FLAGS),
-                }
-            },
-        }
-    else:
-        # --- Core section ---
-        print("\nConfiguring core options (press Enter to accept the default):\n")
-        ticket_prefix = _prompt("ticket_prefix", "TICK")
-        tickets_dir = _prompt("tickets_dir", f".{APP_NAME}/tickets")
-        worktrees_dir = _prompt("worktrees_dir", f".{APP_NAME}/worktrees")
-        print(f"  (valid: {', '.join(sorted(_VALID_EXECUTOR_TYPES))})")
-        executor_raw = _prompt("executor", "claude")
-        # Validate executor; fall back to claude on invalid input
-        executor = executor_raw if executor_raw in _VALID_EXECUTOR_TYPES else "claude"
-        if executor != executor_raw:
-            print(
-                f"  Warning: '{executor_raw}' is not a recognised executor; "
-                f"using 'claude'. (Valid: {sorted(_VALID_EXECUTOR_TYPES)})"
-            )
-        print(f"  (valid: {', '.join(sorted(_VALID_REVIEWERS))})")
+    # A blank prompt -- or an unrecognized (typo'd) one -- must not
+    # silently become an explicit reviewer pin: cfg["reviewer"] is set
+    # conditionally below, only when the user typed a value that's
+    # actually a real reviewer choice (see that comment for why this
+    # matters). A typo pinning self-review the same way a deliberate
+    # match does would be exactly the footgun the blank case was fixed
+    # for, just triggered by a mistake instead of an empty Enter.
+    reviewer_explicit = bool(reviewer_input) and reviewer_input in _VALID_REVIEWERS
+    if reviewer_explicit and reviewer == executor:
         print(
-            f"  Tip: pick a reviewer different from executor ('{executor}') for an "
-            "independent review. Leave this blank to let LaneGate decide at "
-            "dispatch time (uses a different pool instance/model when one is "
-            "available, otherwise escalates to a human review gate rather than "
-            "silently self-reviewing) -- typing a value here, even one matching "
-            "the executor, pins it and always wins over that safe fallback."
+            f"  Note: reviewer == executor ('{executor}') — review will run in "
+            "combined (self-review) mode, not the independent review pipeline."
         )
-        reviewer_raw, reviewer_input = _prompt_raw(
-            "reviewer", executor, display_default="auto"
+    max_parallel_raw = _prompt("max_parallel", "2")
+    try:
+        max_parallel = int(max_parallel_raw)
+        if max_parallel < 1:
+            raise ValueError
+    except ValueError:
+        print("  Invalid max_parallel — using 2.")
+        max_parallel = 2
+
+    cfg: dict = {
+        "ticket_prefix": ticket_prefix,
+        "tickets_dir": tickets_dir,
+        "worktrees_dir": worktrees_dir,
+        "executor": executor,
+        "max_parallel": max_parallel,
+        "commit_status_changes": True,
+    }
+    # Only pin reviewer: when the user actually typed something at the
+    # prompt above (even a value matching executor) -- a blank/default
+    # answer leaves it unset so resolve_independent_review_driver's
+    # ladder runs at dispatch time instead of being permanently bypassed.
+    # An explicit pin "always wins outright" over that ladder (see its
+    # docstring), including the review_fallback: needs_review safety
+    # escalation that would otherwise apply to an unconfigured
+    # single-account setup -- accepting a blank prompt must not disable
+    # that safety net the same way a deliberate, informed pin does.
+    if reviewer_explicit:
+        cfg["reviewer"] = reviewer
+
+    return cfg, executor, reviewer, reviewer_explicit
+
+
+def _init_trunk_branch(cfg: dict, repo_root: Path) -> None:
+    """Prompt for trunk_branch, defaulting to detected origin/HEAD or current branch."""
+    # A real origin/HEAD detection wins over the currently checked-out
+    # branch: a cloned repo with a remote configured (origin/HEAD ->
+    # main) but currently sitting on a local feature/WIP branch during
+    # `init` should default to "main", not that feature branch. Only
+    # fall back to the checked-out branch when origin/HEAD can't be
+    # determined at all (a fresh local project with no remote set up
+    # yet, TICK-645) -- resolve_trunk_branch()'s own hardcoded "main"
+    # fallback in that case would be blind to a project that isn't
+    # actually using "main" as its trunk name.
+    origin_head_branch = _detect_origin_head_branch(repo_root)
+    current_branch = _current_git_branch(repo_root)
+    trunk_branch = _prompt(
+        "trunk_branch", origin_head_branch or current_branch or "main"
+    )
+    cfg["trunk_branch"] = trunk_branch
+
+
+def _init_headless_flags(cfg: dict, executor: str, reviewer: str) -> None:
+    """Write required unattended-run flags for whichever of executor/reviewer needs them."""
+    # Without these, the tool blocks on an interactive prompt and an
+    # unattended run just hangs instead of failing (see
+    # docs/troubleshooting.md "The agent hangs and never finishes").
+    _CLAUDE_TYPES = {"claude", "claude-subagent", "claude-process"}
+    _headless_types = {
+        t
+        for t in (executor, reviewer)
+        if t in _CLAUDE_TYPES or t in ("aider", "codex", "agy")
+    }
+    for _t in sorted(_headless_types):
+        if _t in _CLAUDE_TYPES:
+            print()
+            print(f"Note: {_t} requires headless flags for unattended runs.")
+            print("These are already pre-configured for you with a scoped permission set")
+            print("(--allowedTools), rather than --dangerously-skip-permissions.")
+            cfg.setdefault("executors", {}).setdefault(_t, {})["flags"] = list(
+                _SCOPED_CLAUDE_HEADLESS_FLAGS
+            )
+        elif _t == "aider":
+            print()
+            print("Note: aider requires --yes-always for unattended runs (auto-confirms")
+            print("its interactive prompts); --no-gitignore stops it editing .gitignore.")
+            cfg.setdefault("executors", {}).setdefault("aider", {})["flags"] = [
+                "--yes-always",
+                "--no-gitignore",
+            ]
+        elif _t == "codex":
+            print()
+            print("Note: codex requires approval/sandbox bypass flags for unattended runs.")
+            cfg.setdefault("executors", {}).setdefault("codex", {})["flags"] = list(
+                _CODEX_HEADLESS_FLAGS
+            )
+        elif _t == "agy":
+            print()
+            print("Note: agy requires --dangerously-skip-permissions for unattended runs")
+            print("(tool executions would otherwise block on interactive prompts), and")
+            print("--disable-slash-commands so agy doesn't interpret '/'-prefixed prompt")
+            print("content (e.g. ticket text) as its own CLI commands.")
+            cfg.setdefault("executors", {}).setdefault("agy", {})["flags"] = [
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands",
+            ]
+
+
+def _init_autonomy(cfg: dict) -> None:
+    """Prompt for pipeline autonomy (full vs supervised)."""
+    # resolve_autonomy() already defaults to "supervised" (pause for a
+    # manual `lanegate merge`) when this is left unset -- a deliberate
+    # safety default, not a bug. But the wizard never offered a way to
+    # opt into unattended "full" autonomy either, so every fresh project
+    # silently got supervised with no indication another option existed
+    # (TICK-645). Leaving option 2 unwritten preserves that same safe
+    # default; only an explicit "full" choice changes anything.
+    print()
+    print("Pipeline autonomy:")
+    print("  [1] full — unattended: auto-merge on an approved review")
+    print("  [2] supervised — pause at each ticket for a manual `lanegate merge` (default)")
+    autonomy_choice = _prompt("autonomy", "2")
+    if autonomy_choice == "1":
+        cfg["autonomy"] = "full"
+        cfg["default_human_review"] = "none"
+    elif autonomy_choice not in ("2", ""):
+        print(f"  Invalid choice {autonomy_choice!r} — using supervised.")
+
+
+def _init_models(
+    cfg: dict, executor: str, reviewer: str, reviewer_explicit: bool, repo_root: Path
+) -> dict:
+    """Prompt for models.analyze/implement/fix/review/drift_check, including Ollama discovery."""
+    # Always shown (not gated behind a y/N) so the resulting .lanegate.yml
+    # states exactly which model each step will use instead of leaving it
+    # to whatever the executor's own CLI/config defaults to invisibly.
+    print()
+    print("Model selection (press Enter to accept the default / use the tool's own default):")
+    _MODEL_EXAMPLES: dict[str, str] = {
+        "claude": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
+        "claude-subagent": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
+        "claude-process": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
+        "aider": "ollama_chat/qwen2.5-coder:14b (local), claude-sonnet-4-6 (cloud)",
+        "codex": "gpt-5.6-terra, gpt-5.6-sol, o3, openai/o3-mini",
+        "ollama": "qwen3-coder:30b-a3b-q4_K_M, qwen2.5-coder:14b",
+    }
+    # Wizard-only suggested defaults: review intentionally points at a
+    # stronger/different model than analyze+implement so review isn't
+    # just the implementer re-reading its own work with its own biases,
+    # mirroring this project's own executors.claude-a/codex/aider-ollama-*
+    # blocks. This is separate from resolve_model()'s runtime fallback
+    # (_DEFAULT_*_MODEL, all haiku) used when models: is left unset
+    # entirely -- that fallback stays a conservative/cheap default.
+    # fix and drift_check are as exposed to an unconfigured-step gap as
+    # analyze/implement/review: resolve_model() returns None for any
+    # non-Claude executor with no models.<step> entry, and for aider that
+    # means no --model flag at all -- which, with an Ollama provider, falls
+    # through to aider's own default (an interactive OpenRouter login flow)
+    # instead of the local model the rest of the config points at. A
+    # headless dispatch just hangs on that prompt for several minutes and
+    # then fails, indistinguishable from a genuine drift-check/fix failure
+    # to whatever's watching (observed live on a real drift-check run,
+    # which is what prompted adding these two prompts). fix follows implement's
+    # suggestion (it's editing code the same way); drift_check follows
+    # review's (autofix.py already treats it as "an independent review
+    # route" that resolves from the review route's config).
+    _WIZARD_STEP_DEFAULTS: dict[str, dict[str, str]] = {
+        "claude": {
+            "analyze": "claude-sonnet-5",
+            "implement": "claude-sonnet-5",
+            "review": "claude-opus-5",
+            "fix": "claude-sonnet-5",
+            "drift_check": "claude-opus-5",
+        },
+        "claude-subagent": {
+            "analyze": "claude-sonnet-5",
+            "implement": "claude-sonnet-5",
+            "review": "claude-opus-5",
+            "fix": "claude-sonnet-5",
+            "drift_check": "claude-opus-5",
+        },
+        "claude-process": {
+            "analyze": "claude-sonnet-5",
+            "implement": "claude-sonnet-5",
+            "review": "claude-opus-5",
+            "fix": "claude-sonnet-5",
+            "drift_check": "claude-opus-5",
+        },
+        "codex": {
+            "analyze": "gpt-5.6-terra",
+            "implement": "gpt-5.6-terra",
+            "review": "gpt-5.6-sol",
+            "fix": "gpt-5.6-terra",
+            "drift_check": "gpt-5.6-sol",
+        },
+        "aider": {
+            "analyze": "ollama_chat/qwen2.5-coder:14b",
+            "implement": "ollama_chat/qwen2.5-coder:14b",
+            "review": "ollama_chat/qwen2.5-coder:32b",
+            "fix": "ollama_chat/qwen2.5-coder:14b",
+            "drift_check": "ollama_chat/qwen2.5-coder:32b",
+        },
+    }
+
+    # Best-effort discovery of what's actually pulled locally, so the
+    # wizard's suggested default is a model that exists rather than a
+    # hardcoded 14b/32b guess that 404s at runtime if it isn't installed
+    # (TICK-645). One lookup, reused for all three model prompts below;
+    # [] (Ollama not running / nothing pulled / unreachable) falls back
+    # to today's hardcoded suggestion with no behavior change.
+    _ollama_discovered: list[str] = []
+    if "aider" in (executor, reviewer) or "ollama" in (executor, reviewer):
+        from lanegate.executor import discover_ollama_models
+
+        _ollama_discovered = discover_ollama_models("http://localhost:11434")
+
+    def _ask_model(step: str, exec_type: str) -> str:
+        examples = _MODEL_EXAMPLES.get(exec_type)
+        hint = f"e.g. {examples}" if examples else f"check {exec_type}'s own docs for supported model names"
+        print(f"  models.{step} ({exec_type}) — {hint}")
+        default = _WIZARD_STEP_DEFAULTS.get(exec_type, {}).get(step, "")
+
+        # aider routes local models through Aider's LiteLLM integration,
+        # which needs an "ollama_chat/" prefix; the raw `ollama` executor
+        # type talks to Ollama directly and takes the bare name. `ollama
+        # list`/`GET /api/tags` always reports the bare name either way.
+        picker: dict[str, str] = {}
+        if exec_type in ("aider", "ollama") and _ollama_discovered:
+            prefix = "ollama_chat/" if exec_type == "aider" else ""
+            display_names = [f"{prefix}{name}" for name in _ollama_discovered]
+            size_hint = "32b" if step in ("review", "drift_check") else "14b"
+            suggested = next(
+                (i for i, name in enumerate(_ollama_discovered) if size_hint in name), 0
+            )
+            print("  Installed Ollama models detected:")
+            for i, display_name in enumerate(display_names):
+                marker = " (suggested)" if i == suggested else ""
+                print(f"    [{i + 1}] {display_name}{marker}")
+            if exec_type == "aider":
+                print(
+                    "  Note: aider needs the 'ollama_chat/' prefix above (LiteLLM "
+                    "routing) -- 'ollama list' itself reports these without it."
+                )
+            default = display_names[suggested]
+            picker = {str(i + 1): name for i, name in enumerate(display_names)}
+
+        while True:
+            value = _prompt(f"  models.{step}", default)
+            if not value:
+                return value
+            if picker and value.isdigit() and value not in picker:
+                print(
+                    f"  Invalid choice: '{value}' is not one of the listed "
+                    f"options above ([1]-[{len(picker)}])."
+                )
+                continue
+            value = picker.get(value, value)
+            try:
+                # No provider= here: the wizard doesn't know the
+                # provider yet at this point (aider+Ollama is decided
+                # further down, after all the model prompts run), so
+                # this uses validate_model_for_executor's permissive
+                # no-provider branch -- still catches a wrong-vendor
+                # model string, just not an Ollama-specific mismatch.
+                validate_model_for_executor(value, exec_type, f"models.{step}")
+            except ConfigError as exc:
+                print(f"  Invalid model: {exc}")
+                continue
+            return value
+
+    models: dict[str, str] = {}
+    for step, step_executor in (
+        ("analyze", executor),
+        ("implement", executor),
+        ("fix", executor),
+        ("review", reviewer),
+        ("drift_check", reviewer),
+    ):
+        value = _ask_model(step, step_executor)
+        if value:
+            models[step] = value
+    if models:
+        cfg["models"] = models
+
+    # --- Independent review across two local models ---
+    # A same-tool setup (e.g. executor: aider, reviewer: aider) with two
+    # different models is a real independent review -- but
+    # resolve_independent_review_driver's ladder can only see a different
+    # pool instance/driver, not a same-instance model swap, so without
+    # this it falls through to the needs_review safety escalation on
+    # every ticket (TICK-645).
+    if (
+        reviewer_explicit
+        and reviewer == executor
+        and models.get("review")
+        and models.get("review") != models.get("implement")
+    ):
+        cfg.setdefault("review_fallback", "different_model")
+
+    return models
+
+
+def _init_aider_ollama_context(
+    cfg: dict, executor: str, reviewer: str, models: dict, repo_root: Path
+) -> None:
+    """Suggest a context budget + edit_format when aider is routed to a local Ollama model."""
+    # A local model has a finite context window; without a declared budget,
+    # an oversized ticket overflows it unpredictably instead of failing
+    # cleanly upfront (see docs/executor-capabilities.md#context-window-tokens).
+    # Declaring provider: ollama here also arms lanegate's own runtime
+    # warning if context_window_tokens is later left unset.
+    aider_ollama_model = next(
+        (
+            models[step]
+            for step, step_executor in (
+                ("analyze", executor),
+                ("implement", executor),
+                ("fix", executor),
+                ("review", reviewer),
+                ("drift_check", reviewer),
+            )
+            if step_executor == "aider" and models.get(step, "").startswith("ollama")
+        ),
+        None,
+    )
+    if aider_ollama_model:
+        print()
+        print(
+            f"Note: aider is routed to a local Ollama model ({aider_ollama_model}). "
+            "LaneGate can enforce a preflight context budget so an oversized "
+            "prompt fails cleanly instead of overflowing the model silently."
         )
-        reviewer = reviewer_raw if reviewer_raw in _VALID_REVIEWERS else executor
-        if reviewer_input and reviewer != reviewer_raw:
-            print(
-                f"  Warning: '{reviewer_raw}' is not a recognised reviewer; "
-                f"treating it like a blank answer (auto). (Valid: {sorted(_VALID_REVIEWERS)})"
-            )
-        # A blank prompt -- or an unrecognized (typo'd) one -- must not
-        # silently become an explicit reviewer pin: cfg["reviewer"] is set
-        # conditionally below, only when the user typed a value that's
-        # actually a real reviewer choice (see that comment for why this
-        # matters). A typo pinning self-review the same way a deliberate
-        # match does would be exactly the footgun the blank case was fixed
-        # for, just triggered by a mistake instead of an empty Enter.
-        reviewer_explicit = bool(reviewer_input) and reviewer_input in _VALID_REVIEWERS
-        if reviewer_explicit and reviewer == executor:
-            print(
-                f"  Note: reviewer == executor ('{executor}') — review will run in "
-                "combined (self-review) mode, not the independent review pipeline."
-            )
-        max_parallel_raw = _prompt("max_parallel", "2")
+        context_tokens_raw = _prompt(
+            "  executors.aider.context_window_tokens (0 to skip)", "32768"
+        )
+        aider_cfg = cfg.setdefault("executors", {}).setdefault("aider", {})
+        aider_cfg["provider"] = "ollama"
         try:
-            max_parallel = int(max_parallel_raw)
-            if max_parallel < 1:
+            context_tokens = int(context_tokens_raw)
+        except ValueError:
+            context_tokens = 0
+        if context_tokens > 0:
+            aider_cfg["context_window_tokens"] = context_tokens
+
+        # Neither edit_format is universally safe for small local models:
+        # "whole" rewrites the entire file every turn and can truncate or
+        # hallucinate past a few hundred lines; "diff" avoids that but can
+        # get a malformed hunk from a small model (see
+        # docs/executor-capabilities.md, "Known caveats" for aider). Pick
+        # the default from what's actually in this repo (TICK-645) rather
+        # than a flat guess either way.
+        recommended_format, format_note = _recommend_aider_edit_format(repo_root)
+        if format_note:
+            print(f"  {format_note}")
+        else:
+            print(
+                "  No large tracked file detected here; 'whole' (full-file "
+                "rewrites) is fine for small local models. Switch to 'diff' "
+                "if a touched file grows past ~300-500 lines."
+            )
+        # Every other optional step in this wizard is an input(...
+        # [y/N]) confirm, so a "y"/"n" typed here from muscle memory
+        # must not land in config verbatim -- it would silently become
+        # `aider --edit-format y` on every dispatch.
+        # _VALID_AIDER_EDIT_FORMATS is a module-level constant (see top of file).
+        while True:
+            edit_format = _prompt("  executors.aider.edit_format", recommended_format)
+            if not edit_format or edit_format in _VALID_AIDER_EDIT_FORMATS:
+                break
+            print(
+                f"  Invalid edit_format {edit_format!r} — valid values are "
+                f"{sorted(_VALID_AIDER_EDIT_FORMATS)}"
+            )
+        if edit_format:
+            aider_cfg["edit_format"] = edit_format
+
+        # repo_map/neutralize_touches/map_tokens keep the prompt lean by
+        # deferring eager full-file preload to aider's own lazy
+        # filename-mention scan instead of front-loading every touched
+        # file — see the neutralize_touches/repo_map comments in
+        # lanegate/executor.py's aider dispatch for the full rationale.
+        aider_cfg["repo_map"] = True
+        aider_cfg["neutralize_touches"] = True
+        aider_cfg["map_tokens"] = 1024
+
+        # A local model costs nothing per call, unlike a cloud API where
+        # every retry is a real charge -- max_auto_fix_attempts' default of
+        # 1 is a deliberate cost guardrail for that cloud case, not a
+        # correctness requirement. It doesn't apply the same way once
+        # everything routed through aider here is local, so default higher
+        # for a local-Ollama setup instead of leaving cloud's conservative
+        # default in place for a project that has no reason to want it.
+        cfg.setdefault("max_auto_fix_attempts", 2)
+
+
+def _init_feature_flags(cfg: dict) -> None:
+    """Prompt to enable the feature-flag file."""
+    print()
+    want_flags = _prompt_yes_no("Enable feature flags?")
+    if want_flags:
+        flag_file = _prompt("flag_file", f"~/.{APP_NAME}/feature_flags.json")
+        cfg["flag_file"] = flag_file
+
+
+def _init_deployment_pipeline(cfg: dict, detected_trunk_branch: str) -> None:
+    """Prompt to configure the optional deployment pipeline (environments)."""
+    print()
+    want_envs = _prompt_yes_no("Enable deployment pipeline (environments)?")
+    if want_envs:
+        num_envs_raw = _prompt("Number of environments", "1")
+        try:
+            num_envs = int(num_envs_raw)
+            if num_envs < 1:
                 raise ValueError
         except ValueError:
-            print("  Invalid max_parallel — using 2.")
-            max_parallel = 2
+            print("  Invalid number — skipping environments.")
+            num_envs = 0
 
-        cfg = {
-            "ticket_prefix": ticket_prefix,
-            "tickets_dir": tickets_dir,
-            "worktrees_dir": worktrees_dir,
-            "executor": executor,
-            "max_parallel": max_parallel,
-            "commit_status_changes": True,
-        }
-        # Only pin reviewer: when the user actually typed something at the
-        # prompt above (even a value matching executor) -- a blank/default
-        # answer leaves it unset so resolve_independent_review_driver's
-        # ladder runs at dispatch time instead of being permanently bypassed.
-        # An explicit pin "always wins outright" over that ladder (see its
-        # docstring), including the review_fallback: needs_review safety
-        # escalation that would otherwise apply to an unconfigured
-        # single-account setup -- accepting a blank prompt must not disable
-        # that safety net the same way a deliberate, informed pin does.
-        if reviewer_explicit:
-            cfg["reviewer"] = reviewer
+        environments = []
+        for i in range(num_envs):
+            print(f"\n  Environment {i + 1}:")
+            env_name = _prompt("    name", f"env{i + 1}")
+            env_branch = _prompt("    branch", env_name)
+            env_from = _prompt("    from (source branch)", detected_trunk_branch)
+            env_trigger = _prompt("    trigger (manual/auto)", "manual")
+            if env_trigger not in _VALID_TRIGGERS:
+                print("    Invalid trigger; using 'manual'.")
+                env_trigger = "manual"
+            env_guard = _prompt("    guard_script (leave blank to skip)", "").strip() or None
+            pre_raw = _prompt(
+                "    pre_promote scripts (comma-separated, blank to skip)", ""
+            ).strip()
+            pre_promote = [s.strip() for s in pre_raw.split(",") if s.strip()]
+            post_raw = _prompt(
+                "    post_promote scripts (comma-separated, blank to skip)", ""
+            ).strip()
+            post_promote = [s.strip() for s in post_raw.split(",") if s.strip()]
 
-        # --- Required: executor headless flags ---
-        # Without these, the tool blocks on an interactive prompt and an
-        # unattended run just hangs instead of failing (see
-        # docs/troubleshooting.md "The agent hangs and never finishes").
-        _CLAUDE_TYPES = {"claude", "claude-subagent", "claude-process"}
-        _headless_types = {
-            t
-            for t in (executor, reviewer)
-            if t in _CLAUDE_TYPES or t in ("aider", "codex", "agy")
-        }
-        for _t in sorted(_headless_types):
-            if _t in _CLAUDE_TYPES:
-                print()
-                print(f"Note: {_t} requires headless flags for unattended runs.")
-                print("These are already pre-configured for you with a scoped permission set")
-                print("(--allowedTools), rather than --dangerously-skip-permissions.")
-                cfg.setdefault("executors", {}).setdefault(_t, {})["flags"] = list(
-                    _SCOPED_CLAUDE_HEADLESS_FLAGS
-                )
-            elif _t == "aider":
-                print()
-                print("Note: aider requires --yes-always for unattended runs (auto-confirms")
-                print("its interactive prompts); --no-gitignore stops it editing .gitignore.")
-                cfg.setdefault("executors", {}).setdefault("aider", {})["flags"] = [
-                    "--yes-always",
-                    "--no-gitignore",
-                ]
-            elif _t == "codex":
-                print()
-                print("Note: codex requires approval/sandbox bypass flags for unattended runs.")
-                cfg.setdefault("executors", {}).setdefault("codex", {})["flags"] = list(
-                    _CODEX_HEADLESS_FLAGS
-                )
-            elif _t == "agy":
-                print()
-                print("Note: agy requires --dangerously-skip-permissions for unattended runs")
-                print("(tool executions would otherwise block on interactive prompts), and")
-                print("--disable-slash-commands so agy doesn't interpret '/'-prefixed prompt")
-                print("content (e.g. ticket text) as its own CLI commands.")
-                cfg.setdefault("executors", {}).setdefault("agy", {})["flags"] = [
-                    "--dangerously-skip-permissions",
-                    "--disable-slash-commands",
-                ]
-
-        # --- Model selection ---
-        # Always shown (not gated behind a y/N) so the resulting .lanegate.yml
-        # states exactly which model each step will use instead of leaving it
-        # to whatever the executor's own CLI/config defaults to invisibly.
-        print()
-        print("Model selection (press Enter to accept the default / use the tool's own default):")
-        _MODEL_EXAMPLES: dict[str, str] = {
-            "claude": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
-            "claude-subagent": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
-            "claude-process": "claude-haiku-4-5-20251001, claude-sonnet-5, claude-opus-5",
-            "aider": "ollama_chat/qwen2.5-coder:14b (local), claude-sonnet-4-6 (cloud)",
-            "codex": "gpt-5.6-terra, gpt-5.6-sol, o3, openai/o3-mini",
-            "ollama": "qwen3-coder:30b-a3b-q4_K_M, qwen2.5-coder:14b",
-        }
-        # Wizard-only suggested defaults: review intentionally points at a
-        # stronger/different model than analyze+implement so review isn't
-        # just the implementer re-reading its own work with its own biases,
-        # mirroring this project's own executors.claude-a/codex/aider-ollama-*
-        # blocks. This is separate from resolve_model()'s runtime fallback
-        # (_DEFAULT_*_MODEL, all haiku) used when models: is left unset
-        # entirely -- that fallback stays a conservative/cheap default.
-        _WIZARD_STEP_DEFAULTS: dict[str, dict[str, str]] = {
-            "claude": {
-                "analyze": "claude-sonnet-5",
-                "implement": "claude-sonnet-5",
-                "review": "claude-opus-5",
-            },
-            "claude-subagent": {
-                "analyze": "claude-sonnet-5",
-                "implement": "claude-sonnet-5",
-                "review": "claude-opus-5",
-            },
-            "claude-process": {
-                "analyze": "claude-sonnet-5",
-                "implement": "claude-sonnet-5",
-                "review": "claude-opus-5",
-            },
-            "codex": {
-                "analyze": "gpt-5.6-terra",
-                "implement": "gpt-5.6-terra",
-                "review": "gpt-5.6-sol",
-            },
-            "aider": {
-                "analyze": "ollama_chat/qwen2.5-coder:14b",
-                "implement": "ollama_chat/qwen2.5-coder:14b",
-                "review": "ollama_chat/qwen2.5-coder:32b",
-            },
-        }
-
-        def _ask_model(step: str, exec_type: str) -> str:
-            examples = _MODEL_EXAMPLES.get(exec_type)
-            hint = f"e.g. {examples}" if examples else f"check {exec_type}'s own docs for supported model names"
-            print(f"  models.{step} ({exec_type}) — {hint}")
-            default = _WIZARD_STEP_DEFAULTS.get(exec_type, {}).get(step, "")
-            while True:
-                value = _prompt(f"  models.{step}", default)
-                if not value:
-                    return value
-                try:
-                    # No provider= here: the wizard doesn't know the
-                    # provider yet at this point (aider+Ollama is decided
-                    # further down, after all three model prompts run), so
-                    # this uses validate_model_for_executor's permissive
-                    # no-provider branch -- still catches a wrong-vendor
-                    # model string, just not an Ollama-specific mismatch.
-                    validate_model_for_executor(value, exec_type, f"models.{step}")
-                except ConfigError as exc:
-                    print(f"  Invalid model: {exc}")
-                    continue
-                return value
-
-        models: dict[str, str] = {}
-        for step, step_executor in (("analyze", executor), ("implement", executor), ("review", reviewer)):
-            value = _ask_model(step, step_executor)
-            if value:
-                models[step] = value
-        if models:
-            cfg["models"] = models
-
-        # --- Aider + local Ollama: suggest a context budget ---
-        # A local model has a finite context window; without a declared budget,
-        # an oversized ticket overflows it unpredictably instead of failing
-        # cleanly upfront (see docs/executor-capabilities.md#context-window-tokens).
-        # Declaring provider: ollama here also arms lanegate's own runtime
-        # warning if context_window_tokens is later left unset.
-        aider_ollama_model = next(
-            (
-                models[step]
-                for step, step_executor in (
-                    ("analyze", executor),
-                    ("implement", executor),
-                    ("review", reviewer),
-                )
-                if step_executor == "aider" and models.get(step, "").startswith("ollama")
-            ),
-            None,
-        )
-        if aider_ollama_model:
-            print()
-            print(
-                f"Note: aider is routed to a local Ollama model ({aider_ollama_model}). "
-                "LaneGate can enforce a preflight context budget so an oversized "
-                "prompt fails cleanly instead of overflowing the model silently."
-            )
-            context_tokens_raw = _prompt(
-                "  executors.aider.context_window_tokens (0 to skip)", "32768"
-            )
-            aider_cfg = cfg.setdefault("executors", {}).setdefault("aider", {})
-            aider_cfg["provider"] = "ollama"
-            try:
-                context_tokens = int(context_tokens_raw)
-            except ValueError:
-                context_tokens = 0
-            if context_tokens > 0:
-                aider_cfg["context_window_tokens"] = context_tokens
-
-            # Small local models routinely produce malformed diffs — aider's
-            # default edit format — which either breaks aider's parser or gets
-            # misparsed as bogus filenames (see
-            # docs/executor-capabilities.md, "Known caveats" for aider).
-            # "whole" (full-file rewrites) is the reliable format for them;
-            # "diff" stays a fine choice for a stronger cloud model.
-            print(
-                "  Small local models are unreliable with aider's default 'diff' "
-                "edit format (malformed diffs / misparsed filenames); 'whole' "
-                "(full-file rewrites) is more reliable for them."
-            )
-            # Every other optional step in this wizard is an input(...
-            # [y/N]) confirm, so a "y"/"n" typed here from muscle memory
-            # must not land in config verbatim -- it would silently become
-            # `aider --edit-format y` on every dispatch.
-            _VALID_AIDER_EDIT_FORMATS = {
-                "whole", "diff", "diff-fenced", "udiff", "patch",
-                "editor-diff", "editor-whole",
+            env_entry: dict = {
+                "name": env_name,
+                "branch": env_branch,
+                "from": env_from,
+                "trigger": env_trigger,
             }
-            while True:
-                edit_format = _prompt("  executors.aider.edit_format", "whole")
-                if not edit_format or edit_format in _VALID_AIDER_EDIT_FORMATS:
-                    break
-                print(
-                    f"  Invalid edit_format {edit_format!r} — valid values are "
-                    f"{sorted(_VALID_AIDER_EDIT_FORMATS)}"
-                )
-            if edit_format:
-                aider_cfg["edit_format"] = edit_format
+            if env_guard:
+                # Hooks are argv lists, never bare strings — validate_hook rejects
+                # a string outright, so writing one here bricks every later command.
+                env_entry["guard_script"] = shlex.split(env_guard)
+            if pre_promote:
+                env_entry["pre_promote"] = pre_promote
+            if post_promote:
+                env_entry["post_promote"] = post_promote
 
-            # repo_map/neutralize_touches/map_tokens keep the prompt lean by
-            # deferring eager full-file preload to aider's own lazy
-            # filename-mention scan instead of front-loading every touched
-            # file — see the neutralize_touches/repo_map comments in
-            # lanegate/executor.py's aider dispatch for the full rationale.
-            aider_cfg["repo_map"] = True
-            aider_cfg["neutralize_touches"] = True
-            aider_cfg["map_tokens"] = 1024
+            environments.append(env_entry)
 
-        # --- Optional: feature flags ---
-        print()
-        want_flags = _prompt_yes_no("Enable feature flags?")
-        if want_flags:
-            flag_file = _prompt("flag_file", f"~/.{APP_NAME}/feature_flags.json")
-            cfg["flag_file"] = flag_file
+        if environments:
+            cfg["environments"] = environments
 
-        # --- Optional: deployment pipeline ---
-        print()
-        want_envs = _prompt_yes_no("Enable deployment pipeline (environments)?")
-        if want_envs:
-            num_envs_raw = _prompt("Number of environments", "1")
-            try:
-                num_envs = int(num_envs_raw)
-                if num_envs < 1:
-                    raise ValueError
-            except ValueError:
-                print("  Invalid number — skipping environments.")
-                num_envs = 0
 
-            environments = []
-            for i in range(num_envs):
-                print(f"\n  Environment {i + 1}:")
-                env_name = _prompt("    name", f"env{i + 1}")
-                env_branch = _prompt("    branch", env_name)
-                env_from = _prompt("    from (source branch)", detected_trunk_branch)
-                env_trigger = _prompt("    trigger (manual/auto)", "manual")
-                if env_trigger not in _VALID_TRIGGERS:
-                    print("    Invalid trigger; using 'manual'.")
-                    env_trigger = "manual"
-                env_guard = _prompt("    guard_script (leave blank to skip)", "").strip() or None
-                pre_raw = _prompt(
-                    "    pre_promote scripts (comma-separated, blank to skip)", ""
-                ).strip()
-                pre_promote = [s.strip() for s in pre_raw.split(",") if s.strip()]
-                post_raw = _prompt(
-                    "    post_promote scripts (comma-separated, blank to skip)", ""
-                ).strip()
-                post_promote = [s.strip() for s in post_raw.split(",") if s.strip()]
-
-                env_entry: dict = {
-                    "name": env_name,
-                    "branch": env_branch,
-                    "from": env_from,
-                    "trigger": env_trigger,
-                }
-                if env_guard:
-                    # Hooks are argv lists, never bare strings — validate_hook rejects
-                    # a string outright, so writing one here bricks every later command.
-                    env_entry["guard_script"] = shlex.split(env_guard)
-                if pre_promote:
-                    env_entry["pre_promote"] = pre_promote
-                if post_promote:
-                    env_entry["post_promote"] = post_promote
-
-                environments.append(env_entry)
-
-            if environments:
-                cfg["environments"] = environments
-
-        # --- Optional: safeguards ---
-        print()
-        detected_runners = detect_test_runner_safeguards(repo_root)
-        if detected_runners:
-            runner_names = ", ".join(d.name for d in detected_runners)
-            commands = [d.command for d in detected_runners]
-            command_list = ", ".join(commands)
-            want_safeguards = _prompt_yes_no(
-                f"Detected {runner_names} -- configure pre_complete: "
-                f"[{command_list}], pre_merge: [{command_list}]?",
-                default=True,
-            )
-            if want_safeguards:
-                cfg["safeguards"] = {
-                    "pre_complete": commands,
-                    "pre_merge": commands,
-                }
-        else:
-            want_safeguards = _prompt_yes_no(
-                "Configure ticket safeguards (pre_complete / pre_merge guards)?"
-            )
-            if want_safeguards:
-                print("  Enter guard commands as a comma-separated list (blank to skip).")
-                print("  Examples: pytest, scripts/run-tests.sh, cargo test, npm test")
-                pre_complete_raw = _prompt(
-                    "  pre_complete guards (run before marking code_complete)", ""
-                ).strip()
-                pre_complete = [s.strip() for s in pre_complete_raw.split(",") if s.strip()]
-                pre_merge_raw = _prompt("  pre_merge guards (run before git merge)", "").strip()
-                pre_merge = [s.strip() for s in pre_merge_raw.split(",") if s.strip()]
-
-                safeguards: dict = {}
-                if pre_complete:
-                    safeguards["pre_complete"] = pre_complete
-                if pre_merge:
-                    safeguards["pre_merge"] = pre_merge
-                if safeguards:
-                    cfg["safeguards"] = safeguards
-
-        # --- Optional: GitHub PR integration ---
-        print()
-        cfg["github_pr"] = _prompt_yes_no(
-            "Auto-push branches and open GitHub PRs on approved review?"
+def _init_safeguards(cfg: dict, repo_root: Path) -> None:
+    """Prompt to configure pre_complete/pre_merge safeguards, offering detected test runners."""
+    print()
+    detected_runners = detect_test_runner_safeguards(repo_root)
+    if detected_runners:
+        runner_names = ", ".join(d.name for d in detected_runners)
+        commands = [d.command for d in detected_runners]
+        command_list = ", ".join(commands)
+        want_safeguards = _prompt_yes_no(
+            f"Detected {runner_names} -- configure pre_complete: "
+            f"[{command_list}], pre_merge: [{command_list}]?",
+            default=True,
         )
+        if want_safeguards:
+            cfg["safeguards"] = {
+                "pre_complete": commands,
+                "pre_merge": commands,
+            }
+    else:
+        want_safeguards = _prompt_yes_no(
+            "Configure ticket safeguards (pre_complete / pre_merge guards)?"
+        )
+        if want_safeguards:
+            print("  Enter guard commands as a comma-separated list (blank to skip).")
+            print("  Examples: pytest, scripts/run-tests.sh, cargo test, npm test")
+            pre_complete_raw = _prompt(
+                "  pre_complete guards (run before marking code_complete)", ""
+            ).strip()
+            pre_complete = [s.strip() for s in pre_complete_raw.split(",") if s.strip()]
+            pre_merge_raw = _prompt("  pre_merge guards (run before git merge)", "").strip()
+            pre_merge = [s.strip() for s in pre_merge_raw.split(",") if s.strip()]
+
+            safeguards: dict = {}
+            if pre_complete:
+                safeguards["pre_complete"] = pre_complete
+            if pre_merge:
+                safeguards["pre_merge"] = pre_merge
+            if safeguards:
+                cfg["safeguards"] = safeguards
+
+
+def _init_github_pr(cfg: dict) -> None:
+    """Prompt to enable auto-push + GitHub PR creation on approved review."""
+    print()
+    cfg["github_pr"] = _prompt_yes_no(
+        "Auto-push branches and open GitHub PRs on approved review?"
+    )
+
+
+def _finalize_init_config(cfg: dict, repo_root: Path) -> dict:
+    """Run the steps common to both interactive and non-interactive init: re-init safety
+    check, writing .lanegate.yml, updating .gitignore, creating directories, and
+    registering the project."""
+    config_path = repo_root / CONFIG_FILENAME
 
     # --- Re-init safety: detect existing tickets in a non-default location ---
     # If a non-default directory (e.g. tickets/) exists and contains .md files,
@@ -2813,6 +3124,77 @@ def interactive_init(
     registry_add(repo_root)
 
     return cfg
+
+
+def interactive_init(
+    repo_root: Path, *, use_defaults: bool = False, force_interactive: bool = False
+) -> dict | None:
+    """
+    Walk through every core config option and write .lanegate.yml to repo_root.
+
+    Returns the config dict on success, or None if .lanegate.yml already exists.
+
+    Parameters
+    ----------
+    repo_root:
+        Directory where .lanegate.yml will be written.
+    use_defaults:
+        Skip all prompts and write a minimal config (also activated when stdin is
+        not a TTY).
+    force_interactive:
+        Show prompts even when stdin is not a TTY (overrides the TTY check).
+    """
+    global _stdin_exhausted_warned
+    _stdin_exhausted_warned = False
+    config_path = repo_root / CONFIG_FILENAME
+
+    if config_path.exists():
+        print(
+            f"ERROR: {CONFIG_FILENAME} already exists at {repo_root}. "
+            "Remove it first to re-initialise.",
+            file=sys.stderr,
+        )
+        return None
+
+    detected_trunk_branch = resolve_trunk_branch({}, repo_root)
+
+    non_interactive = use_defaults or (not force_interactive and not sys.stdin.isatty())
+    if non_interactive and not use_defaults:
+        print(
+            "Note: stdin is not a TTY — using defaults. "
+            "Run `lanegate init --interactive` to configure interactively.",
+            file=sys.stderr,
+        )
+
+    if non_interactive:
+        # Minimal defaults, no environments, no flag_file
+        cfg: dict = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": f".{APP_NAME}/tickets",
+            "worktrees_dir": f".{APP_NAME}/worktrees",
+            "executor": "claude",
+            "max_parallel": 2,
+            "commit_status_changes": True,
+            "github_pr": False,
+            "executors": {
+                "claude": {
+                    "flags": list(_SCOPED_CLAUDE_HEADLESS_FLAGS),
+                }
+            },
+        }
+    else:
+        cfg, executor, reviewer, reviewer_explicit = _init_core_options(repo_root)
+        _init_trunk_branch(cfg, repo_root)
+        _init_headless_flags(cfg, executor, reviewer)
+        _init_autonomy(cfg)
+        models = _init_models(cfg, executor, reviewer, reviewer_explicit, repo_root)
+        _init_aider_ollama_context(cfg, executor, reviewer, models, repo_root)
+        _init_feature_flags(cfg)
+        _init_deployment_pipeline(cfg, detected_trunk_branch)
+        _init_safeguards(cfg, repo_root)
+        _init_github_pr(cfg)
+
+    return _finalize_init_config(cfg, repo_root)
 
 
 # ---------------------------------------------------------------------------

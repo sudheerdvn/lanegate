@@ -513,9 +513,10 @@ def record_failure_signature(
 
     Returns True once *threshold* consecutive failures with the same
     ``signature`` have landed within ``window_s`` seconds of each other.
-    A differing signature, or a gap exceeding ``window_s``, resets the count
-    to 1 instead of raising an error — this is a streak counter, not a
-    rate-limit-pattern classifier.
+    A differing signature, or a gap of ``window_s`` seconds or more, resets
+    the count to 1 instead of raising an error — this is a streak counter,
+    not a rate-limit-pattern classifier. ``window_s=0`` therefore means no
+    gap, however small, ever counts as "within" the window.
     """
     path = _failure_streak_path(repo_root, name)
     now = _utc_now()
@@ -530,7 +531,7 @@ def record_failure_signature(
             if (
                 data.get("signature") == signature
                 and last_ts is not None
-                and (now - last_ts).total_seconds() <= window_s
+                and (now - last_ts).total_seconds() < window_s
             ):
                 count = int(data.get("count") or 0) + 1
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -800,7 +801,71 @@ def build_visual_verification_note(groups: list[dict]) -> str:
     )
 
 
-_CLAUDE_SUBPROCESS_TYPES = frozenset({"claude", "claude-process", "claude-subagent"})
+EXECUTOR_CAPABILITIES: dict[str, dict[str, bool]] = {
+    # tool_dispatch_loop: the executor runs an interactive agent loop that can
+    #   call tools; False means a single-turn, non-agentic invocation (no loop).
+    # stdin_capable: the executor accepts its prompt via stdin rather than as
+    #   a positional command-line argument.
+    # streaming_capable: the executor streams structured JSON progress events
+    #   during execution (enables output-idle watchdog logic).
+    # streaming_capable_without_heartbeat: like streaming_capable, but safe to
+    #   apply the output-idle watchdog even when *no* worker heartbeat monitor
+    #   is running alongside.  Codex's JSON output can be quiet for extended
+    #   periods between events; without a heartbeat keeping it alive past the
+    #   short idle threshold it must fall back to the hard ceiling.  This flag
+    #   is False for codex so that review/autofix (which have no heartbeat
+    #   thread) use the flat timeout, while pool.py (which does have one) may
+    #   use the broader streaming_capable flag to include codex.
+    "claude":          {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+    "claude-process":  {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+    "claude-subagent": {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+    "codex":           {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": False},
+    "aider":           {"tool_dispatch_loop": False, "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    "ollama":          {"tool_dispatch_loop": False, "stdin_capable": True,  "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    "agy":             {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    # openhands is an agentic task runner (tool-dispatch loop); it takes its
+    # prompt via --task on the command line and produces no structured JSON
+    # progress stream.
+    "openhands":       {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    # gemini is deprecated (superseded by "agy" as of 2026-06-18) but kept in
+    # _VALID_EXECUTOR_TYPES for backward compat.  It ran an interactive agent
+    # loop (tool_dispatch_loop=True) via the Gemini CLI.
+    "gemini":          {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    # continue is a generic fall-through executor type (Continue.dev); it runs
+    # an agentic tool-dispatch loop but produces no structured JSON events.
+    "continue":        {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+}
+
+
+def has_capability(executor_type: str, cap: str) -> bool:
+    """Return whether *executor_type* has the named capability.
+
+    Returns ``False`` (not ``KeyError``) for unknown executor type strings or
+    unknown capability names — callers that probe for a feature on an
+    unregistered executor type receive a safe negative.
+    """
+    caps = EXECUTOR_CAPABILITIES.get(executor_type)
+    if caps is None:
+        return False
+    return bool(caps.get(cap, False))
+
+
+def executor_types_with(cap: str) -> frozenset[str]:
+    """Return the frozenset of executor type strings where *cap* is True.
+
+    Reads ``EXECUTOR_CAPABILITIES`` each call so that test-time monkey-patches
+    to the dict are reflected immediately.
+    """
+    return frozenset(t for t, c in EXECUTOR_CAPABILITIES.items() if c.get(cap))
+
+
+# Private alias kept for backward compatibility with internal callers in this
+# module and sibling modules that import it directly.  Derived from the
+# registry so it stays in sync automatically.
+_CLAUDE_SUBPROCESS_TYPES = frozenset(
+    t for t, c in EXECUTOR_CAPABILITIES.items()
+    if c["tool_dispatch_loop"] and "claude" in t
+)
 _SESSION_RESUME_TYPES = frozenset(_CLAUDE_SUBPROCESS_TYPES | {"agy", "codex"})
 _AIDER_CONTEXT_RESERVE_TOKENS = 8_192
 _AIDER_DEFAULT_MAP_TOKENS = 1024
@@ -994,6 +1059,33 @@ def discover_ollama_context(
     return None, None
 
 
+def discover_ollama_models(base_url: str, timeout_secs: int = 5) -> list[str]:
+    """Return locally installed Ollama model tags via ``GET /api/tags``.
+
+    Names come back bare (e.g. ``"qwen2.5-coder:14b"``, Ollama's own naming) --
+    a caller routing through Aider/LiteLLM must add the ``ollama_chat/`` prefix
+    itself (see ``_normalise_ollama_model``). Best-effort: returns ``[]`` on
+    any failure (Ollama not running, unreachable *base_url*, timeout) rather
+    than raising -- callers such as the init wizard (TICK-645) must fall back
+    to a hardcoded suggestion when this comes back empty.
+    """
+    target = _ollama_target(base_url)
+    if target is None:
+        return []
+    data = _ollama_json_request(target, "GET", "/api/tags", timeout_secs)
+    models = data.get("models") if data else None
+    if not isinstance(models, list):
+        return []
+    names: list[str] = []
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or entry.get("model")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
 def discover_ollama_context_length(
     base_url: str, model: str, timeout_secs: int = 5
 ) -> int | None:
@@ -1135,6 +1227,7 @@ def _check_aider_context_budget(
     worktree_path: Path | None = None,
     executor: str | None = None,
     cfg: dict | None = None,
+    context_tiers_active: bool = False,
 ) -> None:
     """Fail before launching Aider when its configured input budget is exceeded.
 
@@ -1149,6 +1242,21 @@ def _check_aider_context_budget(
     and does not affect enforcement.
     """
     budget = executor_cfg.get("context_window_tokens")
+    # Apply per-model override from model_settings if present.  model is the
+    # post-context_tiers-escalated model name.  executor_cfg is already the
+    # fully-resolved instance dict (from get_executor_config), so model_settings
+    # is a direct key — do not re-index cfg["executors"]["aider"] which would
+    # silently miss named executor instances (e.g. {"aider-local": {type: aider}}).
+    #
+    # Skip this when context_tiers just picked the tier for this exact
+    # request: context_tiers already set executor_cfg["context_window_tokens"]
+    # to the tier's own tokens value specifically because it fits the estimated
+    # request, so re-overriding it from a static per-model setting would either
+    # spuriously reject a request the tier system just proved fits, or silently
+    # widen/narrow the enforced budget away from the tier that was selected.
+    if model and not context_tiers_active:
+        _model_override = (executor_cfg.get("model_settings") or {}).get(model, {})
+        budget = _model_override.get("context_window_tokens", budget)
     if budget is None:
         return
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
@@ -1314,6 +1422,7 @@ def build_executor_cmd(
         prompt = _neutralize_aider_file_mentions(prompt, set(touches or []), worktree_path)
 
         context_tiers = executor_cfg.get("context_tiers")
+        _context_tiers_active = False
         if context_tiers:
             estimated_tokens = _estimate_aider_request_tokens(prompt, touches, worktree_path)
             selected_tier = None
@@ -1325,6 +1434,7 @@ def build_executor_cmd(
             if selected_tier is not None:
                 model = selected_tier["model"]
                 executor_cfg["context_window_tokens"] = selected_tier["tokens"]
+                _context_tiers_active = True
             else:
                 max_tier_tokens = max((t.get("tokens", 0) for t in context_tiers), default=0)
                 raise ConfigError(
@@ -1333,6 +1443,27 @@ def build_executor_cmd(
                     "Route to a larger executor."
                 )
 
+        # An Ollama-backed aider route with no model resolved for this step
+        # is not "use aider's own default" the way it is for aider's actual
+        # default (cloud) provider -- aider's own default, with no --model
+        # and no cloud API key present, is an interactive OpenRouter
+        # browser-auth flow. In a non-interactive dispatch that flow can't
+        # complete; it sits for several minutes waiting on a login that will
+        # never happen and then exits non-zero, which a caller like
+        # run_drift_check has no way to distinguish from a genuine failed
+        # verification -- it just reports the step failed and escalates.
+        # Fail immediately instead, with a config fix instead of a hang.
+        if model is None and _aider_provider(executor, cfg, executor_cfg) == "ollama":
+            instance = executor_cfg.get("instance", executor)
+            raise ConfigError(
+                f"aider executor '{instance}' declares provider 'ollama' but no model "
+                "resolved for this step -- with no --model flag, aider falls back to its "
+                "own default, which is an interactive OpenRouter browser-auth flow, not "
+                "your local Ollama instance. That hangs (then fails) in a non-interactive "
+                "dispatch instead of erroring cleanly. Set models.<step> (or "
+                "executors.<name>.models.<step>) explicitly for every step this executor "
+                "handles -- analyze, implement, review, fix, and drift_check."
+            )
         model_flags = ["--model", model] if model else []
         # ``lazy_context`` existed before repo-map dispatch was implemented:
         # it made the preflight estimate lean, so it must select the same
@@ -1362,6 +1493,16 @@ def build_executor_cmd(
         edit_format = executor_cfg.get("edit_format")
         if edit_format is not None and (not isinstance(edit_format, str) or not edit_format):
             raise ConfigError("executors.aider.edit_format must be a non-empty string")
+        # Apply per-model edit_format override from model_settings.  model here
+        # is the post-context_tiers-escalated model name (set earlier in this
+        # function).  executor_cfg is already the fully-resolved instance dict
+        # (from get_executor_config), so model_settings is a direct key — do
+        # not re-index cfg["executors"]["aider"] which would silently miss named
+        # executor instances (e.g. {"aider-local": {type: aider}}).
+        # Only override when not read_only — read_only forces "ask" below regardless.
+        if model and not read_only:
+            _ef_override = (executor_cfg.get("model_settings") or {}).get(model, {})
+            edit_format = _ef_override.get("edit_format", edit_format)
         # A read-only call (analyze) never edits or commits -- --dry-run
         # already guarantees that -- so force aider's own "ask" coder
         # regardless of any configured edit_format. Without this, aider
@@ -1381,7 +1522,8 @@ def build_executor_cmd(
         # added to the chat at runtime regardless of whether they were passed
         # positionally. The map-tokens flag only bounds the repo map, not this.
         _check_aider_context_budget(
-            prompt, touches, executor_cfg, model, worktree_path=worktree_path, executor=executor, cfg=cfg
+            prompt, touches, executor_cfg, model, worktree_path=worktree_path, executor=executor, cfg=cfg,
+            context_tiers_active=_context_tiers_active,
         )
         # --dry-run: aider's own edit/commit capability (--yes-always included)
         # must not run at analyze time, before any worktree exists -- this is

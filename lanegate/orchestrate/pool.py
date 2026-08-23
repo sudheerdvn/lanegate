@@ -27,6 +27,7 @@ from lanegate.config import (
 from lanegate.executor import (
     _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
+    executor_types_with,
     get_executor_config,
     parse_structured_result,
     reject_ollama_for_code_step,
@@ -871,7 +872,7 @@ def invoke_executor(
         step_max_turns = _get_step_budget_cap(cfg, step, "max_turns")
         step_max_tokens = _get_step_budget_cap(cfg, step, "max_cumulative_tokens")
         prompt_stdin = None
-        if executor_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"}):
+        if executor_type in executor_types_with("stdin_capable"):
             cmd = build_executor_cmd(
                 executor, prompt, command_cfg, model=model, touches=touches,
                 analyze_session_id=resume_session_id,
@@ -1097,7 +1098,7 @@ def invoke_executor(
     # Output quietness alone is not a liveness signal. A fresh heartbeat keeps
     # a live executor past the short idle threshold; only a much longer lack
     # of parsed progress triggers the semantic stall cutoff.
-    streaming_capable = executor_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex"})
+    streaming_capable = executor_type in executor_types_with("streaming_capable")
     stream_kwargs = (
         {
             "idle_timeout": float(cfg.get("executor_idle_timeout_seconds", 75)),

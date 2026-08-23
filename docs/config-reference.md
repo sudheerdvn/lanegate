@@ -30,7 +30,7 @@ Set `commit_status_changes: false` in `.lanegate.yml` to opt back into fully zer
 | `safeguards` | `{}` | Optional pre-complete / pre-merge verification commands |
 | `max_turns` | `null` | Optional executor turn cap; see [Dispatch budget caps](#dispatch-budget-caps) |
 | `max_cumulative_tokens` | `null` | Optional executor token cap; see [Dispatch budget caps](#dispatch-budget-caps) |
-| `max_auto_fix_attempts` | `1` | Fix → drift-check → re-review cycles run when a review returns `changes_requested`, see [Auto-fix attempts](#auto-fix-attempts) |
+| `max_auto_fix_attempts` | `1` (`2` if the init wizard detects a local Ollama executor) | Fix → drift-check → re-review cycles run when a review returns `changes_requested`, see [Auto-fix attempts](#auto-fix-attempts) |
 | `on_rate_limit` | `resume` | `halt` or `resume`, see [Rate limits and auto-resume](#rate-limits-and-auto-resume) |
 | `notify.ntfy_topic` | `null` | ntfy.sh topic for phone alerts, see [Phone alerts for stuck runs](#phone-alerts-for-stuck-runs-notify-watch) |
 | `notify.poll_seconds` | `60` | How often `notify-watch` checks state |
@@ -499,6 +499,7 @@ choose (`claude-1`, `claude-2`, `local-ollama`, ...). Fields:
 | `max_parallel` | no | Per-instance concurrency cap, same precedence rules as the legacy per-type `executors:` block below. |
 | `provider` | no | Explicit backing route for provider-specific safeguards. For an Aider route backed by Ollama, use `provider: ollama`. |
 | `context_window_tokens` | no | Usable input-context budget for an Aider route. Required to enable its context preflight. See [Context window tokens](executor-capabilities.md#context-window-tokens). |
+| `model_settings` | no | Aider only. Per-model override of `context_window_tokens`/`edit_format`, keyed by the literal model string dispatched for this instance. Falls back to this instance's flat `context_window_tokens`/`edit_format` for any model without an entry. See [Per-model settings overrides](executor-capabilities.md#per-model-settings-overrides-model_settings). |
 | `print_timeout_seconds` | no | Timeout in seconds for executor print/run execution commands (overrides root `print_timeout_seconds`). |
 | `neutralize_touches` | no | Boolean (default `false`). When `true`, suppresses eager positional arguments for touched files during Aider initialization. |
 
@@ -675,6 +676,19 @@ every review escalates to a human `needs_review` state instead. Combined
 mode's self-review path only actually runs when `review_fallback:
 same_model` is set (or an explicit same-executor `reviewer:`/`steps.review`
 pin is configured).
+
+A same-tool setup (`executor: aider`, `reviewer: aider`) with genuinely
+different `models.implement`/`models.review` is real independent review
+(rung 2), but the ladder only *tries* rung 2 when `review_fallback` is
+explicitly `different_model` (or `same_model`) — left at the `needs_review`
+default, that setup still escalates to a human on every ticket instead of
+using the independent-model review it actually has available.
+`lanegate init`'s wizard sets `review_fallback: different_model`
+automatically when it detects exactly this shape at setup time, but a
+`.lanegate.yml` authored outside the wizard (hand-written, templated, or from
+`lanegate init --defaults`) does not get this inferred for it — set
+`review_fallback: different_model` explicitly if your config matches this
+shape.
 
 ### `profile`
 
@@ -880,7 +894,7 @@ The `_is_combined_mode(cfg, ticket)` predicate in `lanegate/orchestrate/autofix.
 ## Auto-fix attempts
 
 ```yaml
-max_auto_fix_attempts: 1   # default
+max_auto_fix_attempts: 1   # default (2 for a local-Ollama setup; see init wizard)
 ```
 
 When `lanegate review` returns `changes_requested`, LaneGate runs up to this many **fix → drift-check → re-review** cycles per continuation pass. The default of `1` means each pass has one re-review.

@@ -2411,6 +2411,98 @@ class TestRunFixAgentExcludesReviewer:
 
         mock_invoke.assert_not_called()
 
+    def test_run_fix_agent_allows_same_executor_different_model(self, tmp_path):
+        """TICK-652: a single-executor project (no ``pools:`` block) whose
+        fix step resolves to a different model than the one recorded for
+        review is independent by model, not just by executor identity --
+        it must dispatch instead of refusing (mirrors
+        resolve_independent_review_driver's "different-model" rung)."""
+        from lanegate.orchestrate.autofix import run_fix_agent
+
+        ticket = {
+            "id": "TICK-004",
+            "title": "Refactor",
+            "close_criteria": "Passes.",
+            "review_driver": "aider",
+            "review_model": "qwen-27b",
+            "model": "qwen-30b-coder",
+        }
+        cfg = {"executor": "aider"}
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py"),
+            patch("lanegate.reviewer.build_fix_prompt", return_value="fix prompt"),
+            patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="aider"),
+            patch(
+                "lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")
+            ) as mock_invoke,
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True),
+            patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-after"),
+        ):
+            result = run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
+
+        assert result is True
+        assert mock_invoke.call_args.kwargs["executor_override"] == "aider"
+
+
+class TestResolveIndependentFixDriver:
+    """TICK-652: resolve_independent_fix_driver is the fix-side counterpart
+    of review.resolve_independent_review_driver."""
+
+    def test_different_pool_instance_is_independent(self, tmp_path):
+        from lanegate.orchestrate.autofix import resolve_independent_fix_driver
+
+        ticket = {"id": "TICK-100", "review_driver": "claude-b"}
+        cfg = _default_cfg(tmp_path)
+        cfg["default_pool"] = "pool1"
+        cfg["pools"] = {"pool1": {"executors": ["claude-a", "claude-b"]}}
+
+        driver, independence = resolve_independent_fix_driver(ticket, cfg, tmp_path)
+
+        assert (driver, independence) == ("claude-a", "independent")
+
+    def test_same_executor_different_model_is_different_model(self, tmp_path):
+        from lanegate.orchestrate.autofix import resolve_independent_fix_driver
+
+        ticket = {"id": "TICK-004", "review_driver": "aider", "review_model": "qwen-27b", "model": "qwen-30b-coder"}
+        cfg = {"executor": "aider"}
+
+        with patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="aider"):
+            driver, independence = resolve_independent_fix_driver(ticket, cfg, tmp_path)
+
+        assert (driver, independence) == ("aider", "different-model")
+
+    def test_same_executor_same_model_needs_review(self, tmp_path):
+        from lanegate.orchestrate.autofix import resolve_independent_fix_driver
+
+        ticket = {"id": "TICK-050", "review_driver": "codex"}
+        cfg = {"executor": "codex"}
+
+        with patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"):
+            driver, independence = resolve_independent_fix_driver(ticket, cfg, tmp_path)
+
+        assert (driver, independence) == (None, "needs_review")
+
+    def test_driver_alias_model_override_is_not_different_model(self, tmp_path):
+        """A `drivers:` alias with its own `model:` forces that model for
+        every step (resolve_dispatch, pool.py) -- so it must be compared
+        against the *driver's* forced model, not the base cfg's own
+        per-step default, or a same-model self-fix slips through as
+        "different-model"."""
+        from lanegate.orchestrate.autofix import resolve_independent_fix_driver
+
+        ticket = {"id": "TICK-004", "review_driver": "reviewer-x", "review_model": "gpt-4o"}
+        cfg = {
+            "executor": "codex",
+            "drivers": {"reviewer-x": {"type": "codex", "model": "gpt-4o"}},
+            "models": {"fix": "gpt-4-turbo"},
+        }
+
+        with patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="reviewer-x"):
+            driver, independence = resolve_independent_fix_driver(ticket, cfg, tmp_path)
+
+        assert (driver, independence) == (None, "needs_review")
+
 
 class TestRunAutoFixCycleDriftStructuredResult:
     """TICK-348: the drift verdict is a structured, machine-readable

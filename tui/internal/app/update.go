@@ -386,7 +386,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // Run screen's live raw-log stream is stopped when leaving it, since it is
 // the only screen with a standing connection; entering it resets the
 // Activity/Raw Audit Log focus back to the default (live run, Activity
-// mode) rather than persisting whatever was selected last visit.
+// mode) rather than persisting whatever was selected last visit. Leaving
+// the History screen for anywhere else similarly closes any open history
+// detail — otherwise a later number-key jump back into History (bypassing
+// the "esc" handler that normally closes detail) reopens the same stale
+// detail view instead of the run list.
 func (m *Model) switchScreen(target screenID) tea.Cmd {
 	m.helpVisible = false
 	if target != m.screen {
@@ -398,6 +402,11 @@ func (m *Model) switchScreen(target screenID) tea.Cmd {
 		if target == screenRun {
 			m.run.SetMode(screens.RunModeActivity)
 			m.runActivityWant = ""
+		}
+		if m.screen == screenHistory && m.run.IsHistoryDetail() {
+			m.run.CloseHistoryDetail()
+			m.runActivityWant = ""
+			m.scrollOffsets[screenHistory] = 0
 		}
 		m.previousScreen = m.screen
 		m.screen = target

@@ -1709,6 +1709,20 @@ def is_paired_test_file(committed_file: str, allowed: set[str]) -> bool:
     return any(PurePosixPath(a).stem == module_name for a in allowed)
 
 
+def is_lanegate_notes_file(committed_file: str) -> bool:
+    """True if committed_file is a durable implementation note under .lanegate/notes/.
+
+    Every implement prompt instructs agents to record project-wide facts in
+    .lanegate/notes/global.md and per-file facts in .lanegate/notes/v2/<encoded_path>.md
+    (or the legacy flat .lanegate/notes/<encoded_path>.md). Since lanegate itself
+    mandates this side-channel for every ticket, writing to it is expected, not
+    scope drift -- treat it the same way is_paired_test_file() treats a module's
+    own test file: exempt from touches-compliance checks regardless of whether
+    it was declared.
+    """
+    return PurePosixPath(committed_file).parts[:2] == (".lanegate", "notes")
+
+
 def display_order(tickets: list[dict]) -> list[dict]:
     """Return tickets sorted by the standard status display order, then priority."""
     order_map = {s: i for i, s in enumerate(_STANDARD_STATUSES)}

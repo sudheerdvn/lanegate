@@ -22,8 +22,8 @@ from lanegate.config import (
 )
 from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.executor import (
-    _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
+    executor_types_with,
     get_executor_config,
     parse_structured_result,
     reject_ollama_for_code_step,
@@ -38,6 +38,7 @@ from .pool import (
     _get_step_budget_cap,
     _resolve_drift_driver_name,
     _resolve_driver_route,
+    _ticket_for_model_resolution,
     _unpack_stream_result,
     capture_review_step_run,
     commit_worktree_changes,
@@ -69,6 +70,76 @@ class FixFailedError(Exception):
     The auto-fix loop should consume an attempt slot and escalate if the cap
     is reached.
     """
+
+
+def resolve_independent_fix_driver(
+    ticket: dict,
+    cfg: dict,
+    repo_root: Path,
+    *,
+    pool_name: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve the fix driver, excluding the reviewer where possible.
+
+    Mirrors ``resolve_independent_review_driver``'s ladder (review.py) for
+    the fix step, minus its ``same_model`` fallback rung -- there is no
+    config equivalent of ``review_fallback`` for fix, so genuine
+    non-independence always means "refuse to dispatch", never "proceed
+    anyway on the same model".
+
+      1. ``independent``     -- a different pool instance was selected.
+      2. ``different-model`` -- the reviewer is the only pool candidate, but
+         a different model resolves for the fix step than the one actually
+         used for review.
+      3. ``needs_review``    -- independence could not be established; the
+         caller must refuse to dispatch.
+
+    When the ticket has no recorded ``review_driver`` at all (e.g. called
+    outside the normal review-then-fix cycle), there is nothing to exclude
+    and whatever ``resolve_pool_executor`` resolves is used as-is.
+    """
+    from lanegate.orchestrate.loop import resolve_pool_executor
+
+    review_driver = ticket.get("review_driver")
+    excluded = {review_driver} if review_driver else set()
+    fix_executor = resolve_pool_executor(
+        "fix", ticket, cfg, repo_root, excluded=excluded, pool_name=pool_name
+    )
+    if review_driver is None:
+        return fix_executor, "independent"
+    if fix_executor is not None and fix_executor not in excluded:
+        return fix_executor, "independent"
+
+    # No distinct pool instance is available -- the reviewer is the only
+    # candidate left. See whether a different *model* resolves for the fix
+    # step than the one actually recorded for review (e.g. a per-ticket
+    # `model:` override, or per-step `models:` config on a single-executor
+    # project -- the TICK-004 shape this ladder exists for).
+    #
+    # This must resolve fix_model exactly as invoke_executor's resolve_dispatch
+    # will when it actually dispatches with executor_override=review_driver: a
+    # `drivers:` entry can carry its own `model:` override that forces that
+    # model for every step regardless of the base cfg's own per-step model, so
+    # evaluating against plain `cfg` here would compare against a model that
+    # is never actually used and let a same-model self-fix through.
+    driver_cfg = expand_driver(review_driver, cfg)
+    fix_driver_type = driver_cfg.get("type", review_driver)
+    fix_executor_cfg = get_executor_config(fix_driver_type, cfg)
+    fix_executor_type = fix_executor_cfg.get("type", fix_driver_type)
+    effective_cfg = (
+        dict(cfg, executor=fix_driver_type)
+        if fix_driver_type != cfg.get("executor")
+        else cfg
+    )
+    model_ticket = _ticket_for_model_resolution(ticket, fix_executor_type)
+    review_model = ticket.get("review_model")
+    fix_model = driver_cfg.get("model") or resolve_model(
+        effective_cfg, "fix", ticket=model_ticket
+    )
+    if review_model and fix_model and review_model != fix_model:
+        return review_driver, "different-model"
+
+    return None, "needs_review"
 
 
 def run_fix_agent(
@@ -128,21 +199,27 @@ def run_fix_agent(
     )
 
     # The reviewer that recorded the findings being fixed must never also be
-    # the one fixing them — a reviewer fixing its own findings has no
-    # independent check (one step earlier in the cycle).
-    from lanegate.orchestrate.loop import resolve_pool_executor
-
-    excluded = {ticket["review_driver"]} if ticket.get("review_driver") else set()
-    fix_executor = resolve_pool_executor(
-        "fix", ticket, cfg, repo_root, excluded=excluded, pool_name=pool_name
+    # the one fixing them with no independent check one step earlier in the
+    # cycle -- unless a different *model* resolves for the fix step than the
+    # one actually used for review, which is independence too (mirrors
+    # resolve_independent_review_driver's "different-model" rung).
+    fix_executor, fix_independence = resolve_independent_fix_driver(
+        ticket, cfg, repo_root, pool_name=pool_name
     )
-    if excluded and (fix_executor is None or fix_executor in excluded):
+    if fix_independence == "needs_review":
         print(
             f"WARNING: no independent fix executor is available for {tid}; "
             "refusing to dispatch the reviewer to fix its own findings",
             file=sys.stderr,
         )
         raise FixFailedError(f"no independent fix executor available for {tid}")
+    if fix_independence == "different-model":
+        print(
+            f"[autofix] {tid}: {fix_executor!r} implemented the review this ticket is "
+            "fixing findings from, but a different model resolves for the fix step -- "
+            "proceeding on that model instead of refusing dispatch.",
+            file=sys.stderr,
+        )
 
     exit_code, captured_stdout, captured_stderr = invoke_executor(
         ticket,
@@ -857,13 +934,13 @@ def run_drift_check(
                     f"[orchestrate] {tid}: not resuming session for drift_check — {reason}",
                     file=sys.stderr,
                 )
-        stdin_capable = resolved_drift_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"})
+        stdin_capable = resolved_drift_type in executor_types_with("stdin_capable")
         # Agy's JSON mode is completion-only, so it needs a flat timeout
         # rather than output-idle detection.
         # Drift checks have no worker heartbeat monitor. Codex's JSON output
         # can be quiet while it works, so use the hard ceiling instead of an
         # output-idle kill for that executor type.
-        streaming_capable = resolved_drift_type in _CLAUDE_SUBPROCESS_TYPES
+        streaming_capable = resolved_drift_type in executor_types_with("streaming_capable_without_heartbeat")
         step_max_turns = _get_step_budget_cap(cfg, "drift_check", "max_turns")
         step_max_tokens = _get_step_budget_cap(cfg, "drift_check", "max_cumulative_tokens")
         meter = (

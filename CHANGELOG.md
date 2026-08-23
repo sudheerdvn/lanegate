@@ -4,6 +4,19 @@ All notable changes to LaneGate are logged here. Dates are the day a change merg
 
 ## Unreleased
 
+## v1.1.1 (2026-08-23): small fixes and reliability follow-ups
+
+- `interactive_init()` refactored into named sub-steps for readability; prompt order, text, defaults, and validation behavior are unchanged.
+- Review verdict JSON extraction is now resilient to unescaped interior quotes in the model's response, instead of failing to parse a well-formed verdict.
+- Aider executor now supports per-model `context_window_tokens`/`edit_format` overrides.
+- `.lanegate/notes/` writes are exempted from touches-drift blocking, so agents can update cross-ticket notes without tripping the drift check.
+- Fix-dispatch's independence check now allows same-executor-different-model, matching the review path's existing behavior.
+- `tui.py`'s `api_proc` teardown now kills the whole process group instead of just the PID, so child processes don't leak on exit.
+- An aider executor routed to a local Ollama model with no model resolved for the current step (analyze/implement/fix/review/drift_check) now fails immediately with a config error instead of silently falling back to aider's own default — an interactive OpenRouter browser-auth flow that hangs for several minutes in a non-interactive dispatch and then fails, indistinguishable to the caller from a genuine step failure.
+- The review, fix, and drift-check prompts' diff payload is now truncated at file boundaries when it exceeds the step's size budget, instead of a plain byte-offset clip that could sever a diff mid-file. A file that gets cut is now omitted whole (never partially shown) and named in an explicit note in the prompt, so a reviewer can't mistake "this file was cut from what I was shown" for "this file has no changes" — previously a large multi-file diff could silently drop the exact file a fix landed in from a re-review with no signal anything was missing.
+- `lanegate init`'s model-selection wizard now also prompts for `models.fix` and `models.drift_check`, matching the existing analyze/implement/review prompts — these two steps were previously left unconfigured by a fresh `init`, which is what let the local-Ollama drift-check hang above go unnoticed until it actually happened.
+- A local-Ollama aider setup detected during `init` now defaults `max_auto_fix_attempts` to 2 instead of the cloud-oriented default of 1, since a local model's auto-fix retries have no per-call cost the way a cloud API's do.
+
 ## v1.1.0 (2026-08-19): model-validation hardening, security fixes, review/merge reliability
 
 - Model validation now catches a cross-vendor model string leaking to the wrong executor

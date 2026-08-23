@@ -2135,6 +2135,112 @@ from lanegate.orchestrate import (  # noqa: E402
     _queue_code_complete_reviews,
     _scan_injection_signals,
 )
+from lanegate.orchestrate.loop import recover_scope_only_needs_review_tickets  # noqa: E402
+
+
+class TestRecoverScopeOnlyNeedsReviewNotesExemption:
+    """TICK-651: .lanegate/notes/ writes are exempt from scope-drift, including
+    in the auto_claim_touches recovery path (recover_scope_only_needs_review_tickets)."""
+
+    def test_notes_only_drift_is_not_auto_claimed(self, tmp_path, capsys):
+        """A ticket hibernated only over an (exempt) notes file is skipped for
+        recovery rather than having the notes file auto-claimed into touches —
+        the live diff no longer matches the recorded scope-drift reason once
+        the notes file is filtered out, so auto-claim correctly defers instead
+        of re-declaring a file the exemption says shouldn't need declaring."""
+        cfg = _default_cfg(tmp_path)
+        cfg["auto_claim_touches"] = True
+        tickets_dir = Path(cfg["tickets_dir"])
+        wt = tmp_path / "worktrees" / "tick-900"
+        wt.mkdir(parents=True)
+        (tickets_dir / "TICK-900.md").write_text(
+            "---\n"
+            "id: TICK-900\n"
+            "title: Test TICK-900\n"
+            "status: needs_review\n"
+            "priority: 1\n"
+            "parallel_safe: true\n"
+            "touches:\n  - a.py\n"
+            f"worktree: {wt}\n"
+            "close_criteria: All tests pass.\n"
+            "---\n"
+            "Body.\n\n"
+            "## Needs Review Reason\n"
+            "committed files outside touches list: .lanegate/notes/global.md\n"
+        )
+
+        with patch(
+            "lanegate.orchestrate.loop._committed_files",
+            return_value={"a.py", ".lanegate/notes/global.md"},
+        ):
+            recovered = recover_scope_only_needs_review_tickets(cfg, tmp_path)
+
+        assert recovered == []
+        err = capsys.readouterr().err
+        assert "scope recovery skipped" in err
+
+
+class TestPreCompleteGuardNotesExemption:
+    """TICK-651: Pre-complete touched-files guard (loop.py:3473) exempts .lanegate/notes/ writes."""
+
+    def test_pre_complete_guard_exempts_notes_files(self, tmp_path, capsys):
+        """Pre-complete guard permits committed notes files without pausing ticket."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        (tmp_path / "worktrees" / "tick-001").mkdir(parents=True)
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+        def fake_invoke_combined(ticket, cfg_, wt_, *, log_stream=None, terminal_stream=None, prompt_override=None, repo_root=None, executor_override=None):
+            p = tickets_dir / f"{ticket['id']}.md"
+            text = p.read_text().replace(
+                "status: open", "status: in_review\nreview_verdict: approved"
+            )
+            p.write_text(text)
+            return (0, "", "")
+
+        with (
+            patch("lanegate.lifecycle.cmd_start"),
+            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._committed_files", return_value={"a.py", ".lanegate/notes/global.md"}),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        captured = capsys.readouterr()
+        assert "committed files outside touches list" not in captured.err
+
+    def test_pre_complete_guard_blocks_real_undeclared_files(self, tmp_path, capsys):
+        """Pre-complete guard still pauses tickets that have real undeclared files alongside notes."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        (tmp_path / "worktrees" / "tick-001").mkdir(parents=True)
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+        def fake_invoke_combined(ticket, cfg_, wt_, *, log_stream=None, terminal_stream=None, prompt_override=None, repo_root=None, executor_override=None):
+            p = tickets_dir / f"{ticket['id']}.md"
+            text = p.read_text().replace(
+                "status: open", "status: in_review\nreview_verdict: approved"
+            )
+            p.write_text(text)
+            return (0, "", "")
+
+        with (
+            patch("lanegate.lifecycle.cmd_start"),
+            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._committed_files", return_value={"a.py", ".lanegate/notes/global.md", "other.py"}),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        captured = capsys.readouterr()
+        assert "committed files outside touches list: other.py" in captured.err
+
 
 
 class TestAnalyzeDrafts:
@@ -2223,6 +2329,38 @@ class TestAnalyzeDrafts:
         assert "TICK-002" in analyzed
         captured = capsys.readouterr()
         assert "WARNING" in captured.err
+
+    def test_failed_analyze_records_ticket_outcome_and_run_reports_failure(self, tmp_path):
+        """A swallowed analyze failure must still be a durable ticket_outcome
+        event so the run summary calls the run FAILURE instead of SUCCESS
+        (TICK-642) — otherwise a run that aborted on a real, unresolved
+        analyze error looks like a clean success everywhere but the raw log.
+        """
+        from lanegate.orchestrate.run_report import _append_run_event, build_run_summary
+        from lanegate.orchestrate.run_summary import RunReason
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_draft_ticket(tickets_dir, "TICK-001")
+        session_ts = "2026-08-22T00-00-00"
+
+        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
+            import sys as _sys
+
+            print("ERROR: model returned empty or non-list touches; ticket left as draft", file=_sys.stderr)
+            _sys.exit(1)
+
+        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid())
+        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
+            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir, session_ts=session_ts)
+        _append_run_event(tmp_path, session_ts, "run_end", status="completed")
+
+        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
+        assert summary.reason == RunReason.FAILURE
+        assert len(summary.batch_tickets) == 1
+        failed = summary.batch_tickets[0]
+        assert failed.ticket_id == "TICK-001"
+        assert "empty or non-list touches" in (failed.failure_reason or "")
 
     def test_analyze_drafts_skips_already_resolved_drafts(self, tmp_path):
         """_analyze_drafts must skip draft tickets that already have 'already resolved' in their body."""
@@ -2487,7 +2625,8 @@ class TestBoardClearingLoopAutoAnalyze:
         call_order = []
 
         def fake_analyze_drafts(
-            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None
+            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None,
+            session_ts=None,
         ):
             call_order.append("analyze_drafts")
 
@@ -2553,7 +2692,8 @@ class TestBoardClearingLoopAutoAnalyze:
         events: list[str] = []
 
         def fake_analyze_drafts(
-            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None
+            cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None,
+            session_ts=None,
         ):
             events.append("analyze_drafts")
 

@@ -62,13 +62,43 @@ executors:
     context_window_tokens: 32768
 ```
 
+#### Per-model settings overrides (`model_settings`)
+
+When multiple models are dispatched through the same `executors.aider` config (e.g. via `models:`, `context_tiers`, or pool dispatch), each model may have its own `context_window_tokens` and `edit_format` under an optional `model_settings` mapping. The key is the exact model string as it appears in `--model` (after any `context_tiers` escalation).
+
+**Lookup order:** `model_settings[dispatched-model-name]` → flat `executors.aider.*` default → absent (i.e. the flag is omitted from the aider CLI call). Partial overrides are fully supported: if a model's entry has only `context_window_tokens`, its `edit_format` still falls back to the flat default.
+
+**YAML shape:**
+
+```yaml
+executors:
+  aider:
+    edit_format: diff              # flat default, used when no per-model override matches
+    context_window_tokens: 65536   # flat default
+    model_settings:
+      'ollama_chat/gpt-oss:20b':
+        context_window_tokens: 131072   # this model's architecture context length
+        edit_format: whole              # avoid diff parser failures on thinking-capable models
+      'ollama_chat/qwen2.5-coder:14b':
+        context_window_tokens: 49152   # override only; edit_format falls back to "diff" above
+      'ollama_chat/smtek/Qwen3.8-27B:Q3_K_M-ctx32k':
+        context_window_tokens: 32768
+```
+
+Keys not present in a `model_settings` entry individually fall back to flat defaults — they do not inherit from other models' entries. Model names containing `/` or `:` (e.g. `ollama_chat/gpt-oss:20b`) are looked up as plain YAML string keys without any escaping requirement beyond quoting if needed by YAML syntax.
+
+**Validation:** `context_window_tokens` must be a positive integer; `edit_format` must be a non-empty string from the same valid set as the flat key (`whole`, `diff`, `diff-fenced`, `udiff`, `patch`, `editor-diff`, `editor-whole`). Unknown sub-keys are rejected at config load time. These constraints mirror those already enforced for the flat keys.
+
+**`context_tiers` interaction:** If `context_tiers` is configured, the model applied to the current dispatch is the post-escalation tier model (the one actually sent to aider). `model_settings` uses that escalated model name for the lookup, not the originally-configured step model. This means you can set per-model overrides for each tier model independently.
+
 **Auto-commit behavior:** Aider commits each accepted change to the current branch automatically. This is aider's native behavior and is not controlled by LaneGate. LaneGate inspects the committed diff after aider exits.
+
 
 **Sandbox status:** Aider runs as a host process under the invoking OS user. No container or kernel-level isolation is applied by LaneGate.
 
 **Recommended use:** Teams that prefer aider's direct git integration. Also useful in split mode: `executor_steps: {implement: aider, review: claude}` lets a fast code-generation tool implement while a higher-quality model reviews.
 
-**Known caveats:** Aider's repo map can be slow on large repositories. Providing an explicit `touches` list in the ticket file is strongly recommended to keep context focused and reduce latency, but Aider can still add repository and tool overhead. Use `context_window_tokens` for local routes with a finite model context. Small local models (e.g. qwen2.5-coder 7b/14b via Ollama) can unreliably narrate a fake self-verification step wrapped in code fences after a real edit, which either breaks aider's parser or gets misparsed as bogus filenames. That's a model/edit-format reliability issue, not a LaneGate integration gap. LaneGate's own safeguards (pre_complete/pre_merge tests, touches compliance) catch it without a false merge.
+**Known caveats:** Aider's repo map can be slow on large repositories. Providing an explicit `touches` list in the ticket file is strongly recommended to keep context focused and reduce latency, but Aider can still add repository and tool overhead. Use `context_window_tokens` for local routes with a finite model context. Small local models (e.g. qwen2.5-coder 7b/14b via Ollama) can unreliably narrate a fake self-verification step wrapped in code fences after a real edit, which either breaks aider's parser or gets misparsed as bogus filenames. That's a model/edit-format reliability issue, not a LaneGate integration gap. LaneGate's own safeguards (pre_complete/pre_merge tests, touches compliance) catch it without a false merge. Neither `edit_format` is universally safe for small local models: `whole` rewrites the entire file every turn and can truncate or hallucinate output past a few hundred lines, while `diff` avoids that but can get a malformed hunk from a small model instead — both failure modes are caught by the same pre_complete/pre_merge safeguards, not silently merged.
 
 ---
 

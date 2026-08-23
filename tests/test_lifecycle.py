@@ -3255,6 +3255,48 @@ def test_touches_compliance_paired_test_file_not_declared_passes(tmp_path):
         check_touches_compliance("TICK-201b", ticket, tmp_path)
 
 
+def test_touches_compliance_notes_file_new_not_declared_passes(tmp_path):
+    """A new file under .lanegate/notes/ is not scope drift, even though every
+    implement prompt writes there without the ticket declaring it in touches."""
+    ticket = {"id": "TICK-205", "touches": ["lanegate/lifecycle.py"]}
+    mock_run = _make_git_diff_mock(
+        committed_files=["lanegate/lifecycle.py", ".lanegate/notes/v2/lanegate_sexecutor.py.md"],
+    )
+    with patch("lanegate.lifecycle.subprocess.run", side_effect=mock_run):
+        # Must not raise
+        check_touches_compliance("TICK-205", ticket, tmp_path)
+
+
+def test_touches_compliance_notes_global_not_declared_passes(tmp_path):
+    """.lanegate/notes/global.md is not scope drift, same as any other notes file."""
+    ticket = {"id": "TICK-206", "touches": ["lanegate/lifecycle.py"]}
+    mock_run = _make_git_diff_mock(
+        committed_files=["lanegate/lifecycle.py", ".lanegate/notes/global.md"],
+    )
+    with patch("lanegate.lifecycle.subprocess.run", side_effect=mock_run):
+        # Must not raise
+        check_touches_compliance("TICK-206", ticket, tmp_path)
+
+
+def test_touches_compliance_notes_file_does_not_mask_other_undeclared_file(tmp_path, capsys):
+    """A notes file is exempt, but a genuinely undeclared file alongside it still blocks."""
+    ticket = {"id": "TICK-207", "touches": ["lanegate/lifecycle.py"]}
+    mock_run = _make_git_diff_mock(
+        committed_files=[
+            "lanegate/lifecycle.py",
+            ".lanegate/notes/global.md",
+            "lanegate/executor.py",
+        ],
+    )
+    with patch("lanegate.lifecycle.subprocess.run", side_effect=mock_run):
+        with pytest.raises(SystemExit) as exc_info:
+            check_touches_compliance("TICK-207", ticket, tmp_path)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "lanegate/executor.py" in err
+    assert ".lanegate/notes/global.md" not in err
+
+
 def test_touches_compliance_wildcard_skips_check(tmp_path):
     """touches: ['*'] bypasses the drift check entirely — no error even with unexpected files."""
     ticket = {"id": "TICK-202", "touches": ["*"]}

@@ -725,12 +725,72 @@ def compute_payload_composition_stats(
     from lanegate.executor import describe_implement_payload
     from lanegate.reviewer import describe_fix_payload, describe_review_payload
 
+    # Resolved once, not per ticket: identical for every ticket in this repo
+    # (same cfg, same repo_root), and resolving it is itself a git subprocess
+    # call -- recomputing it inside a per-ticket loop turns what used to be
+    # pure in-memory computation into up to 2N sequential git invocations.
+    from lanegate.config import resolve_trunk_branch
+
+    trunk_branch = resolve_trunk_branch(cfg or {}, root)
+
+    def _describe_review(t: dict) -> list[dict]:
+        # Resolve reviewer_type/diff the same way run_review_agent() does
+        # (TICK-644) so a project configured with reviewer: aider/ollama is
+        # audited against the actual inlined-diff prompt shape it dispatches,
+        # not the tool-capable default. Both are best-effort: a ticket with
+        # no worktree on disk (e.g. the synthetic sample ticket, or a closed
+        # ticket whose worktree was cleaned up) simply falls back to no diff.
+        #
+        # resolve_reviewer_driver_and_type() is the shared helper
+        # orchestrate/review.py exposes precisely so this audit doesn't carry
+        # its own copy of the driver/type resolution chain (pool-aware, via
+        # resolve_pool_executor -> resolve_driver, then the same two-stage
+        # expand_driver -> get_executor_config lookup run_review_agent()
+        # itself uses) -- a previous version of this fix reimplemented that
+        # chain inline and got it wrong (skipped pools:, wrong resolver for
+        # steps: routing) in ways review kept finding one at a time.
+        from lanegate.orchestrate.review import resolve_reviewer_driver_and_type
+        from lanegate.reviewer import get_worktree_diff
+        from lanegate.ticket import branch_name
+
+        try:
+            _driver_name, reviewer_type = resolve_reviewer_driver_and_type(t, cfg or {}, root)
+        except Exception:
+            # Best-effort like the diff fetch below: a malformed routing
+            # rule or unresolvable pool/driver reference for this one
+            # ticket must degrade to the tool-capable default (reviewer_type
+            # None), not raise out of _describe_review -- the outer
+            # per-ticket try/except in compute_payload_composition_stats
+            # would otherwise silently drop this ticket from the "review"
+            # step's stats entirely instead of describing it with a
+            # reasonable default.
+            reviewer_type = None
+        diff = None
+        try:
+            # ticket.get("worktree") first, matching run_review_agent()'s own
+            # resolution order (orchestrate/review.py) -- a ticket's recorded
+            # worktree path is not guaranteed to match the conventional
+            # <worktrees_dir>/<id> layout (custom location, non-default
+            # naming), and falling back to the convention unconditionally
+            # would silently audit the wrong (or a nonexistent) worktree.
+            if t.get("worktree"):
+                worktree_path = Path(t["worktree"])
+            else:
+                worktrees_dir = (cfg or {}).get("worktrees_dir", ".lanegate/worktrees")
+                worktree_path = root / worktrees_dir / t["id"].lower()
+            branch = t.get("branch") or branch_name(t["id"])
+            diff = get_worktree_diff(worktree_path, branch, base=trunk_branch)
+        except Exception:
+            diff = None
+        return describe_review_payload(
+            t, commit_messages="", project_root=root, cfg=cfg,
+            reviewer_type=reviewer_type, diff=diff,
+        )
+
     step_funcs = {
         "analyze": lambda t: describe_analyze_payload(t, root, cfg),
         "implement": lambda t: describe_implement_payload(t, root, cfg),
-        "review": lambda t: describe_review_payload(
-            t, commit_messages="", project_root=root, cfg=cfg
-        ),
+        "review": _describe_review,
         "fix": lambda t: describe_fix_payload(t, diff="", findings="", project_root=root, cfg=cfg),
     }
 

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from lanegate.config import load_config, resolve_trunk_branch
-from lanegate.ticket import is_paired_test_file
+from lanegate.ticket import is_lanegate_notes_file, is_paired_test_file
 
 
 def _trunk_branch(worktree_path: Path, trunk_branch: str | None = None) -> str:
@@ -134,6 +134,9 @@ def check_touches_compliance(
     # TICK-245: a changed file that's the natural paired test file for an
     # already-declared module is not scope drift.
     undeclared = {f for f in undeclared if not is_paired_test_file(f, declared)}
+    # Durable implementation notes under .lanegate/notes/ are a lanegate-mandated
+    # side-channel every implement prompt writes to -- not scope drift.
+    undeclared = {f for f in undeclared if not is_lanegate_notes_file(f)}
 
     if not undeclared:
         return

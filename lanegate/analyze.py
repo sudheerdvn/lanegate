@@ -610,6 +610,7 @@ def _call_model(
     from lanegate.executor import (
         _CLAUDE_SUBPROCESS_TYPES,
         build_executor_cmd,
+        executor_types_with,
         get_executor_config,
         parse_structured_result,
         resolve_executor_env,
@@ -624,7 +625,7 @@ def _call_model(
     executor_env = _build_env(effective_driver_cfg, base_env=executor_env)
     resolved_executor_type = resolved_executor_cfg.get("type", executor)
 
-    use_stdin = resolved_executor_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"})
+    use_stdin = resolved_executor_type in executor_types_with("stdin_capable")
     # Analyze must stay read-only: the prompt carries candidate-file skeletons
     # (see _build_prompt) so touches/change_notes precision doesn't depend on
     # the model reading real files itself, and denying edit capability here

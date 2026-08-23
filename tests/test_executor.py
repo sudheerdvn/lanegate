@@ -857,7 +857,7 @@ def test_check_aider_context_budget_neutralize_touches_still_counts_touch_sizes(
 def test_aider_ollama_unconfigured_warning(capsys):
     cfg = {"executors": {"aider": {"provider": "ollama", "flags": ["--no-gitignore"]}}}
 
-    build_executor_cmd("aider", "implement TICK-299", cfg)
+    build_executor_cmd("aider", "implement TICK-299", cfg, model="ollama_chat/qwen2.5-coder:14b")
 
     warning = capsys.readouterr().err
     assert warning.count("warning:") == 1
@@ -872,7 +872,9 @@ def test_aider_ollama_unconfigured_warning_named_driver(capsys):
         "executors": {"local-aider": {"type": "aider", "flags": ["--no-gitignore"]}},
     }
 
-    build_executor_cmd("local-aider", "implement TICK-299", cfg)
+    build_executor_cmd(
+        "local-aider", "implement TICK-299", cfg, model="ollama_chat/qwen2.5-coder:14b"
+    )
 
     warning = capsys.readouterr().err
     assert warning.count("warning:") == 1
@@ -891,9 +893,32 @@ def test_aider_ollama_configured_no_warning(capsys):
         }
     }
 
-    build_executor_cmd("aider", "implement TICK-299", cfg)
+    build_executor_cmd("aider", "implement TICK-299", cfg, model="ollama_chat/qwen2.5-coder:14b")
 
     assert capsys.readouterr().err == ""
+
+
+def test_aider_ollama_no_model_fails_closed():
+    # Regression: with no model resolved, aider's own fallback is an
+    # interactive OpenRouter browser-auth flow, not the local Ollama
+    # instance provider: ollama declares. That flow can't complete in a
+    # non-interactive dispatch -- it hangs for several minutes and then
+    # fails, indistinguishable from a genuine step failure to the caller.
+    # This must fail immediately and closed instead.
+    cfg = {"executors": {"aider": {"provider": "ollama", "flags": ["--no-gitignore"]}}}
+
+    with pytest.raises(ConfigError, match="no model resolved for this step"):
+        build_executor_cmd("aider", "implement TICK-299", cfg)
+
+
+def test_aider_ollama_no_model_fails_closed_named_driver():
+    cfg = {
+        "drivers": {"local-aider": {"type": "aider", "provider": "ollama"}},
+        "executors": {"local-aider": {"type": "aider", "flags": ["--no-gitignore"]}},
+    }
+
+    with pytest.raises(ConfigError, match="no model resolved for this step"):
+        build_executor_cmd("local-aider", "implement TICK-299", cfg)
 
 
 def test_aider_no_provider_declared_no_warning(capsys):
@@ -1587,6 +1612,89 @@ def test_ollama_context_discovery_fallback_to_api_show():
     assert json.loads(connection.request.call_args_list[1].kwargs["body"].decode()) == {"model": "qwen2.5-coder:14b"}
 
 
+# --- discover_ollama_models tests ---
+# Every other reference to this function across the test suite mocks it away
+# entirely; these exercise its own GET /api/tags response parsing directly
+# (name-vs-model fallback precedence, non-dict entries, a non-list `models`
+# value) so a parsing bug doesn't ship silently -- the init wizard's picker
+# swallows any exception and falls back to [], indistinguishable from
+# "Ollama not running" in the UI.
+
+
+def test_discover_ollama_models_parses_name_field():
+    from lanegate.executor import discover_ollama_models
+
+    connection = mock.Mock()
+    response = mock.Mock(status=200)
+    response.read.return_value = json.dumps({
+        "models": [{"name": "qwen2.5-coder:14b"}, {"name": "qwen3-coder:30b"}]
+    }).encode()
+    connection.getresponse.return_value = response
+    with mock.patch("lanegate.executor.http.client.HTTPConnection", return_value=connection):
+        names = discover_ollama_models("http://localhost:11434")
+
+    assert names == ["qwen2.5-coder:14b", "qwen3-coder:30b"]
+
+
+def test_discover_ollama_models_falls_back_to_model_field():
+    """Some Ollama-compatible servers report `model` instead of `name`."""
+    from lanegate.executor import discover_ollama_models
+
+    connection = mock.Mock()
+    response = mock.Mock(status=200)
+    response.read.return_value = json.dumps({
+        "models": [{"model": "qwen2.5-coder:14b"}]
+    }).encode()
+    connection.getresponse.return_value = response
+    with mock.patch("lanegate.executor.http.client.HTTPConnection", return_value=connection):
+        names = discover_ollama_models("http://localhost:11434")
+
+    assert names == ["qwen2.5-coder:14b"]
+
+
+def test_discover_ollama_models_prefers_name_over_model():
+    from lanegate.executor import discover_ollama_models
+
+    connection = mock.Mock()
+    response = mock.Mock(status=200)
+    response.read.return_value = json.dumps({
+        "models": [{"name": "from-name", "model": "from-model"}]
+    }).encode()
+    connection.getresponse.return_value = response
+    with mock.patch("lanegate.executor.http.client.HTTPConnection", return_value=connection):
+        names = discover_ollama_models("http://localhost:11434")
+
+    assert names == ["from-name"]
+
+
+def test_discover_ollama_models_skips_non_dict_entries():
+    from lanegate.executor import discover_ollama_models
+
+    connection = mock.Mock()
+    response = mock.Mock(status=200)
+    response.read.return_value = json.dumps({
+        "models": ["not-a-dict", {"name": "qwen2.5-coder:14b"}, 42, None]
+    }).encode()
+    connection.getresponse.return_value = response
+    with mock.patch("lanegate.executor.http.client.HTTPConnection", return_value=connection):
+        names = discover_ollama_models("http://localhost:11434")
+
+    assert names == ["qwen2.5-coder:14b"]
+
+
+def test_discover_ollama_models_returns_empty_on_non_list_models_value():
+    from lanegate.executor import discover_ollama_models
+
+    connection = mock.Mock()
+    response = mock.Mock(status=200)
+    response.read.return_value = json.dumps({"models": "not-a-list"}).encode()
+    connection.getresponse.return_value = response
+    with mock.patch("lanegate.executor.http.client.HTTPConnection", return_value=connection):
+        names = discover_ollama_models("http://localhost:11434")
+
+    assert names == []
+
+
 def test_ollama_context_discovery_graceful_timeout():
     """Return None gracefully on timeout."""
     from lanegate.executor import discover_ollama_context_length
@@ -2199,3 +2307,619 @@ def test_implement_prompt_omits_invalid_overlap_plan_from_trusted_context(tmp_pa
     prompt = build_implement_prompt(ticket, project_root=tmp_path)
 
     assert "Active overlap plan" not in prompt
+
+
+class TestExecutorCapabilityRegistry:
+    """Tests for the EXECUTOR_CAPABILITIES registry, has_capability, and executor_types_with
+    (TICK-646)."""
+
+    # Expected capability flags for every registered executor type.
+    # Columns: tool_dispatch_loop, stdin_capable, streaming_capable,
+    #          streaming_capable_without_heartbeat
+    # Update this table whenever a new executor type is added or a flag changes;
+    # the per-field assertions below are derived from it so nothing gets missed.
+    EXPECTED: dict[str, dict[str, bool]] = {
+        "claude":          {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+        "claude-process":  {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+        "claude-subagent": {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
+        "codex":           {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": False},
+        "aider":           {"tool_dispatch_loop": False, "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "ollama":          {"tool_dispatch_loop": False, "stdin_capable": True,  "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "agy":             {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "openhands":       {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "gemini":          {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "continue":        {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    }
+
+    def test_registry_all_known_types_present(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        for known_type in self.EXPECTED:
+            assert known_type in EXECUTOR_CAPABILITIES, (
+                f"Expected '{known_type}' to be a key in EXECUTOR_CAPABILITIES"
+            )
+
+    def test_all_registered_types_have_all_expected_flags(self):
+        """Every executor type in EXPECTED must carry all four capability flags."""
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        for exec_type, expected_caps in self.EXPECTED.items():
+            assert exec_type in EXECUTOR_CAPABILITIES, (
+                f"'{exec_type}' missing from EXECUTOR_CAPABILITIES"
+            )
+            actual = EXECUTOR_CAPABILITIES[exec_type]
+            for cap, expected_val in expected_caps.items():
+                assert actual.get(cap) is expected_val, (
+                    f"EXECUTOR_CAPABILITIES['{exec_type}']['{cap}'] "
+                    f"expected {expected_val!r}, got {actual.get(cap)!r}"
+                )
+
+    def test_expected_table_covers_every_valid_executor_type(self):
+        """EXPECTED is hand-maintained; pin it against config so a new valid
+        executor type added without a registry entry fails here instead of
+        silently passing every test in this class."""
+        from lanegate import config
+
+        assert set(config._VALID_EXECUTOR_TYPES) <= set(self.EXPECTED)
+
+    # --- per-type spot checks (explicit assertions make CI output readable) ---
+
+    def test_capability_flags_claude(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["claude"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is True
+        assert caps["streaming_capable"] is True
+        assert caps["streaming_capable_without_heartbeat"] is True
+
+    def test_capability_flags_claude_process(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["claude-process"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is True
+        assert caps["streaming_capable"] is True
+        assert caps["streaming_capable_without_heartbeat"] is True
+
+    def test_capability_flags_claude_subagent(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["claude-subagent"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is True
+        assert caps["streaming_capable"] is True
+        assert caps["streaming_capable_without_heartbeat"] is True
+
+    def test_capability_flags_codex(self):
+        """codex streams JSON events and is stdin-capable, but its output can
+        be quiet for extended periods so it must NOT be watchdog-idle-killed when
+        running without a heartbeat monitor (review/autofix).  Pinning both flags
+        here so this regression is caught before it reaches review again.
+        """
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["codex"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is True
+        assert caps["streaming_capable"] is True, (
+            "codex.streaming_capable must be True — pool.py (with heartbeat) legitimately "
+            "includes it"
+        )
+        assert caps["streaming_capable_without_heartbeat"] is False, (
+            "codex.streaming_capable_without_heartbeat must be False — review/autofix have "
+            "no heartbeat monitor, so codex must use the flat hard-ceiling timeout"
+        )
+
+    def test_capability_flags_aider(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["aider"]
+        assert caps["tool_dispatch_loop"] is False
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_ollama(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["ollama"]
+        assert caps["tool_dispatch_loop"] is False
+        assert caps["stdin_capable"] is True
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_agy(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["agy"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_openhands(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["openhands"]
+        assert caps["tool_dispatch_loop"] is True, (
+            "openhands is an agentic tool-dispatch reviewer — must be tool_dispatch_loop=True"
+        )
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_gemini(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["gemini"]
+        assert caps["tool_dispatch_loop"] is True, (
+            "gemini (deprecated Gemini CLI) ran an interactive agent loop — tool_dispatch_loop=True"
+        )
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_continue(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["continue"]
+        assert caps["tool_dispatch_loop"] is True, (
+            "continue (Continue.dev) is an agentic assistant — tool_dispatch_loop=True"
+        )
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is False
+        assert caps["streaming_capable_without_heartbeat"] is False
+
+    # --- executor_types_with ---
+
+    def test_has_capability_unknown_type_returns_false(self):
+        from lanegate.executor import has_capability
+
+        result = has_capability("nonexistent", "stdin_capable")
+        assert result is False, (
+            "has_capability must return False (not raise) for an unrecognized executor type"
+        )
+
+    def test_has_capability_unknown_cap_returns_false(self):
+        from lanegate.executor import has_capability
+
+        # Even for a known type, an unknown capability key must return False
+        result = has_capability("claude", "nonexistent_capability")
+        assert result is False
+
+    def test_executor_types_with_stdin_capable_includes_codex(self):
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("stdin_capable")
+        assert "codex" in result, (
+            "'codex' must be in executor_types_with('stdin_capable')"
+        )
+
+    def test_executor_types_with_tool_dispatch_loop_excludes_aider_and_ollama(self):
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("tool_dispatch_loop")
+        assert "aider" not in result
+        assert "ollama" not in result
+
+    def test_executor_types_with_streaming_capable_excludes_ollama_and_aider(self):
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("streaming_capable")
+        assert "ollama" not in result
+        assert "aider" not in result
+
+    def test_executor_types_with_streaming_capable_includes_codex(self):
+        """pool.py uses streaming_capable (has heartbeat); codex must be included."""
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("streaming_capable")
+        assert "codex" in result, (
+            "codex must be in streaming_capable — pool.py (with heartbeat monitor) "
+            "legitimately includes it for output-idle watchdog"
+        )
+
+    def test_executor_types_with_streaming_capable_without_heartbeat_excludes_codex(self):
+        """review/autofix have no heartbeat monitor; codex must NOT be idle-killed."""
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("streaming_capable_without_heartbeat")
+        assert "codex" not in result, (
+            "codex must NOT be in streaming_capable_without_heartbeat — without a heartbeat "
+            "monitor, a quiet codex would be killed by the 75s idle watchdog instead of "
+            "running to the hard ceiling"
+        )
+
+    def test_executor_types_with_streaming_capable_without_heartbeat_includes_claude(self):
+        from lanegate.executor import executor_types_with
+
+        result = executor_types_with("streaming_capable_without_heartbeat")
+        for claude_type in ("claude", "claude-process", "claude-subagent"):
+            assert claude_type in result, (
+                f"'{claude_type}' must be in streaming_capable_without_heartbeat"
+            )
+
+    def test_executor_types_with_reflects_runtime_mutation(self):
+        """executor_types_with reads the dict each call, so monkey-patches are reflected."""
+        from lanegate import executor as executor_module
+
+        original = executor_module.EXECUTOR_CAPABILITIES.get("__test_type__")
+        try:
+            executor_module.EXECUTOR_CAPABILITIES["__test_type__"] = {
+                "tool_dispatch_loop": False,
+                "stdin_capable": True,
+                "streaming_capable": False,
+                "streaming_capable_without_heartbeat": False,
+            }
+            result = executor_module.executor_types_with("stdin_capable")
+            assert "__test_type__" in result
+        finally:
+            if original is None:
+                executor_module.EXECUTOR_CAPABILITIES.pop("__test_type__", None)
+            else:
+                executor_module.EXECUTOR_CAPABILITIES["__test_type__"] = original
+
+    # --- is_non_tool_reviewer correctness for all valid executor types ---
+
+    def test_is_non_tool_reviewer_returns_false_for_tool_capable_types(self):
+        """Types with tool_dispatch_loop=True must NOT be treated as non-tool reviewers.
+
+        Previously openhands, gemini, and continue were missing from EXECUTOR_CAPABILITIES,
+        causing has_capability to return False and is_non_tool_reviewer to return True for
+        them — wrongly telling an agentic reviewer to use the diff-inlined non-tool prompt.
+        """
+        from lanegate.reviewer import is_non_tool_reviewer
+
+        for exec_type, caps in self.EXPECTED.items():
+            if caps["tool_dispatch_loop"]:
+                assert not is_non_tool_reviewer(exec_type), (
+                    f"is_non_tool_reviewer('{exec_type}') must be False "
+                    f"(tool_dispatch_loop=True)"
+                )
+
+    def test_is_non_tool_reviewer_returns_true_for_non_tool_types(self):
+        from lanegate.reviewer import is_non_tool_reviewer
+
+        for exec_type, caps in self.EXPECTED.items():
+            if not caps["tool_dispatch_loop"]:
+                assert is_non_tool_reviewer(exec_type), (
+                    f"is_non_tool_reviewer('{exec_type}') must be True "
+                    f"(tool_dispatch_loop=False)"
+                )
+
+    def test_is_non_tool_reviewer_none_returns_false(self):
+        from lanegate.reviewer import is_non_tool_reviewer
+
+        assert is_non_tool_reviewer(None) is False, (
+            "is_non_tool_reviewer(None) must return False (safe default: assume tool-capable)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# model_settings per-model override tests (TICK-650)
+# ---------------------------------------------------------------------------
+
+
+def test_aider_model_settings_override(tmp_path, monkeypatch):
+    """A model_settings entry for the dispatched model overrides both
+    context_window_tokens (enforced by budget check) and edit_format
+    (reflected in the aider CLI flags).
+
+    Uses 'ollama_chat/gpt-oss:20b' — a name with slash and colon — to
+    confirm that special characters in model names are looked up correctly.
+
+    Budget check assertion: set the per-model context_window_tokens to a
+    tiny value (1) while the flat default is large, then confirm the budget
+    check fires at the per-model limit (not the flat one).  If the override
+    were silently dropped the large flat budget would pass; the ConfigError
+    proves the small override was actually used.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/gpt-oss:20b": {
+                        "context_window_tokens": 131072,
+                        "edit_format": "whole",
+                    },
+                },
+            }
+        }
+    }
+
+    cmd = build_executor_cmd(
+        "aider",
+        "implement this",
+        cfg,
+        model="ollama_chat/gpt-oss:20b",
+        touches=["small.py"],
+    )
+
+    # edit_format from model_settings override must be used
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "whole"
+
+    # context_window_tokens override must be enforced by the budget check:
+    # set per-model limit to 1 (well below any realistic estimate) while the
+    # flat default remains 65536 — a ConfigError proves the small per-model
+    # value was used, not the larger flat one.
+    cfg_tight = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/gpt-oss:20b": {
+                        "context_window_tokens": 1,
+                        "edit_format": "whole",
+                    },
+                },
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="exceeded executors.aider.context_window_tokens"):
+        build_executor_cmd(
+            "aider",
+            "implement this",
+            cfg_tight,
+            model="ollama_chat/gpt-oss:20b",
+            touches=["small.py"],
+        )
+
+
+def test_aider_model_settings_fallback(tmp_path, monkeypatch):
+    """When model_settings is present but the dispatched model has no entry,
+    flat defaults are used unchanged — unrelated entries have no side effects.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/other-model:7b": {
+                        "context_window_tokens": 32768,
+                        "edit_format": "whole",
+                    },
+                },
+            }
+        }
+    }
+
+    cmd = build_executor_cmd(
+        "aider",
+        "implement this",
+        cfg,
+        model="ollama_chat/qwen2.5-coder:14b",
+        touches=["small.py"],
+    )
+
+    # Flat default edit_format must be used (not the unrelated model's override)
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
+
+
+def test_aider_model_settings_null_value_does_not_crash(tmp_path, monkeypatch):
+    """A YAML `model_settings:` key with no value (explicit null, e.g. all
+    entries commented out) must not crash dispatch. _validate_aider_model_settings
+    accepts a None model_settings (config.py: `if model_settings is None: continue`),
+    so both read sites must tolerate None too, not just an absent key.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": None,
+            }
+        }
+    }
+
+    # edit_format read site (build_executor_cmd) — must not raise
+    cmd = build_executor_cmd(
+        "aider", "implement this", cfg, model="m", touches=["small.py"]
+    )
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
+
+    # context_window_tokens / budget read site — must not raise, read_only path
+    build_executor_cmd(
+        "aider", "implement this", cfg, model="m", touches=["small.py"], read_only=True
+    )
+
+
+def test_aider_model_settings_partial_override(tmp_path, monkeypatch):
+    """A model_settings entry with only context_window_tokens must not
+    affect edit_format resolution — partial overrides are per-key independent.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/qwen2.5-coder:14b": {
+                        # Only context_window_tokens — edit_format must fall back to flat
+                        "context_window_tokens": 49152,
+                    },
+                },
+            }
+        }
+    }
+
+    cmd = build_executor_cmd(
+        "aider",
+        "implement this",
+        cfg,
+        model="ollama_chat/qwen2.5-coder:14b",
+        touches=["small.py"],
+    )
+
+    # edit_format should fall back to flat default ("diff"), not be absent
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
+
+
+def test_aider_model_settings_after_context_tiers_escalation(tmp_path, monkeypatch):
+    """After context_tiers escalates to a secondary model, that secondary
+    model's model_settings entry (not the original model's) must be applied.
+
+    The lookup uses the post-escalation model name, so the override must
+    appear as the edit_format passed to aider.
+    """
+    monkeypatch.chdir(tmp_path)
+    # A file large enough to exceed the first tier (10_000 tokens), forcing
+    # escalation to the second tier (40_000 tokens).
+    (tmp_path / "large.py").write_text("x" * 60_000)
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "model_settings": {
+                    # Override only for the *escalated* model
+                    "ollama/qwen2.5-coder:32b": {
+                        "edit_format": "whole",
+                    },
+                },
+                "context_tiers": [
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                ],
+            }
+        }
+    }
+
+    cmd = build_executor_cmd(
+        "aider",
+        "large prompt",
+        cfg,
+        touches=["large.py"],
+        worktree_path=tmp_path,
+    )
+
+    # Must have escalated to tier-2 model
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen2.5-coder:32b"
+    # And the escalated model's model_settings override must be used
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "whole"
+
+
+def test_aider_model_settings_context_window_ignored_after_tier_escalation(tmp_path, monkeypatch):
+    """A model_settings context_window_tokens override for the escalated model
+    must NOT override the tier's own tokens value -- the tier was selected
+    specifically because its tokens value fits the estimated request, so a
+    smaller static per-model override must not spuriously reject it.
+    """
+    monkeypatch.chdir(tmp_path)
+    # Large enough to exceed tier 1 (10_000) but fit tier 2 (40_000).
+    (tmp_path / "large.py").write_text("x" * 60_000)
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "model_settings": {
+                    # Deliberately much smaller than the tier's own budget —
+                    # before the fix this raised ConfigError even though the
+                    # tier system just proved the request fits.
+                    "ollama/qwen2.5-coder:32b": {
+                        "context_window_tokens": 1_000,
+                    },
+                },
+                "context_tiers": [
+                    {"tokens": 10_000, "model": "ollama/qwen2.5-coder:7b"},
+                    {"tokens": 40_000, "model": "ollama/qwen2.5-coder:32b"},
+                ],
+            }
+        }
+    }
+
+    # Must not raise ConfigError -- the tier's 40_000 budget must be enforced,
+    # not the model_settings override's 1_000.
+    cmd = build_executor_cmd(
+        "aider",
+        "large prompt",
+        cfg,
+        touches=["large.py"],
+        worktree_path=tmp_path,
+    )
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen2.5-coder:32b"
+
+
+def test_aider_model_settings_named_executor_instance(tmp_path, monkeypatch):
+    """model_settings on a *named* executor instance (type: aider) must work
+    identically to the legacy flat 'aider' key.
+
+    Regression test for finding-1: both read sites previously re-indexed
+    cfg["executors"]["aider"] which silently drops model_settings on any
+    named instance (e.g. {"aider-local": {type: aider, model_settings: ...}}).
+    After the fix, executor_cfg is used directly so the lookup is the same
+    regardless of how the executor is keyed.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider-local": {
+                "type": "aider",
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/gpt-oss:20b": {
+                        "context_window_tokens": 131072,
+                        "edit_format": "whole",
+                    },
+                },
+            }
+        }
+    }
+
+    cmd = build_executor_cmd(
+        "aider-local",
+        "implement this",
+        cfg,
+        model="ollama_chat/gpt-oss:20b",
+        touches=["small.py"],
+    )
+
+    # edit_format override must be used for the named instance
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "whole"
+
+    # context_window_tokens override must be enforced for the named instance
+    cfg_tight = {
+        "executors": {
+            "aider-local": {
+                "type": "aider",
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "ollama_chat/gpt-oss:20b": {
+                        "context_window_tokens": 1,
+                        "edit_format": "whole",
+                    },
+                },
+            }
+        }
+    }
+    with pytest.raises(ConfigError, match="exceeded executors.aider.context_window_tokens"):
+        build_executor_cmd(
+            "aider-local",
+            "implement this",
+            cfg_tight,
+            model="ollama_chat/gpt-oss:20b",
+            touches=["small.py"],
+        )
+

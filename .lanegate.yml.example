@@ -79,6 +79,44 @@ drivers:
     type: codex
     model: o4-mini
 
+  # --- Fully-local, VRAM-tiered split (no cloud calls at all) ---
+  #
+  # On a single consumer GPU, different pipeline steps have very different
+  # real context needs, so they don't all need the same model:
+  #   - analyze and review only ever see AST skeletons and a git diff, both
+  #     deterministically byte-budgeted (see get_payload_budget() /
+  #     _DEFAULT_PAYLOAD_BUDGETS in lanegate/prompts.py) -- they stay small
+  #     and predictable regardless of how large the touched files are.
+  #   - implement sees full file contents. On a codebase with large,
+  #     under-modularized files this can spike far past your typical ticket
+  #     size, so it's the step most likely to exceed VRAM and spill onto
+  #     CPU -- which doesn't lower quality, but can fall off a cliff in
+  #     throughput (or blow past executor_timeout_seconds on a big enough
+  #     file) if the model doesn't comfortably fit fully in VRAM at your
+  #     real context sizes, not just a short test prompt.
+  # Route the highest-quality model you can fit to the bounded steps, and
+  # reserve whichever model stays 100% GPU-resident across your actual
+  # (not toy) context range for implement. Benchmark before trusting any of
+  # this for your own hardware/models -- `ollama ps` after a real-sized
+  # prompt tells you whether a model is fully resident or already spilling.
+  aider-local-analyze:
+    type: aider
+    model: ollama_chat/hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q3_K_XL
+    provider: ollama
+    context_window_tokens: 32768
+
+  aider-local-implement:
+    type: aider
+    model: ollama_chat/gpt-oss:20b
+    provider: ollama
+    context_window_tokens: 32768
+
+  aider-local-review:
+    type: aider
+    model: ollama_chat/hf.co/unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:UD-Q3_K_XL
+    provider: ollama
+    context_window_tokens: 32768
+
 # Route each pipeline step to a specific driver.
 # Omit this block to use the top-level legacy `executor:` / `reviewer:` fields.
 steps:
@@ -88,6 +126,16 @@ steps:
     driver: aider-local     # local model handles bulk coding
   review:
     driver: claude-main     # Claude reviews for quality
+
+# Fully-local alternative (no cloud calls) using the VRAM-tiered drivers
+# defined above -- swap in for the steps: block above, not alongside it:
+#   steps:
+#     analyze:
+#       driver: aider-local-analyze
+#     implement:
+#       driver: aider-local-implement
+#     review:
+#       driver: aider-local-review
 
 # Legacy shorthand: max tickets the orchestrator runs in parallel.
 # Effective batch = min(touch-disjoint candidates, max_parallel)

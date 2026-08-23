@@ -19,6 +19,7 @@ from lanegate import APP_NAME
 from lanegate.safeguards import is_control_plane_file
 from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.config import (
+    ConfigError,
     resolve_acceptance_contract_mode,
     resolve_model,
     resolve_ticket_pool,
@@ -26,8 +27,8 @@ from lanegate.config import (
     validate_model_for_executor,
 )
 from lanegate.executor import (
-    _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
+    executor_types_with,
     get_executor_config,
     parse_structured_result,
     reject_ollama_for_code_step,
@@ -57,6 +58,96 @@ from .run_report import (
 )
 
 
+_JSON_KEY_PATTERN = re.compile(r'^"(?:\\.|[^\"])*"\s*:')
+
+
+def _escape_interior_quotes(text: str) -> str:
+    """Escape otherwise-unescaped double quotes inside JSON string values."""
+    repaired: list[str] = []
+    in_string = False
+    string_kind = "VALUE"
+    stack: list[str] = []
+    index = 0
+
+    while index < len(text):
+        char = text[index]
+
+        if in_string:
+            if char == "\\" and index + 1 < len(text):
+                repaired.append(text[index : index + 2])
+                index += 2
+                continue
+            if char == '"':
+                next_index = index + 1
+                while next_index < len(text) and text[next_index].isspace():
+                    next_index += 1
+
+                rest = text[next_index:]
+                is_close = False
+
+                if next_index >= len(text):
+                    is_close = True
+                elif string_kind == "KEY":
+                    if rest.startswith(":"):
+                        is_close = True
+                else:  # VALUE or OTHER context
+                    if rest.startswith("}") or rest.startswith("]"):
+                        is_close = True
+                    elif rest.startswith(","):
+                        after_comma = rest[1:].lstrip()
+                        if (
+                            after_comma.startswith("}")
+                            or after_comma.startswith("]")
+                            or _JSON_KEY_PATTERN.match(after_comma)
+                        ):
+                            is_close = True
+
+                if is_close:
+                    in_string = False
+                    repaired.append(char)
+                else:
+                    repaired.append('\\"')
+                index += 1
+                continue
+            else:
+                repaired.append(char)
+                index += 1
+                continue
+
+        if char == '"':
+            in_string = True
+            if stack and stack[-1] == "OBJECT_KEY":
+                string_kind = "KEY"
+            else:
+                string_kind = "VALUE"
+            repaired.append(char)
+            index += 1
+            continue
+
+        if char == "{":
+            stack.append("OBJECT_KEY")
+        elif char == "}":
+            if stack:
+                stack.pop()
+        elif char == "[":
+            stack.append("ARRAY_VALUE")
+        elif char == "]":
+            if stack:
+                stack.pop()
+        elif char == ":":
+            if stack and stack[-1] == "OBJECT_KEY":
+                stack[-1] = "OBJECT_VALUE"
+        elif char == ",":
+            if stack and stack[-1] == "OBJECT_VALUE":
+                stack[-1] = "OBJECT_KEY"
+
+        repaired.append(char)
+        index += 1
+
+    return "".join(repaired)
+
+
+
 def _extract_review_verdict_json(output: str) -> str | None:
     """Return the last JSON object containing a review verdict from *output*.
 
@@ -74,6 +165,8 @@ def _extract_review_verdict_json(output: str) -> str | None:
     decoder = json.JSONDecoder(strict=False)
 
     def verdict_objects(text: str) -> list[str]:
+        if '"verdict"' not in text:
+            return []
         candidates: list[str] = []
         for start, char in enumerate(text):
             if char != "{":
@@ -84,6 +177,21 @@ def _extract_review_verdict_json(output: str) -> str | None:
                 continue
             if isinstance(value, dict) and "verdict" in value:
                 candidates.append(text[start : start + end])
+        if candidates:
+            return candidates
+
+        repaired = _escape_interior_quotes(text)
+        if repaired == text:
+            return []
+        for start, char in enumerate(repaired):
+            if char != "{":
+                continue
+            try:
+                value, end = decoder.raw_decode(repaired[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and "verdict" in value:
+                candidates.append(json.dumps(value))
         return candidates
 
     fenced = re.findall(r"```json[ \t]*\r?\n(.*?)```", output, re.DOTALL | re.IGNORECASE)
@@ -212,6 +320,10 @@ def resolve_independent_review_driver(
     A per-ticket ``reviewer:`` pin is handled by the caller before this is
     reached; it always wins outright (resolve_pool_executor's own early
     return, loop.py) and is not subject to this ladder.
+
+    ``autofix.resolve_independent_fix_driver`` mirrors rungs 1/2/4 of this
+    ladder for the fix step (no ``self`` rung -- a fix step has no config
+    equivalent of ``review_fallback``). Keep the two in sync.
     """
     from . import resolve_pool_executor
 
@@ -461,6 +573,51 @@ def _escalate_no_reviewer(ticket: dict, repo_root: Path, cfg: dict, *, reason: s
     return False
 
 
+def resolve_executor_type_for_driver(name: str, cfg: dict) -> str:
+    """Resolve *name* (a ``drivers:`` alias, pool instance name, or bare
+    executor type) down to its effective executor type.
+
+    Two-stage lookup: ``expand_driver`` resolves a ``drivers:`` alias to its
+    underlying type first (a no-op when *name* is not a ``drivers:`` entry),
+    then ``get_executor_config`` resolves that type again against
+    ``executors:`` for a named-instance/per-type override. This is the exact
+    resolution ``run_review_agent()`` performs inline (see
+    ``resolved_review_type`` above) and that ``_review_dispatch_config``
+    below needs for its own compatibility check -- kept as a single shared
+    function so a payload/analytics audit describing what a real review
+    dispatch would look like (``context_log.py``) can resolve the same
+    answer instead of re-deriving its own copy of this chain.
+    """
+    resolved_type = expand_driver(name, cfg).get("type", name)
+    return get_executor_config(resolved_type, cfg).get("type", resolved_type)
+
+
+def resolve_reviewer_driver_and_type(
+    ticket: dict, cfg: dict, repo_root: Path, *, pool_name: str | None = None
+) -> tuple[str, str]:
+    """Best-effort resolution of which reviewer driver/type a real review
+    dispatch would pick for *ticket*, for describing prompt shape (e.g. the
+    payload/analytics audit in ``context_log.py``) without actually running
+    a review.
+
+    Goes through the same pool-aware seam ``run_review_agent()`` uses
+    (``resolve_pool_executor`` -> ``resolve_driver``) so a project routed
+    through ``pools:`` or ``steps.review.driver`` is described accurately,
+    not the bare driver-only resolution. Does not apply the implementer-
+    exclusion independence ladder (``resolve_independent_review_driver``):
+    that ladder decides which *instance* is safe to review with, which does
+    not change the resolved *type* for prompt-shape purposes and would need
+    a resolvable implementer identity this audit does not reliably have for
+    an arbitrary ticket.
+    """
+    from . import resolve_pool_executor
+
+    driver_name = resolve_pool_executor("review", ticket, cfg, repo_root, pool_name=pool_name)
+    if driver_name is None:
+        driver_name = resolve_driver("review", ticket, cfg)
+    return driver_name, resolve_executor_type_for_driver(driver_name, cfg)
+
+
 def _review_dispatch_config(
     control_cfg: dict,
     worktree_cfg: dict,
@@ -503,19 +660,9 @@ def _review_dispatch_config(
     when the trusted route is the alias ``trusted-codex``) without ever
     naming the actual selected driver.
     """
-    from lanegate.executor import get_executor_config
-
     dispatch_cfg = dict(control_cfg)
 
-    def executor_type(name: str, config: dict) -> str:
-        resolved_type = expand_driver(name, config).get("type", name)
-        # ``drivers`` aliases are not executor instances.  Look up the alias'
-        # resolved type so get_executor_config() does not treat the alias name
-        # as an unconfigured bare executor type.
-        lookup_name = resolved_type if resolved_type != name else name
-        return get_executor_config(lookup_name, config).get("type", resolved_type)
-
-    trusted_type = executor_type(review_executor, control_cfg)
+    trusted_type = resolve_executor_type_for_driver(review_executor, control_cfg)
 
     # A top-level worktree model is valid only when the worktree's own review
     # resolution names the exact same driver the trusted pool selected *and*
@@ -527,7 +674,7 @@ def _review_dispatch_config(
     worktree_review_executor = resolve_driver("review", {}, worktree_cfg)
     if worktree_review_executor != review_driver_name:
         return dispatch_cfg
-    if executor_type(worktree_review_executor, worktree_cfg) != trusted_type:
+    if resolve_executor_type_for_driver(worktree_review_executor, worktree_cfg) != trusted_type:
         return dispatch_cfg
 
     worktree_models = worktree_cfg.get("models")
@@ -548,7 +695,7 @@ def _review_dispatch_config(
     worktree_executor = worktree_executors.get(review_executor)
     if not isinstance(control_executor, dict) or not isinstance(worktree_executor, dict):
         return dispatch_cfg
-    if executor_type(review_executor, worktree_cfg) != trusted_type:
+    if resolve_executor_type_for_driver(review_executor, worktree_cfg) != trusted_type:
         return dispatch_cfg
     worktree_executor_models = worktree_executor.get("models")
     if not (
@@ -581,9 +728,13 @@ def run_review_agent(
     The reviewer runs inside the ticket's git worktree with full git and file
     tool access — same as the implementer — and inspects the branch itself
     (``git diff <trunk>...HEAD``, file reads, etc.) rather than being handed a
-    diff embedded in the prompt. ``get_worktree_diff`` below is only a
+    diff embedded in the prompt. ``get_worktree_diff`` below is primarily a
     pre-flight check (confirms the branch has real commits) before spending
-    an LLM call; its return value is no longer forwarded to the prompt.
+    an LLM call. Its return value is also forwarded into the prompt for a
+    non-tool-calling reviewer executor (see ``reviewer.is_non_tool_reviewer`` /
+    ``executor.EXECUTOR_CAPABILITIES``), which has no tool-dispatch loop to
+    run ``git diff`` itself; a tool-capable reviewer still ignores it and
+    reads the branch directly (TICK-644).
 
     Args:
         ticket: The ticket dict.
@@ -889,6 +1040,10 @@ def run_review_agent(
         branch,
         base=resolve_trunk_branch(_cfg_for_review, repo_root),
     )
+    # Resolved once, before the sibling-retry loop below, to build the
+    # initial prompt. The loop below re-resolves this per attempt and rebuilds
+    # the prompt if a sibling retry changes the resolved type.
+    resolved_review_type = resolve_executor_type_for_driver(review_executor, _cfg_for_review)
     prompt = build_review_prompt(
         ticket,
         commit_messages=commit_messages,
@@ -897,11 +1052,26 @@ def run_review_agent(
         # Prompt policy is derived from the trusted control-checkout config,
         # never from a ticket worktree.
         cfg=cfg,
+        reviewer_type=resolved_review_type,
+        diff=diff,
     )
+    # Type the prompt above was shaped for (TICK-644's tool-capable vs.
+    # non-tool-capable instruction text). A sibling rate-limit failover below
+    # can reassign review_executor to a sibling of a *different* executor
+    # type (e.g. an agy-review pool instance failing over to a codex-review
+    # sibling) without otherwise touching the prompt; if that failover ever
+    # crosses a tool-capable/non-tool-capable boundary (a hybrid cloud+local
+    # review pool), reusing this prompt reproduces the TICK-644 dead-end
+    # <tool_call> bug on the retry. Rebuilt below only when the resolved type
+    # actually changes, to avoid extra cost on the common same-type retry.
+    prompt_built_for_type = resolved_review_type
 
-    # The prompt is fixed across sibling retries, so it is written once and
-    # every retry's run directory copies the same file. Audit I/O is strictly
-    # best-effort: review execution itself still receives ``prompt`` directly.
+    # The prompt is fixed across sibling retries that stay on the same
+    # resolved executor type, so it is written once here and every same-type
+    # retry's run directory copies this file. A retry that crosses executor
+    # types rebuilds and rewrites it inside the loop below (see
+    # prompt_built_for_type). Audit I/O is strictly best-effort: review
+    # execution itself still receives ``prompt`` directly.
     prompt_path = write_prompt_file_best_effort(worktree_path, tid, "review", prompt)
     session_ts = _resolve_active_run_session_ts(repo_root)
     bundle_path: Path | None = None
@@ -924,9 +1094,31 @@ def run_review_agent(
             # configured as `executors: {local-ollama: {type: ollama}}` reaches
             # here as "local-ollama". The guard has to run on the resolved
             # type or that config dispatches a raw ollama review anyway.
+            # get_executor_config() alone here is single-stage: config
+            # validation rejects a `drivers:` entry whose `type:` names
+            # another alias rather than a real executor type (_parse_steps),
+            # so review_executor cannot actually be an unresolved alias in
+            # practice -- but resolve_executor_type_for_driver() (the same
+            # two-stage lookup the initial resolution above and
+            # _review_dispatch_config use) costs nothing extra and keeps
+            # this the one place in the retry loop that could silently
+            # diverge from the others. resolved_review_executor_cfg itself
+            # is still needed below for .get("provider").
             resolved_review_executor_cfg = get_executor_config(review_executor, _cfg_for_review)
-            resolved_review_type = resolved_review_executor_cfg.get("type", review_executor)
+            resolved_review_type = resolve_executor_type_for_driver(review_executor, _cfg_for_review)
             reject_ollama_for_code_step("review", resolved_review_type)
+            if resolved_review_type != prompt_built_for_type:
+                prompt = build_review_prompt(
+                    ticket,
+                    commit_messages=commit_messages,
+                    project_root=repo_root,
+                    worktree_path=worktree_path,
+                    cfg=cfg,
+                    reviewer_type=resolved_review_type,
+                    diff=diff,
+                )
+                prompt_path = write_prompt_file_best_effort(worktree_path, tid, "review", prompt)
+                prompt_built_for_type = resolved_review_type
             # Resolved inside the try so a bad named-executor config
             # (api_key_env pointing at an unset var, or a type with no known
             # key-injection target), or a malformed driver env
@@ -1021,13 +1213,13 @@ def run_review_agent(
                             f"[orchestrate] {tid}: not resuming session for review — {reason}",
                             file=sys.stderr,
                         )
-            stdin_capable = resolved_review_type in (_CLAUDE_SUBPROCESS_TYPES | {"codex", "ollama"})
+            stdin_capable = resolved_review_type in executor_types_with("stdin_capable")
             # Agy's JSON mode produces its result at process completion; it
             # is not safe to apply an output-idle watchdog to it.
             # Review does not have the implementation worker's heartbeat
             # monitor. Codex can validly remain silent between JSON events, so
             # give it the hard ceiling rather than applying an output-idle kill.
-            streaming_capable = resolved_review_type in _CLAUDE_SUBPROCESS_TYPES
+            streaming_capable = resolved_review_type in executor_types_with("streaming_capable_without_heartbeat")
             step_max_turns = _get_step_budget_cap(_cfg_for_review, "review", "max_turns")
             step_max_tokens = _get_step_budget_cap(
                 _cfg_for_review, "review", "max_cumulative_tokens"
@@ -1547,6 +1739,12 @@ def _minimal_cfg(ticket: dict, repo_root: Path) -> dict:
 
     try:
         return load_config(repo_root)
+    except ConfigError:
+        # A genuine config validation failure (e.g. a malformed
+        # executors.aider.model_settings block) must surface, not be masked
+        # by a bogus executors-less fallback that silently breaks downstream
+        # dispatch/routing decisions.
+        raise
     except Exception:
         # Fallback: infer from ticket path
         tickets_dir = ticket["_path"].parent

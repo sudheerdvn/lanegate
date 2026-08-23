@@ -155,6 +155,69 @@ def truncate_to_budget(text: str, budget: int) -> tuple[str, bool]:
     return encoded[:budget].decode("utf-8", errors="ignore"), True
 
 
+def truncate_diff_to_budget(diff_text: str, budget: int) -> tuple[str, bool, list[str]]:
+    """Clip a unified ``git diff`` to *budget* bytes at file boundaries.
+
+    ``truncate_to_budget``'s plain byte offset can sever a diff mid-file,
+    which silently drops the rest of that file (and every file after it)
+    from whatever reads the result, with no indication anything is missing.
+    A reviewer handed a diff truncated that way has no way to tell "this
+    file has no changes" apart from "this file's changes were cut off" —
+    and a re-review is exactly the case where the cut-off file is the one
+    that matters, since it's where the prior fix landed.
+
+    This clips on ``diff --git a/... b/...`` headers instead: each file is
+    included whole or not at all, and every omitted file's path is returned
+    so the caller can tell the reader what it isn't seeing.
+
+    Returns (clipped_text, was_truncated, omitted_paths).
+    """
+    encoded = diff_text.encode("utf-8")
+    if len(encoded) <= budget:
+        return diff_text, False, []
+
+    segments: list[tuple[str, str]] = []
+    current_path: str | None = None
+    current_lines: list[str] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_lines:
+                segments.append((current_path or "?", "".join(current_lines)))
+            current_lines = [line]
+            parts = line.split(" b/", 1)
+            current_path = parts[1].strip() if len(parts) == 2 else line.strip()
+        else:
+            current_lines.append(line)
+    if current_lines:
+        segments.append((current_path or "?", "".join(current_lines)))
+
+    if not segments:
+        # No recognizable file boundaries (unexpected input shape) — fall
+        # back to the old byte clip rather than emitting nothing.
+        clipped, _ = truncate_to_budget(diff_text, budget)
+        return clipped, True, []
+
+    kept: list[str] = []
+    omitted: list[str] = []
+    used = 0
+    for path, text in segments:
+        size = len(text.encode("utf-8"))
+        if not omitted and used + size <= budget:
+            kept.append(text)
+            used += size
+        else:
+            omitted.append(path)
+
+    if not kept:
+        # Even the first file alone exceeds the budget — keep a byte-clipped
+        # version of it rather than returning an empty diff.
+        first_path, first_text = segments[0]
+        clipped, _ = truncate_to_budget(first_text, budget)
+        return clipped, True, [p for p, _ in segments[1:]]
+
+    return "".join(kept), bool(omitted), omitted
+
+
 _ARCH_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
 

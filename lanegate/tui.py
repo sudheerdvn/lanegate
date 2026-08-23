@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from lanegate.orchestrate.run_report import _terminate_process_tree
+
 # How long to wait for the background `lanegate api` subprocess to start
 # accepting connections before giving up and reporting a launch error.
 _API_READY_TIMEOUT_S = 10.0
@@ -68,6 +70,8 @@ def cmd_tui(
                 cwd=str(repo_root),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=sys.platform != "win32",
+                creationflags=0x00000200 if sys.platform == "win32" else 0,
             )
             _wait_for_api_ready(api_proc, selected_port)
             argv.extend(["--api-url", api_url])
@@ -84,12 +88,7 @@ def cmd_tui(
         sys.exit(1)
     finally:
         if api_proc is not None and api_proc.poll() is None:
-            api_proc.terminate()
-            try:
-                api_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                api_proc.kill()
-                api_proc.wait()
+            _terminate_process_tree(api_proc)
 
 
 def _wait_for_api_ready(api_proc: subprocess.Popen, port: int) -> None:
@@ -113,7 +112,7 @@ def _wait_for_api_ready(api_proc: subprocess.Popen, port: int) -> None:
         finally:
             conn.close()
 
-    api_proc.terminate()
+    _terminate_process_tree(api_proc)
     raise TuiLaunchError(
         f"timed out waiting for the background API to become ready on 127.0.0.1:{port}",
         exit_code=1,

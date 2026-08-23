@@ -31,6 +31,7 @@ from lanegate.prompts import (
     load_project_guidance,
     load_prompt_template,
     render_prompt,
+    truncate_diff_to_budget,
     truncate_to_budget,
 )
 from lanegate.reviewer import build_review_prompt
@@ -67,6 +68,54 @@ class TestTruncateToBudget:
         excerpt, component = _bounded_doc_excerpt(tmp_path, "docs/ARCHITECTURE.md", ["src/x.py"], budget_bytes=20)
         assert len(excerpt.encode("utf-8")) <= 20
         assert component.reason.endswith("-truncated")
+
+
+def _diff_file(path: str, body_lines: int = 3) -> str:
+    body = "\n".join(f"+line {i} of {path}" for i in range(body_lines))
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        f"index 0000000..1111111 100644\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{body_lines} @@\n"
+        f"{body}\n"
+    )
+
+
+class TestTruncateDiffToBudget:
+    def test_returns_text_unchanged_when_under_budget(self):
+        diff = _diff_file("a.py")
+        text, truncated, omitted = truncate_diff_to_budget(diff, 10_000)
+        assert (text, truncated, omitted) == (diff, False, [])
+
+    def test_drops_whole_files_not_partial_hunks(self):
+        # Regression: observed live on a real project's re-review, a diff was
+        # byte-clipped mid-file, silently dropping the exact file the fix
+        # landed in with no signal anything was missing. A file must come
+        # back whole or not at all, and every dropped file must be named.
+        first = _diff_file("a.py", body_lines=2)
+        second = _diff_file("b.py", body_lines=2)
+        budget = len(first.encode("utf-8"))  # room for exactly the first file
+        text, truncated, omitted = truncate_diff_to_budget(first + second, budget)
+        assert text == first
+        assert "diff --git a/b.py" not in text
+        assert "+line 0 of b.py" not in text  # no partial hunk from the dropped file
+        assert truncated is True
+        assert omitted == ["b.py"]
+
+    def test_first_file_alone_exceeds_budget_falls_back_to_byte_clip(self):
+        first = _diff_file("huge.py", body_lines=50)
+        second = _diff_file("b.py", body_lines=2)
+        text, truncated, omitted = truncate_diff_to_budget(first + second, 50)
+        assert len(text.encode("utf-8")) <= 50
+        assert truncated is True
+        assert omitted == ["b.py"]
+
+    def test_no_diff_git_header_falls_back_to_byte_clip(self):
+        text, truncated, omitted = truncate_diff_to_budget("not a real diff " * 10, 20)
+        assert len(text.encode("utf-8")) <= 20
+        assert truncated is True
+        assert omitted == []
 
 # ---------------------------------------------------------------------------
 # build_prompt
@@ -592,15 +641,23 @@ class TestBuildReviewPrompt:
         repro-first instruction as the packaged default (TICK-529: the
         override resolves first via load_prompt_template(), so a paragraph
         added only to the packaged default never reaches this project's own
-        reviews). Reads the file directly rather than through
-        build_review_prompt: project_root resolution deliberately redirects
-        a worktree path back to the control checkout root (TICK-211), so
-        exercising that path from inside a worktree would test the wrong
-        file for reasons unrelated to this regression."""
-        override_path = Path(__file__).parents[1] / "prompts" / "review.md"
-        text = override_path.read_text(encoding="utf-8")
-        assert "construct and execute a minimal repro" in text
-        assert "unverified by execution" in text
+        reviews).
+
+        Since the TICK-644 fix, both the override and the packaged default
+        source this instruction from the shared {{ repro_execution_note }}
+        placeholder (see reviewer._repro_execution_note) rather than each
+        carrying its own duplicated copy, so this renders the actual prompt
+        for the tool-capable case (the default when no reviewer_type is
+        passed) instead of grepping the raw override file for literal text
+        that no longer lives there unrendered. project_root is passed as the
+        repo root directly (not a worktree path) since project_root
+        resolution deliberately redirects a worktree path back to the
+        control checkout root (TICK-211), and that redirection isn't what
+        this test is exercising."""
+        repo_root = Path(__file__).parents[1]
+        prompt = build_review_prompt(self._make_ticket(), project_root=repo_root)
+        assert "construct and execute a minimal repro" in prompt
+        assert "unverified by execution" in prompt
 
     def test_finding_discipline_warns_against_bare_git_stash(self, tmp_path):
         """TICK-626: reviewers must not use a bare `git stash`/`git stash
@@ -620,10 +677,15 @@ class TestBuildReviewPrompt:
         same reason TICK-529 required the repro-first instruction in both
         files: the override resolves first via load_prompt_template(), so
         a paragraph added only to the packaged default never reaches this
-        project's own reviews."""
-        override_path = Path(__file__).parents[1] / "prompts" / "review.md"
-        text = override_path.read_text(encoding="utf-8")
-        assert "do not use a bare `git stash`" in text.lower()
+        project's own reviews.
+
+        Since the TICK-644 fix this is sourced from the shared
+        {{ repro_execution_note }} placeholder (see the sibling repro
+        instruction test above for why this renders the prompt instead of
+        grepping the raw file)."""
+        repo_root = Path(__file__).parents[1]
+        prompt = build_review_prompt(self._make_ticket(), project_root=repo_root)
+        assert "do not use a bare `git stash`" in prompt.lower()
 
     def test_project_guidance_in_trusted_layer(self, tmp_path):
         (tmp_path / "CONTRIBUTING.md").write_text("Reviewers require regression tests.")

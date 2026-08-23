@@ -482,9 +482,13 @@ def check_interactive_init_guard(installed: InstalledArtifact, work: Path) -> No
             "",  # executor
             "",  # reviewer
             "",  # max_parallel
+            "",  # trunk_branch
+            "",  # autonomy
             "",  # models.analyze
             "",  # models.implement
+            "",  # models.fix
             "",  # models.review
+            "",  # models.drift_check
             "n",  # feature flags
             "y",  # environments
             "1",  # environment count

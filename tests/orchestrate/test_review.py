@@ -9,7 +9,8 @@ from __future__ import annotations
 import shutil
 from datetime import UTC, datetime
 
-from lanegate.orchestrate.review import _refresh_ticket_content_from_worktree
+from lanegate.config import ConfigError
+from lanegate.orchestrate.review import _minimal_cfg, _refresh_ticket_content_from_worktree
 from lanegate.reviewer import ReviewError
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
@@ -994,6 +995,63 @@ class TestRunReviewAgentDriverDispatch:
         # control-checkout default, never the stale Agy-scoped model.
         second_cmd = dispatched[1]
         assert second_cmd[second_cmd.index("--model") + 1] == "codex-control-default-model"
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
+    def test_sibling_retry_rebuilds_prompt_when_crossing_tool_capable_boundary(
+        self, tmp_path
+    ):
+        """A rate-limited tool-capable reviewer (claude-process) failing over
+        to a non-tool-capable sibling (aider) must rebuild the review prompt
+        for the new resolved type -- otherwise the stale tool-capable "run
+        git diff yourself" prompt gets sent to aider, which has no
+        tool-dispatch loop and reproduces the TICK-644 dead-end <tool_call>
+        bug on the retry path."""
+        ticket = self._make_ticket()
+        cfg = {
+            "ticket_prefix": "TICK",
+            "tickets_dir": "tickets",
+            "executor": "claude-review-1",
+            "executors": {
+                "claude-review-1": {"type": "claude-process"},
+                "aider-review": {"type": "aider"},
+            },
+            "pools": {
+                "default": {"executors": ["claude-review-1", "aider-review"]}
+            },
+            "default_pool": "default",
+        }
+        dispatched: list[tuple[str, str]] = []
+
+        def fake_build_executor_cmd(executor, prompt, cfg_, **kwargs):
+            dispatched.append((executor, prompt))
+            return [executor]
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "log"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if cmd == ["claude-review-1"]:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rate limit exceeded")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"verdict": "approved", "notes": "ok"}), stderr=""
+            )
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.review.build_executor_cmd", side_effect=fake_build_executor_cmd),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            result = run_review_agent(ticket, tmp_path, cfg=cfg)
+
+        assert result is True
+        assert [executor for executor, _ in dispatched] == ["claude-review-1", "aider-review"]
+        first_prompt = dispatched[0][1]
+        second_prompt = dispatched[1][1]
+        assert "Run `git diff main...HEAD`" in first_prompt
+        assert "GIT DIFF" not in first_prompt
+        assert "GIT DIFF" in second_prompt
+        assert "diff --git a/foo.py" in second_prompt
+        assert "Run `git diff main...HEAD`" not in second_prompt
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
 
     def test_initial_review_skips_known_cooling_reviewer(self, tmp_path):
@@ -2842,6 +2900,69 @@ class TestReviewVerdictExtraction:
         assert review.verdict == "changes_requested"
         assert review.findings == 'the expression says \\"{ keep going }\\"'
 
+    def test_unescaped_interior_quote_in_summary_is_repaired(self):
+        review = self._parse(
+            '{"verdict":"changes_requested","summary":"the function returns '
+            '"foo" unexpectedly","findings":"none"}'
+        )
+
+        assert review.verdict == "changes_requested"
+        assert "foo" in review.notes
+
+    def test_unescaped_interior_quote_in_findings_is_repaired(self):
+        review = self._parse(
+            '{"verdict":"changes_requested","summary":"quoted source",'
+            '"findings":"the expression returns "foo" unexpectedly"}'
+        )
+
+        assert review.verdict == "changes_requested"
+        assert "foo" in review.findings
+
+    def test_unescaped_interior_quote_before_comma_and_colon_is_repaired(self):
+        review_comma = self._parse(
+            '{"verdict":"changes_requested","summary":"the flag "--force", is ignored","findings":""}'
+        )
+        assert review_comma.verdict == "changes_requested"
+        assert '--force"' in review_comma.notes
+
+        review_colon = self._parse(
+            '{"verdict":"changes_requested","summary":"see "foo": broken","findings":""}'
+        )
+        assert review_colon.verdict == "changes_requested"
+        assert '"foo": broken' in review_colon.notes
+
+    def test_unescaped_interior_quote_with_ticket_background_payload_is_repaired(self):
+        output = (
+            '{"verdict": "changes_requested", '
+            '"summary": "whisper load bug", '
+            '"findings": "calls WhisperModel(compute_type="int8", cpu_threads=4)) '
+            'and prints "Loading Whisper..." here"}'
+        )
+        review = self._parse(output)
+
+        assert review.verdict == "changes_requested"
+        assert review.notes == "whisper load bug"
+        assert 'compute_type="int8", cpu_threads=4)' in review.findings
+        assert '"Loading Whisper..." here' in review.findings
+
+    def test_prose_with_quoted_phrase_followed_by_valid_verdict_json(self):
+        output = (
+            'Reviewing now. The bug is in the "parse" helper.\n\n'
+            '{"verdict": "approved", "summary": "ok", "findings": ""}'
+        )
+        review = self._parse(output)
+        assert review.verdict == "approved"
+        assert review.notes == "ok"
+
+        output_array = (
+            'The diff adds x = "a" which is fine.\n'
+            '{"verdict": "approved", "summary": "ok", "findings": ["a", "b"]}'
+        )
+        review_array = self._parse(output_array)
+        assert review_array.verdict == "approved"
+        assert review_array.notes == "ok"
+
+
     def test_fenced_json_is_preferred_over_unfenced_json(self):
         output = (
             '{"verdict":"changes_requested","summary":"example only"}\n'
@@ -3141,4 +3262,42 @@ def test_control_plane_file_escalates_when_review_independence_undetermined(tmp_
         assert mock_esc.called
         assert "cannot be determined" in mock_esc.call_args.kwargs.get("reason", "")
 
+
+class TestMinimalCfgConfigErrorPropagation:
+    """TICK-650 review finding: _minimal_cfg's fallback must not mask a genuine
+    config validation failure (e.g. a malformed executors.aider.model_settings
+    block) behind a bogus executors-less config."""
+
+    def test_config_error_propagates_not_swallowed(self, tmp_path):
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir()
+        ticket_path = tickets_dir / "TICK-900.md"
+        ticket_path.write_text("---\nid: TICK-900\n---\nBody.\n")
+        ticket = {"id": "TICK-900", "_path": ticket_path}
+
+        (tmp_path / ".lanegate.yml").write_text(
+            "executors:\n"
+            "  aider:\n"
+            "    model_settings:\n"
+            "      some-model:\n"
+            "        context_window_tokens: 0\n"
+        )
+
+        with pytest.raises(ConfigError):
+            _minimal_cfg(ticket, tmp_path)
+
+    def test_other_exceptions_still_fall_back(self, tmp_path):
+        """A non-ConfigError failure (e.g. an unreadable/corrupt file) must
+        still use the inferred-from-ticket-path fallback, unchanged."""
+        tickets_dir = tmp_path / "tickets"
+        tickets_dir.mkdir()
+        ticket_path = tickets_dir / "TICK-901.md"
+        ticket_path.write_text("---\nid: TICK-901\n---\nBody.\n")
+        ticket = {"id": "TICK-901", "_path": ticket_path}
+
+        with patch("lanegate.config.load_config", side_effect=OSError("boom")):
+            cfg = _minimal_cfg(ticket, tmp_path)
+
+        assert cfg["ticket_prefix"] == "TICK"
+        assert cfg["tickets_dir"] == str(tickets_dir)
 

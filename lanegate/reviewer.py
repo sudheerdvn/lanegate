@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from lanegate.config import load_config, resolve_trunk_branch
+from lanegate import executor
 from lanegate.executor import matching_verification_groups
 from lanegate.safeguards import effective_safeguards
 from lanegate.ticket import load_acceptance_contract_audit, load_change_notes
@@ -29,6 +30,7 @@ from lanegate.prompts import (
     render_discovery_guidance,
     render_prompt,
     resolve_reference_doc_paths,
+    truncate_diff_to_budget,
     truncate_to_budget,
 )
 from lanegate.ticket import load_file_skeletons
@@ -36,6 +38,27 @@ from lanegate.ticket import load_file_skeletons
 
 class ReviewError(Exception):
     """Raised when a review cannot proceed (missing worktree, empty diff, etc.)."""
+
+
+def _diff_truncation_note(section_label: str, omitted_paths: list[str]) -> str:
+    """Trusted-layer note for when a diff was too large and whole files were dropped.
+
+    Placed in the trusted instruction layer (not the diff itself) so it reads
+    as an authoritative caveat rather than something an attacker-controlled
+    diff could imitate or bury. The omitted paths are lanegate-computed from
+    the diff's own file headers, not copied from untrusted prose.
+    """
+    file_list = ", ".join(omitted_paths)
+    return (
+        f"## {section_label} was truncated — some changed files are not shown\n\n"
+        f"The following files changed on this branch but were cut entirely from "
+        f"{section_label} below because the combined diff exceeded this step's size "
+        f"budget: {file_list}. Do not treat their absence as evidence they are "
+        "unchanged, or as confirmation that an issue in them is still unresolved — "
+        "you have no evidence about their current content either way. Say so "
+        "explicitly (e.g. \"cannot verify — file omitted from diff\") rather than "
+        "repeating a prior finding about one of these files as if you re-checked it."
+    )
 
 
 @dataclass
@@ -250,7 +273,16 @@ def parse_drift_check_result(raw: str) -> DriftCheckResult:
     try:
         # strict=False tolerates a literal control character (e.g. a raw
         # newline) inside a string value -- see parse_review_result.
-        data = json.loads(raw, strict=False)
+        try:
+            data = json.loads(raw, strict=False)
+        except json.JSONDecodeError:
+            # A drift-check agent's own "reason" text is exactly as prone to
+            # unescaped interior quotes as a review verdict's summary/findings
+            # -- reuse the same character-level repair rather than failing
+            # closed on a response that is otherwise well-formed.
+            from lanegate.orchestrate.review import _escape_interior_quotes
+
+            data = json.loads(_escape_interior_quotes(raw), strict=False)
         drift_ok = data.get("drift_ok")
         if not isinstance(drift_ok, bool):
             raise ValueError(f"Missing or invalid drift_ok: {drift_ok!r}")
@@ -284,6 +316,87 @@ def _test_shaped_guards(guards: list[str]) -> list[str]:
     return [g for g in guards if _TEST_GUARD_PATTERN.search(str(g))]
 
 
+def is_non_tool_reviewer(reviewer_type: str | None) -> bool:
+    """Return True if *reviewer_type* runs without an interactive tool-dispatch loop.
+
+    Delegates to the central ``executor.EXECUTOR_CAPABILITIES`` registry so
+    that newly registered non-agentic executor types are automatically covered
+    without needing a separate entry here.  An unknown or ``None`` reviewer
+    type returns ``False`` (safe default: assume tool-capable).
+
+    See TICK-644 for why this matters: non-tool reviewers must receive the diff
+    inline rather than being told to run ``git diff`` themselves, because they
+    have no tool loop to satisfy a ``<tool_call>`` they emit.
+    """
+    if reviewer_type is None or reviewer_type not in executor.EXECUTOR_CAPABILITIES:
+        return False
+    return not executor.has_capability(reviewer_type, "tool_dispatch_loop")
+
+
+def _diff_access_note(non_tool_reviewer: bool, has_diff: bool) -> str:
+    if not non_tool_reviewer:
+        return (
+            "with full git, file, and test-execution tool access, the same "
+            "environment the implementer used. Do not search for it or run "
+            "commands from any other directory. Run `git diff main...HEAD` "
+            "(or `git log -p`) yourself and read the full surrounding "
+            "context of each changed file before judging anything; do not "
+            "evaluate from a pasted hunk."
+        )
+    if has_diff:
+        return (
+            "but you do not have shell or file-read tool access in this "
+            "session. The full diff of this branch is provided below as "
+            "GIT DIFF — inspect it directly, together with FILE SKELETONS "
+            "below when present, instead of attempting to run git or read "
+            "additional files yourself."
+        )
+    return (
+        "but you do not have shell or file-read tool access in this session, "
+        "and no branch diff could be extracted to include below. Judge only "
+        "from FILE SKELETONS, COMMIT MESSAGES, and the other untrusted-data "
+        "sections below."
+    )
+
+
+def _repro_execution_note(non_tool_reviewer: bool, has_diff: bool = False) -> str:
+    if not non_tool_reviewer:
+        return (
+            "construct and execute a minimal repro — a single targeted test "
+            "or a few git commands, not the full test suite — using your "
+            "existing git/file/test-execution tool access in the working "
+            "directory before writing it down; do not assert the failure "
+            "from reading the diff alone. Do not use a bare `git stash`/`git "
+            "stash pop` to temporarily revert code for this: stash is a "
+            "single repo-wide ref stack shared across every worktree of the "
+            "clone, and popping can silently apply an unrelated concurrent "
+            "session's changes. Instead, revert just the touched file's "
+            "working-tree content — `git show <parent-of-first-diff-commit>:"
+            "<path> > <path>` or `git checkout <parent-sha> -- <path>` — run "
+            "the targeted test, then restore with `git checkout HEAD -- "
+            "<path>`. If stash use is genuinely unavoidable, give it a "
+            "unique per-invocation name (ticket id plus a random 4-5 digit "
+            "suffix) and pop or drop it by that exact name via `git stash "
+            "list | grep '<name>'`, never a bare `git stash pop`/`git stash "
+            "pop stash@{0}`. If a repro genuinely cannot run in this "
+            "environment (for example it needs an external service or "
+            "credentials you do not have), say so explicitly and record the "
+            "finding as unverified by execution rather than silently "
+            "dropping it."
+        )
+    source = "GIT DIFF and FILE SKELETONS" if has_diff else "FILE SKELETONS"
+    return (
+        f"trace through a minimal repro by reading {source} — name the "
+        "concrete input or state and the exact resulting behavior. You do "
+        "not have shell, file, or test-execution tool access in this "
+        "session, so do not attempt to run git, run tests, or read "
+        "additional files: do not assert a failure without spelling out "
+        "that trace from what is already provided. If what is provided is "
+        "not enough to construct a concrete trace, say so explicitly and "
+        "record the finding as unverified rather than silently dropping it."
+    )
+
+
 def build_review_prompt(
     ticket: dict,
     commit_messages: str = "",
@@ -292,6 +405,8 @@ def build_review_prompt(
     *,
     _components: list | None = None,
     worktree_path: Path | None = None,
+    reviewer_type: str | None = None,
+    diff: str | None = None,
 ) -> str:
     """Return a trust-separated prompt for reviewing *ticket*.
 
@@ -319,10 +434,21 @@ def build_review_prompt(
             which repo-local coding/contribution instructions are added to the
             trusted prompt layer.
         worktree_path: Path to the ticket's git worktree (if distinct from project_root).
+        reviewer_type: The resolved reviewer executor type (e.g. ``"claude"``,
+            ``"aider"``, ``"ollama"``). When ``is_non_tool_reviewer`` returns
+            ``True`` for it (a single-turn, non-agentic invocation with no
+            tool-dispatch loop), the prompt inlines *diff* under a GIT DIFF
+            section and tells the reviewer to inspect it directly instead of
+            running git/file tools itself — otherwise those models emit a
+            dead-end ``<tool_call>`` and never produce a verdict (TICK-644).
+            ``None`` (the default) keeps the original tool-capable instructions.
+        diff: The branch's git diff (see ``get_worktree_diff``), forwarded
+            into the prompt only when *reviewer_type* is non-tool-capable.
 
     Returns:
         A fully-rendered prompt string safe to pass to the review agent.
     """
+    non_tool_reviewer = is_non_tool_reviewer(reviewer_type)
     raw_root = project_root if project_root is not None else Path.cwd()
     wt = worktree_path if worktree_path is not None else raw_root
     root = _resolve_control_root(raw_root)
@@ -342,6 +468,7 @@ def build_review_prompt(
     # declares touches — a ticket can declare touches for files that don't
     # parse (new files, non-code files) and get zero skeletons back.
     review_skeletons = load_file_skeletons(ticket, wt, regenerate=True)
+    has_diff = bool(diff and diff.strip())
 
     # Load the instruction text from the configurable template
     template = load_prompt_template("review", root)
@@ -355,6 +482,8 @@ def build_review_prompt(
         discovery_guidance=render_discovery_guidance(
             cfg, has_skeletons=bool(review_skeletons)
         ),
+        diff_access_note=_diff_access_note(non_tool_reviewer, has_diff),
+        repro_execution_note=_repro_execution_note(non_tool_reviewer, has_diff),
     ).strip()
 
     # Build the trusted instruction layer with base instruction + prior findings.
@@ -541,6 +670,14 @@ def build_review_prompt(
     }
     if bounded_skeletons:
         untrusted_sections["FILE SKELETONS"] = bounded_skeletons
+    bounded_diff = ""
+    if non_tool_reviewer and has_diff and diff is not None:
+        bounded_diff, _diff_truncated, _diff_omitted = truncate_diff_to_budget(
+            diff, get_payload_budget("review", cfg)
+        )
+        untrusted_sections["GIT DIFF"] = bounded_diff
+        if _diff_omitted:
+            full_instruction += "\n\n" + _diff_truncation_note("GIT DIFF", _diff_omitted)
     bounded_commit_messages = ""
     bounded_prior_findings = ""
     bounded_contract_findings = ""
@@ -597,6 +734,11 @@ def build_review_prompt(
             "verification-checklist", "ticket.verification", "review",
             "\n".join(verification_lines), reason="selected-by-ticket" if verification_lines else "no-checklist",
         ))
+        _components.append(_component(
+            "branch-diff", "worktree git diff", "review", bounded_diff,
+            reason="non-tool-reviewer" if non_tool_reviewer and has_diff
+            else ("tool-capable-reviewer" if not non_tool_reviewer else "no-diff-available"),
+        ))
 
     return build_prompt(
         full_instruction,
@@ -610,15 +752,28 @@ def describe_review_payload(
     project_root: Path | None = None,
     cfg: dict | None = None,
     worktree_path: Path | None = None,
+    reviewer_type: str | None = None,
+    diff: str | None = None,
 ) -> list[dict]:
     """Return a machine-readable breakdown of every component in the review
     prompt payload -- byte/token estimate, source, pipeline step, and whether
     it's always injected or selected because of the ticket. Component
     metadata only; never includes actual ticket/findings text (payload
     audit).
+
+    ``reviewer_type`` and ``diff`` must be resolved and forwarded by the
+    caller the same way ``run_review_agent()`` does (see TICK-644) -- without
+    them ``is_non_tool_reviewer(None)`` is always False here, so a project
+    actually configured with ``reviewer: aider`` / ``reviewer: ollama`` gets
+    audited against the tool-capable prompt shape and undercounts the
+    (potentially large) inlined GIT DIFF section, defeating the audit's
+    purpose for exactly the configs TICK-644 targets.
     """
     components: list = []
-    build_review_prompt(ticket, commit_messages, project_root, cfg, _components=components, worktree_path=worktree_path)
+    build_review_prompt(
+        ticket, commit_messages, project_root, cfg, _components=components,
+        worktree_path=worktree_path, reviewer_type=reviewer_type, diff=diff,
+    )
     return [c.as_dict() for c in components]
 
 
@@ -657,7 +812,7 @@ def build_fix_prompt(
     raw_root = project_root if project_root is not None else Path.cwd()
     wt = worktree_path if worktree_path is not None else raw_root
     root = _resolve_control_root(raw_root)
-    diff, _ = truncate_to_budget(diff, get_payload_budget("fix", cfg))
+    diff, _diff_truncated, _diff_omitted = truncate_diff_to_budget(diff, get_payload_budget("fix", cfg))
     findings, _ = truncate_to_budget(findings, get_payload_budget("fix", cfg))
 
     tid = ticket["id"]
@@ -677,6 +832,8 @@ def build_fix_prompt(
     ).strip()
 
     trusted_parts = [instruction]
+    if _diff_omitted:
+        trusted_parts.append(_diff_truncation_note("GIT DIFF", _diff_omitted))
 
     declared_touches = ticket.get("touches") or []
 
@@ -785,8 +942,12 @@ def build_drift_check_prompt(
     raw_root = project_root if project_root is not None else Path.cwd()
     wt = worktree_path if worktree_path is not None else raw_root
     root = _resolve_control_root(raw_root)
-    original_diff, _ = truncate_to_budget(original_diff, get_payload_budget("fix", cfg))
-    fix_diff, _ = truncate_to_budget(fix_diff, get_payload_budget("fix", cfg))
+    original_diff, _orig_truncated, _orig_omitted = truncate_diff_to_budget(
+        original_diff, get_payload_budget("fix", cfg)
+    )
+    fix_diff, _fix_truncated, _fix_omitted = truncate_diff_to_budget(
+        fix_diff, get_payload_budget("fix", cfg)
+    )
     findings, _ = truncate_to_budget(findings, get_payload_budget("fix", cfg))
 
     tid = ticket["id"]
@@ -810,6 +971,10 @@ def build_drift_check_prompt(
     )
     if project_guidance:
         trusted_parts.append(project_guidance)
+    if _orig_omitted:
+        trusted_parts.append(_diff_truncation_note("ORIGINAL DIFF", _orig_omitted))
+    if _fix_omitted:
+        trusted_parts.append(_diff_truncation_note("FIX DIFF", _fix_omitted))
 
     full_instruction = "\n\n".join(trusted_parts)
 

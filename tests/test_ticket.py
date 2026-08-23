@@ -27,6 +27,7 @@ from lanegate.ticket import (
     get_ticket_summary,
     group_by_status,
     load_all_tickets,
+    is_lanegate_notes_file,
     is_paired_test_file,
     load_file_skeletons,
     needs_attention,
@@ -1745,6 +1746,31 @@ class TestIsPairedTestFile:
     def test_paired_test_file_when_touched_module_nested(self):
         """Matches by module stem regardless of the touched module's own directory depth."""
         assert is_paired_test_file("tests/test_foo.py", {"myapp/sub/foo.py"})
+
+
+class TestIsLanegateNotesFile:
+    """Unit tests for is_lanegate_notes_file (TICK-651). Shared by
+    lifecycle.py's check_touches_compliance and orchestrate/loop.py's two
+    scope-drift guards, the same way is_paired_test_file is."""
+
+    def test_v2_notes_file_is_exempt(self):
+        assert is_lanegate_notes_file(".lanegate/notes/v2/lanegate_sexecutor.py.md")
+
+    def test_global_notes_file_is_exempt(self):
+        assert is_lanegate_notes_file(".lanegate/notes/global.md")
+
+    def test_legacy_flat_notes_file_is_exempt(self):
+        assert is_lanegate_notes_file(".lanegate/notes/lanegate_executor.py.md")
+
+    def test_non_notes_file_under_lanegate_dir_not_exempt(self):
+        assert not is_lanegate_notes_file(".lanegate/tickets/TICK-001.md")
+
+    def test_unrelated_file_not_exempt(self):
+        assert not is_lanegate_notes_file("lanegate/executor.py")
+
+    def test_file_merely_named_notes_elsewhere_not_exempt(self):
+        """Only the .lanegate/notes/ directory is exempt, not any file named notes.*."""
+        assert not is_lanegate_notes_file("docs/notes/global.md")
 
 
 def test_explanatory_docstrings():

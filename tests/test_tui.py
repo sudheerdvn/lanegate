@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.server
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -77,10 +78,11 @@ def test_wait_for_api_ready_times_out_when_nothing_listens():
     with (
         patch("lanegate.tui._API_READY_TIMEOUT_S", 0.2),
         patch("lanegate.tui._API_READY_POLL_INTERVAL_S", 0.05),
+        patch("lanegate.tui._terminate_process_tree") as mock_terminate,
         pytest.raises(TuiLaunchError, match="timed out"),
     ):
         _wait_for_api_ready(proc, _free_port())
-    assert proc.terminated
+    mock_terminate.assert_called_once_with(proc)
 
 
 def test_default_launch_spawns_api_subprocess_on_selected_port_and_tears_it_down(tmp_path):
@@ -91,40 +93,20 @@ def test_default_launch_spawns_api_subprocess_on_selected_port_and_tears_it_down
         patch("subprocess.Popen", return_value=fake_api_proc) as mock_popen,
         patch("lanegate.tui._wait_for_api_ready"),
         patch("subprocess.run") as mock_run,
+        patch("lanegate.tui._terminate_process_tree") as mock_terminate,
     ):
         cmd_tui(tmp_path)
 
     popen_args = mock_popen.call_args[0][0]
     assert popen_args[-3:] == ["api", "--port", "54321"]
+    popen_kwargs = mock_popen.call_args[1]
+    assert popen_kwargs["start_new_session"] == (sys.platform != "win32")
+    assert popen_kwargs["creationflags"] == (0x00000200 if sys.platform == "win32" else 0)
     mock_run.assert_called_once()
     tui_argv = mock_run.call_args[0][0]
     assert "--api-url" in tui_argv
     assert tui_argv[tui_argv.index("--api-url") + 1] == "http://127.0.0.1:54321"
-    assert fake_api_proc.terminated
-    assert fake_api_proc.wait_calls == 1
-
-
-def test_default_launch_kills_api_subprocess_if_terminate_does_not_stop_it(tmp_path):
-    fake_api_proc = FakeProc()
-
-    def slow_wait(timeout=None):
-        fake_api_proc.wait_calls += 1
-        if fake_api_proc.wait_calls == 1:
-            raise __import__("subprocess").TimeoutExpired(cmd="lanegate api", timeout=timeout or 0)
-        return fake_api_proc.returncode
-
-    fake_api_proc.wait = slow_wait
-    with (
-        patch("lanegate.tui._go_tui_command", return_value=(["lanegate-tui"], None)),
-        patch("lanegate.tui._select_loopback_port", return_value=54322),
-        patch("subprocess.Popen", return_value=fake_api_proc),
-        patch("lanegate.tui._wait_for_api_ready"),
-        patch("subprocess.run"),
-    ):
-        cmd_tui(tmp_path)
-
-    assert fake_api_proc.terminated
-    assert fake_api_proc.killed
+    mock_terminate.assert_called_once_with(fake_api_proc)
 
 
 def test_default_launch_reports_launch_error_when_api_never_ready(tmp_path):
@@ -135,6 +117,7 @@ def test_default_launch_reports_launch_error_when_api_never_ready(tmp_path):
         patch("subprocess.Popen", return_value=fake_api_proc),
         patch("lanegate.tui._wait_for_api_ready", side_effect=TuiLaunchError("nope", exit_code=1)),
         patch("subprocess.run") as mock_run,
+        patch("lanegate.tui._terminate_process_tree") as mock_terminate,
         pytest.raises(SystemExit) as exc_info,
     ):
         cmd_tui(tmp_path)
@@ -142,7 +125,7 @@ def test_default_launch_reports_launch_error_when_api_never_ready(tmp_path):
     assert exc_info.value.code == 1
     mock_run.assert_not_called()
     # The API subprocess must still be torn down even though launch failed.
-    assert fake_api_proc.terminated
+    mock_terminate.assert_called_once_with(fake_api_proc)
 
 
 def test_api_url_path_does_not_spawn_a_subprocess(tmp_path):

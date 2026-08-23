@@ -126,6 +126,22 @@ def test_trunk_branch_detects_origin_head_before_main_fallback(tmp_path):
     assert load_config(tmp_path)["trunk_branch"] == "develop"
 
 
+def test_current_git_branch_does_not_hang_on_blocked_git(tmp_path):
+    """A blocked/wedged `git branch --show-current` (a hook prompting for
+    input, a wedged process, an unusual submodule setup) must not hang
+    interactive_init indefinitely before it prints even the first prompt --
+    matches the timeout=10 the sibling helper _repo_tracked_files() already
+    has for the same kind of git subprocess call from the same wizard flow."""
+    from lanegate.config import _current_git_branch
+
+    with mock.patch(
+        "lanegate.config.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["git", "branch", "--show-current"], timeout=10),
+    ) as mock_run:
+        assert _current_git_branch(tmp_path) is None
+    assert mock_run.call_args.kwargs.get("timeout") == 10
+
+
 def test_executor_stream_timeout_overrides_and_ordering(tmp_path):
     _write_config(
         tmp_path / CONFIG_FILENAME,
@@ -1715,6 +1731,14 @@ def test_suggested_safeguards_yaml_names_commands(tmp_path):
 class TestInteractiveInit:
     """Tests for interactive_init() — only the non-interactive paths."""
 
+    @pytest.fixture(autouse=True)
+    def _no_ollama_network(self):
+        """discover_ollama_models makes a real (bounded, 1s) network call --
+        tests that don't specifically exercise it must not depend on whether
+        a local Ollama happens to be running on this machine (TICK-645)."""
+        with mock.patch("lanegate.executor.discover_ollama_models", return_value=[]):
+            yield
+
     def test_defaults_writes_minimal_config(self, tmp_path):
         """--defaults path writes .lanegate.yml with expected minimal fields."""
         with mock.patch("lanegate.config._registry_save"):
@@ -2129,6 +2153,421 @@ class TestInteractiveInit:
         # The file must still be there
         assert ticket_file.exists()
         assert "Important ticket." in ticket_file.read_text()
+
+
+class TestInteractiveInitLocalOllamaWorkflow:
+    """TICK-645: init wizard gaps found end-to-end-testing a local Ollama/Aider
+    setup -- trunk branch, autonomy, model discovery, edit_format, and
+    review_fallback all silently produced a config that needed manual
+    .lanegate.yml edits before `lanegate run` worked unattended."""
+
+    @pytest.fixture(autouse=True)
+    def _no_ollama_network(self):
+        with mock.patch("lanegate.executor.discover_ollama_models", return_value=[]):
+            yield
+
+    def _run(self, tmp_path, fake_input):
+        with (
+            mock.patch("sys.stdin") as mock_stdin,
+            mock.patch("builtins.input", side_effect=fake_input),
+            mock.patch("lanegate.config._registry_save"),
+        ):
+            mock_stdin.isatty.return_value = False
+            return interactive_init(tmp_path, force_interactive=True)
+
+    # --- trunk_branch: active branch, not a blind "main" ---
+
+    def test_trunk_branch_defaults_to_current_git_branch(self, tmp_path):
+        with mock.patch("lanegate.config._current_git_branch", return_value="refactor-code"):
+            cfg = self._run(tmp_path, lambda _="": "")
+        assert cfg["trunk_branch"] == "refactor-code"
+
+    def test_trunk_branch_falls_back_to_main_when_undetectable(self, tmp_path):
+        with mock.patch("lanegate.config._current_git_branch", return_value=None):
+            cfg = self._run(tmp_path, lambda _="": "")
+        assert cfg["trunk_branch"] == "main"
+
+    def test_trunk_branch_typed_override_is_respected(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "develop" if prompt_text.startswith("trunk_branch ") else ""
+
+        with mock.patch("lanegate.config._current_git_branch", return_value="refactor-code"):
+            cfg = self._run(tmp_path, fake_input)
+        assert cfg["trunk_branch"] == "develop"
+
+    def test_trunk_branch_prefers_real_origin_head_over_current_branch(self, tmp_path):
+        """A cloned repo with a remote configured (origin/HEAD -> main) but
+        currently checked out on a local feature/WIP branch during `init`
+        must default to "main" -- the real, authoritative trunk -- not the
+        branch the user happens to be sitting on right now. Only a repo with
+        no detectable origin/HEAD at all (a fresh local project, TICK-645)
+        should fall back to suggesting the checked-out branch."""
+        with (
+            mock.patch("lanegate.config._detect_origin_head_branch", return_value="main"),
+            mock.patch("lanegate.config._current_git_branch", return_value="my-feature"),
+        ):
+            cfg = self._run(tmp_path, lambda _="": "")
+        assert cfg["trunk_branch"] == "main"
+
+    # --- autonomy: explicit opt-in to unattended "full" ---
+
+    def test_autonomy_default_stays_supervised_and_unset(self, tmp_path):
+        """Blank answer must not write an explicit autonomy: supervised --
+        resolve_autonomy() already defaults there; the point is offering an
+        opt-in to full, not changing the safe default's behavior."""
+        cfg = self._run(tmp_path, lambda _="": "")
+        assert "autonomy" not in cfg
+        assert "default_human_review" not in cfg
+
+    def test_autonomy_full_choice_sets_autonomy_and_human_review(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "1" if prompt_text.startswith("autonomy ") else ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert cfg["autonomy"] == "full"
+        assert cfg["default_human_review"] == "none"
+
+    def test_autonomy_invalid_choice_warns_and_stays_supervised(self, tmp_path, capsys):
+        def fake_input(prompt_text: str = "") -> str:
+            return "9" if prompt_text.startswith("autonomy ") else ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert "autonomy" not in cfg
+        assert "Invalid choice" in capsys.readouterr().out
+
+    # --- edit_format: size-aware, not a flat "whole" ---
+
+    def test_edit_format_defaults_to_diff_when_large_file_detected(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        with mock.patch(
+            "lanegate.config._recommend_aider_edit_format",
+            return_value=("diff", "Detected `capture.py` at 1200 lines"),
+        ):
+            cfg = self._run(tmp_path, fake_input)
+        assert cfg["executors"]["aider"]["edit_format"] == "diff"
+
+    def test_edit_format_note_printed_when_large_file_detected(self, tmp_path, capsys):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        with mock.patch(
+            "lanegate.config._recommend_aider_edit_format",
+            return_value=("diff", "Detected `capture.py` at 1200 lines"),
+        ):
+            self._run(tmp_path, fake_input)
+        assert "Detected `capture.py` at 1200 lines" in capsys.readouterr().out
+
+    def test_edit_format_defaults_to_whole_when_no_large_file(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        with mock.patch(
+            "lanegate.config._recommend_aider_edit_format", return_value=("whole", None)
+        ):
+            cfg = self._run(tmp_path, fake_input)
+        assert cfg["executors"]["aider"]["edit_format"] == "whole"
+
+    # --- models.fix / models.drift_check: same unconfigured-step gap as
+    # analyze/implement/review, and a local aider+Ollama route gets a
+    # friendlier max_auto_fix_attempts default since retries are free ---
+
+    def test_model_prompts_include_fix_and_drift_check(self, tmp_path, capsys):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        self._run(tmp_path, fake_input)
+        out = capsys.readouterr().out
+        assert "models.fix" in out
+        assert "models.drift_check" in out
+
+    def test_blank_fix_and_drift_check_prompts_use_wizard_defaults(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert cfg["models"]["fix"] == cfg["models"]["implement"]
+        assert cfg["models"]["drift_check"] == cfg["models"]["review"]
+
+    def test_local_ollama_aider_defaults_max_auto_fix_attempts_to_two(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert cfg["executors"]["aider"]["provider"] == "ollama"
+        assert cfg["max_auto_fix_attempts"] == 2
+
+    def test_cloud_executor_leaves_max_auto_fix_attempts_at_runtime_default(self, tmp_path):
+        # claude is the wizard's own default executor -- accepting every
+        # prompt blank never routes through the local-Ollama branch, so
+        # this must NOT set max_auto_fix_attempts: the cloud-cost guardrail
+        # default of 1 (see resolve_model / config.DEFAULTS) should apply
+        # unless the project opts in explicitly.
+        cfg = self._run(tmp_path, lambda _="": "")
+        assert cfg["executor"] == "claude"
+        assert "max_auto_fix_attempts" not in cfg
+
+    def test_recommend_aider_edit_format_flags_file_too_large_to_line_count(self, tmp_path):
+        """A tracked file over the 2MB threshold must not be silently
+        excluded from consideration (the file is too large/risky to safely
+        open and line-count) -- it should still trigger the 'diff'
+        recommendation directly from its size, since excluding it entirely
+        would mean the single riskiest file in the repo could never be the
+        one that triggers the warning."""
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        huge = tmp_path / "huge_generated.py"
+        huge.write_text("x" * 2_500_000)
+        subprocess.run(["git", "add", "huge_generated.py"], cwd=tmp_path, check=True)
+
+        edit_format, note = _recommend_aider_edit_format(tmp_path)
+        assert edit_format == "diff"
+        assert "huge_generated.py" in note
+        assert "malformed hunk" in note
+
+    def test_recommend_aider_edit_format_stops_scanning_once_threshold_crossed(self, tmp_path):
+        """Once a file's line count crosses the 300-line 'diff' threshold,
+        further line-counting can't change the recommendation -- only which
+        filename gets cited. Scanning should stop there instead of opening
+        and reading every one of up to 3000 candidate files synchronously
+        inside the interactive wizard."""
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        big = tmp_path / "a_big.py"
+        big.write_text("\n".join(f"line {i}" for i in range(400)))
+        for i in range(20):
+            (tmp_path / f"b_small_{i}.py").write_text("pass\n")
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+
+        opened = []
+        real_open = open
+
+        def tracking_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=tracking_open):
+            edit_format, note = _recommend_aider_edit_format(tmp_path)
+
+        assert edit_format == "diff"
+        assert "a_big.py" in note
+        assert len(opened) == 1
+
+    def test_recommend_aider_edit_format_scans_repo_line_counts(self, tmp_path):
+        """Real (unmocked) behavior of the recommender itself, against actual
+        git-tracked files."""
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        big = tmp_path / "capture.py"
+        big.write_text("\n".join(f"line {i}" for i in range(1200)))
+        subprocess.run(["git", "add", "capture.py"], cwd=tmp_path, check=True)
+
+        edit_format, note = _recommend_aider_edit_format(tmp_path)
+        assert edit_format == "diff"
+        assert "capture.py" in note
+        assert "1200" in note
+
+    def test_recommend_aider_edit_format_note_mentions_diff_hunk_risk(self, tmp_path):
+        """When 'diff' is recommended because of a large file, the note must
+        also re-surface diff's own known malformed-hunk risk for small local
+        models, not only explain why 'whole' is risky."""
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        big = tmp_path / "capture.py"
+        big.write_text("\n".join(f"line {i}" for i in range(1200)))
+        subprocess.run(["git", "add", "capture.py"], cwd=tmp_path, check=True)
+
+        _, note = _recommend_aider_edit_format(tmp_path)
+        assert "malformed hunk" in note
+
+    def test_recommend_aider_edit_format_finds_large_file_beyond_tree_order_cutoff(self, tmp_path):
+        """A large tracked file that sorts alphabetically/tree-order after
+        the first 3000 entries (e.g. under vendor/... or zz_generated...)
+        must still be detected -- `git ls-files` order is not size order, so
+        scanning only the first 3000 entries in that order can miss the very
+        file that would break 'whole'."""
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        for i in range(3005):
+            (tmp_path / f"a_{i:05d}.py").write_text("pass\n")
+        big = tmp_path / "zz_generated.py"
+        big.write_text("\n".join(f"line {i}" for i in range(1200)))
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+
+        edit_format, note = _recommend_aider_edit_format(tmp_path)
+        assert edit_format == "diff"
+        assert "zz_generated.py" in note
+
+    def test_recommend_aider_edit_format_whole_when_all_files_small(self, tmp_path):
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        small = tmp_path / "small.py"
+        small.write_text("\n".join(f"line {i}" for i in range(10)))
+        subprocess.run(["git", "add", "small.py"], cwd=tmp_path, check=True)
+
+        edit_format, note = _recommend_aider_edit_format(tmp_path)
+        assert edit_format == "whole"
+        assert note is None
+
+    # --- review_fallback: independent models on the same tool ---
+
+    def test_review_fallback_set_when_same_tool_different_models(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("reviewer "):
+                return "aider"
+            if prompt_text.startswith("  models.implement"):
+                return "ollama_chat/qwen2.5-coder:14b"
+            if prompt_text.startswith("  models.review"):
+                return "ollama_chat/qwen2.5-coder:32b"
+            return ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert cfg["reviewer"] == "aider"
+        assert cfg["review_fallback"] == "different_model"
+
+    def test_review_fallback_not_set_when_models_match(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("reviewer "):
+                return "aider"
+            if prompt_text.startswith("  models."):
+                return "ollama_chat/qwen2.5-coder:14b"
+            return ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert "review_fallback" not in cfg
+
+    def test_review_fallback_not_set_when_reviewer_differs_from_executor(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("reviewer "):
+                return "claude"
+            if prompt_text.startswith("  models.implement"):
+                return "ollama_chat/qwen2.5-coder:14b"
+            if prompt_text.startswith("  models.review"):
+                return "claude-sonnet-5"
+            return ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert "review_fallback" not in cfg
+
+    def test_review_fallback_not_set_when_reviewer_prompt_left_blank(self, tmp_path):
+        """A blank reviewer prompt makes the local `reviewer` variable default
+        to `executor` internally, but reviewer_explicit stays False and no
+        cfg["reviewer"] key is written -- review_fallback must not key off
+        that internal default the same way it keys off an actual explicit
+        same-tool pin, or it silently bypasses the reviewer_explicit
+        safeguard that blank-answer case was specifically built for."""
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("reviewer "):
+                return ""
+            if prompt_text.startswith("  models.implement"):
+                return "ollama_chat/qwen2.5-coder:14b"
+            if prompt_text.startswith("  models.review"):
+                return "ollama_chat/qwen2.5-coder:32b"
+            return ""
+
+        cfg = self._run(tmp_path, fake_input)
+        assert "reviewer" not in cfg
+        assert "review_fallback" not in cfg
+
+    # --- model discovery: suggest what's actually installed ---
+
+    def test_model_prompt_offers_discovered_ollama_models_for_aider(self, tmp_path, capsys):
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        with mock.patch(
+            "lanegate.executor.discover_ollama_models",
+            return_value=["qwen2.5-coder:14b", "qwen2.5-coder:32b"],
+        ):
+            cfg = self._run(tmp_path, fake_input)
+
+        out = capsys.readouterr().out
+        assert "ollama_chat/qwen2.5-coder:14b" in out
+        assert "ollama_chat/qwen2.5-coder:32b" in out
+        assert "ollama_chat/" in out and "'ollama_chat/' prefix" in out
+        # analyze/implement should suggest the 14b tag, review the 32b tag
+        assert cfg["models"]["analyze"] == "ollama_chat/qwen2.5-coder:14b"
+        assert cfg["models"]["review"] == "ollama_chat/qwen2.5-coder:32b"
+
+    def test_model_prompt_picker_number_selects_discovered_model(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("  models.analyze"):
+                return "2"
+            return ""
+
+        with mock.patch(
+            "lanegate.executor.discover_ollama_models",
+            return_value=["qwen2.5-coder:14b", "qwen3-coder:30b"],
+        ):
+            cfg = self._run(tmp_path, fake_input)
+
+        assert cfg["models"]["analyze"] == "ollama_chat/qwen3-coder:30b"
+
+    def test_model_prompt_raw_ollama_executor_gets_no_prefix(self, tmp_path):
+        def fake_input(prompt_text: str = "") -> str:
+            return "ollama" if prompt_text.startswith("executor ") else ""
+
+        with mock.patch(
+            "lanegate.executor.discover_ollama_models",
+            return_value=["qwen2.5-coder:14b"],
+        ):
+            cfg = self._run(tmp_path, fake_input)
+
+        assert cfg["models"]["analyze"] == "qwen2.5-coder:14b"
+
+    def test_model_prompt_falls_back_to_hardcoded_default_when_discovery_empty(self, tmp_path):
+        """discover_ollama_models() returning [] (Ollama not running / no
+        models pulled) must reproduce the pre-TICK-645 hardcoded suggestion,
+        not leave the prompt without any default."""
+
+        def fake_input(prompt_text: str = "") -> str:
+            return "aider" if prompt_text.startswith("executor ") else ""
+
+        cfg = self._run(tmp_path, fake_input)  # autouse fixture -> discovery returns []
+        assert cfg["models"]["analyze"] == "ollama_chat/qwen2.5-coder:14b"
+
+    def test_model_prompt_rejects_out_of_range_picker_digit(self, tmp_path, capsys):
+        """An out-of-range picker digit (only 2 models discovered, user types
+        "9") must not fall through picker.get(value, value) as a literal
+        model string "9" -- validate_model_for_executor() has no branch for
+        executor_type == "ollama" at all, so that would be silently accepted
+        and written to .lanegate.yml, only failing later at dispatch."""
+        calls = {"n": 0}
+
+        def fake_input(prompt_text: str = "") -> str:
+            if prompt_text.startswith("executor "):
+                return "aider"
+            if prompt_text.startswith("  models.analyze"):
+                calls["n"] += 1
+                return "9" if calls["n"] == 1 else "1"
+            return ""
+
+        with mock.patch(
+            "lanegate.executor.discover_ollama_models",
+            return_value=["qwen2.5-coder:14b", "qwen3-coder:30b"],
+        ):
+            cfg = self._run(tmp_path, fake_input)
+
+        assert "Invalid choice" in capsys.readouterr().out
+        assert cfg["models"]["analyze"] == "ollama_chat/qwen2.5-coder:14b"
+        assert calls["n"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2816,6 +3255,118 @@ executor_steps:
         )
         cfg = load_config(tmp_path)
         assert cfg["executor_steps"]["review"] == "human"
+
+
+# ---------------------------------------------------------------------------
+# model_settings validation tests (TICK-650)
+# ---------------------------------------------------------------------------
+
+
+class TestAiderModelSettings:
+    """Validate executors.aider.model_settings block in load_config."""
+
+    def test_model_settings_valid_shape(self, tmp_path):
+        """A well-formed model_settings block parses without ConfigError."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    edit_format: diff
+    context_window_tokens: 65536
+    model_settings:
+      'ollama_chat/gpt-oss:20b':
+        context_window_tokens: 131072
+        edit_format: whole
+      'ollama_chat/qwen2.5-coder:14b':
+        context_window_tokens: 49152
+""",
+        )
+        cfg = load_config(tmp_path)
+        ms = cfg["executors"]["aider"]["model_settings"]
+        assert ms["ollama_chat/gpt-oss:20b"]["context_window_tokens"] == 131072
+        assert ms["ollama_chat/gpt-oss:20b"]["edit_format"] == "whole"
+        assert ms["ollama_chat/qwen2.5-coder:14b"]["context_window_tokens"] == 49152
+
+    def test_model_settings_invalid_context_window_tokens(self, tmp_path):
+        """context_window_tokens=0 under model_settings raises ConfigError
+        (same constraint as the flat key)."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    context_window_tokens: 65536
+    model_settings:
+      'ollama_chat/qwen2.5-coder:14b':
+        context_window_tokens: 0
+""",
+        )
+        with pytest.raises(ConfigError, match="context_window_tokens must be a positive integer"):
+            load_config(tmp_path)
+
+    def test_model_settings_invalid_context_window_tokens_negative(self, tmp_path):
+        """context_window_tokens=-1 under model_settings raises ConfigError."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    model_settings:
+      'ollama_chat/qwen2.5-coder:14b':
+        context_window_tokens: -1
+""",
+        )
+        with pytest.raises(ConfigError, match="context_window_tokens must be a positive integer"):
+            load_config(tmp_path)
+
+    def test_model_settings_invalid_edit_format(self, tmp_path):
+        """An empty string for edit_format under model_settings raises ConfigError
+        (same constraint as the flat key)."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    model_settings:
+      'ollama_chat/qwen2.5-coder:14b':
+        edit_format: ''
+""",
+        )
+        with pytest.raises(ConfigError, match="edit_format must be a non-empty string"):
+            load_config(tmp_path)
+
+    def test_model_settings_unknown_key_raises_if_flat_does(self, tmp_path):
+        """An unknown sub-key inside a model_settings entry raises ConfigError,
+        mirroring the flat-key validator's rejection of unknown keys."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    model_settings:
+      'ollama_chat/qwen2.5-coder:14b':
+        context_window_tokens: 49152
+        unknown_key: some_value
+""",
+        )
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(tmp_path)
+
+    def test_model_settings_absent_passes_validation(self, tmp_path):
+        """An aider config without model_settings passes validation unchanged
+        (backward compatibility: existing flat configs are unaffected)."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    edit_format: diff
+    context_window_tokens: 65536
+""",
+        )
+        cfg = load_config(tmp_path)
+        assert cfg["executors"]["aider"].get("model_settings") is None
 
 
 class TestVerificationValidation:
