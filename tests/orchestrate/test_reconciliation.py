@@ -764,7 +764,7 @@ class TestRunReportEvents:
             patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
             patch("lanegate.orchestrate._is_rate_limit", return_value=False),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),

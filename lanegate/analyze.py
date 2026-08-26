@@ -1398,8 +1398,8 @@ class _ContractItem:
 #     docs/ARCHITECTURE.md) by name, causing those docs to be pulled in as contract
 #     sources on the next run even when the ticket text itself never mentioned them.
 _OPERATIONAL_SECTION_RE = re.compile(
-    r"\n##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+"
-    r"|Review Findings|Acceptance Contract Audit|Status History|Lifecycle Timeline"
+    r"(?:^|\n)##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+"
+    r"|Review Findings|Dismissal Rationale|Acceptance Contract Audit|Status History|Lifecycle Timeline"
     r"|Post-Merge Verification Diagnostic)"
     r".*?(?=\n##\s|\Z)",
     re.IGNORECASE | re.DOTALL,
@@ -1448,6 +1448,43 @@ def _contract_terms(text: str) -> tuple[str, ...]:
         if token not in terms:
             terms.append(token)
     return tuple(terms)
+
+
+def _close_criteria_as_str(value: object) -> str:
+    """Coerce a close_criteria value (str or list) to a comparable string.
+
+    Tickets may store ``close_criteria`` as a YAML list of strings.  Joining
+    with newlines produces a canonical form that ``_normalize_contract_text``
+    can compare without calling ``.strip()`` on a list object.
+    """
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value)
+    return str(value) if value is not None else ""
+
+
+def _close_criteria_drifted(original: object, proposed: object) -> bool:
+    """Return True when the model-proposed close_criteria differs from the original.
+
+    Accepts ``str`` or ``list`` for both arguments; lists are normalised to a
+    newline-joined string so comparison is always performed on plain text.
+
+    Normalisation (collapse whitespace, lowercase) means trivial re-wrapping or
+    punctuation changes do not constitute drift.
+
+    * Empty ``original`` → no prior criteria exists, so nothing to restore; return False.
+    * Empty ``proposed`` with non-empty ``original`` → the model omitted a
+      pre-existing criteria; that is drift; return True so the guard restores it.
+    """
+    original_str = _close_criteria_as_str(original)
+    proposed_str = _close_criteria_as_str(proposed)
+    if not original_str:
+        return False
+    if not proposed_str:
+        return True
+    return (
+        _normalize_contract_text(original_str.strip())
+        != _normalize_contract_text(proposed_str.strip())
+    )
 
 
 def _covered_by_text(item: _ContractItem, text: str) -> bool:
@@ -2443,6 +2480,69 @@ def _parse_response(text: str) -> dict:
     return json.loads(span, strict=False)
 
 
+_ALREADY_RESOLVED_CITATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
+    r"[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|(?:Makefile|Dockerfile|Containerfile|Rakefile|Gemfile|Procfile))"
+    r"\s*:\s*~?L?"
+    r"(?P<start>\d+)(?:\s*[-–]\s*~?L?(?P<end>\d+))?"
+)
+
+
+def _already_resolved_reason_matches_worktree(reason: str, repo_root: Path) -> tuple[bool, str | None]:
+    """Reject cited resolved claims whose files, lines, or code snippets do not match.
+
+    Generalized reasons remain reviewable: only reasons that make a concrete
+    file-and-line claim are checked here.  The check intentionally fails closed
+    when a cited range cannot substantiate an inline code snippet.
+    """
+    citations = list(_ALREADY_RESOLVED_CITATION_RE.finditer(reason))
+    if not citations:
+        return True, None
+
+    cited_text: list[str] = []
+    for citation in citations:
+        relative = Path(citation.group("path"))
+        if relative.is_absolute() or ".." in relative.parts:
+            return False, f"unsafe cited path {relative}"
+        path = repo_root / relative
+        try:
+            path.resolve().relative_to(repo_root.resolve())
+        except ValueError:
+            return False, f"cited path {relative} escapes the worktree"
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            return False, f"cited file {relative} cannot be read"
+        start = int(citation.group("start"))
+        end = int(citation.group("end") or start)
+        if start < 1 or end < start or end > len(lines):
+            return False, f"cited range {relative}:{start}-{end} is not in the worktree"
+        cited_text.append("\n".join(lines[start - 1:end]))
+
+    # Backticks are the model response format's unambiguous marker for a code
+    # claim.  Require every such snippet to be present in at least one cited
+    # range, after normalizing whitespace so formatting-only changes do not
+    # cause a false rejection.
+    snippets = [
+        snippet
+        for snippet in re.findall(r"`([^`\n]+)`", reason)
+        if _ALREADY_RESOLVED_CITATION_RE.fullmatch(snippet.strip()) is None
+        # Backticks also commonly delimit filenames, symbols, and concepts.
+        # Only syntax-bearing text is an unambiguous literal code claim.
+        if re.search(r"[(){}\[\]=;:]", snippet)
+        or re.match(
+            r"\s*(?:async\s+def|def|class|return|raise|import|from|if|elif|else|for|while|try|except)\b",
+            snippet,
+        )
+    ]
+    normalized_ranges = [re.sub(r"\s+", " ", text).strip() for text in cited_text]
+    for snippet in snippets:
+        normalized_snippet = re.sub(r"\s+", " ", snippet).strip()
+        if normalized_snippet and not any(normalized_snippet in text for text in normalized_ranges):
+            return False, f"cited code snippet {snippet!r} is absent from the cited worktree lines"
+    return True, None
+
+
 # ---------------------------------------------------------------------------
 # Main command
 # ---------------------------------------------------------------------------
@@ -2576,36 +2676,18 @@ def _cmd_analyze_core(
                 tid=tid,
             )
 
-    # Build prompt and call model. Analyze is read-only, so unlike implement
-    # it can safely retry immediately on a healthy pool sibling after a quota
-    # error; no in-worktree progress check is relevant here.
-    visibility.emit("context_indexed", "Indexing context...")
-    prompt = _build_prompt(ticket, repo_root, cfg)
-    visibility.emit("prompt_ready", f"Prompt ready ({_estimate_prompt_tokens(prompt)} tokens)")
-    visibility.emit(
-        "model_requested",
-        f"Executor: {analyze_executor} Model: {analyze_model or 'default'}",
-    )
-    visibility.emit("model_requested", "Waiting for model... (elapsed 0s)")
-    waiting_reporter = _WaitingReporter(
-        lambda message: visibility.emit("model_requested", message),
-        visibility.started_at,
-        float(cfg.get("analyze_wait_interval_seconds", 10)),
-    )
-    waiting_reporter.start()
-    try:
+    def call_model_with_failover(model_prompt: str) -> tuple[str, str | None]:
+        """Call the current analyzer, failing over from rate-limited siblings."""
+        nonlocal analyze_driver_name, analyze_driver_cfg, analyze_executor, analyze_model
         max_retries = int(cfg.get("max_sibling_retries", 1))
         excluded: set[str] = set()
         attempts = 0
         while True:
             try:
-                raw, analyze_session_id = call_model(prompt)
+                response = call_model(model_prompt)
                 _clear_analyze_failure_streak(repo_root, analyze_driver_name)
-                break
+                return response
             except RuntimeError as exc:
-                # Classify against the executor's raw output, never the
-                # display message — see ExecutorCallError. Plain RuntimeErrors
-                # from other paths carry nothing raw, so fall back to str(exc).
                 raw_stdout = getattr(exc, "raw_stdout", "")
                 raw_stderr = getattr(exc, "raw_stderr", "") or str(exc)
                 is_rate_limited = _is_rate_limit(
@@ -2616,10 +2698,6 @@ def _cmd_analyze_core(
                         repo_root, analyze_driver_name, raw_stdout, raw_stderr
                     )
                     if failure_count == _ANALYZE_FAILURE_COOLDOWN_THRESHOLD:
-                        # Keep this reason independent of the raw error text:
-                        # write_cooldown intentionally discards known terminal
-                        # request/configuration errors, while this bounded
-                        # routing cooldown must apply to any repeated failure.
                         _write_executor_cooldown(
                             repo_root,
                             analyze_driver_name,
@@ -2627,11 +2705,7 @@ def _cmd_analyze_core(
                         )
                 elif is_rate_limited:
                     _clear_analyze_failure_streak(repo_root, analyze_driver_name)
-                if (
-                    model_fn is not None
-                    or attempts >= max_retries
-                    or not is_rate_limited
-                ):
+                if model_fn is not None or attempts >= max_retries or not is_rate_limited:
                     raise
                 reason = _rate_limit_reason(
                     1, repo_root, captured_stdout=raw_stdout, captured_stderr=raw_stderr
@@ -2658,6 +2732,26 @@ def _cmd_analyze_core(
                     "model_requested",
                     f"Executor: {analyze_executor} Model: {analyze_model or 'default'}",
                 )
+
+    # Build prompt and call model. Analyze is read-only, so unlike implement
+    # it can safely retry immediately on a healthy pool sibling after a quota
+    # error; no in-worktree progress check is relevant here.
+    visibility.emit("context_indexed", "Indexing context...")
+    prompt = _build_prompt(ticket, repo_root, cfg)
+    visibility.emit("prompt_ready", f"Prompt ready ({_estimate_prompt_tokens(prompt)} tokens)")
+    visibility.emit(
+        "model_requested",
+        f"Executor: {analyze_executor} Model: {analyze_model or 'default'}",
+    )
+    visibility.emit("model_requested", "Waiting for model... (elapsed 0s)")
+    waiting_reporter = _WaitingReporter(
+        lambda message: visibility.emit("model_requested", message),
+        visibility.started_at,
+        float(cfg.get("analyze_wait_interval_seconds", 10)),
+    )
+    waiting_reporter.start()
+    try:
+        raw, analyze_session_id = call_model_with_failover(prompt)
     except Exception as exc:
         print(f"ERROR: model call failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -2674,6 +2768,63 @@ def _cmd_analyze_core(
         print(f"ERROR: could not parse model response: {exc}", file=sys.stderr)
         print(f"Raw response:\n{raw[:600]}", file=sys.stderr)
         sys.exit(1)
+
+    # A specific already-resolved claim has a higher consequence than an
+    # ordinary analysis response.  Verify concrete citations before allowing
+    # it to move the ticket to needs_review; a bad claim gets one normal
+    # analysis retry rather than being persisted as a plausible-sounding fact.
+    fallback_attempted = False
+    while bool(result.get("already_resolved")):
+        reason = (result.get("already_resolved_reason") or "").strip()
+        verified, mismatch = _already_resolved_reason_matches_worktree(reason, repo_root)
+        if verified:
+            break
+        if fallback_attempted:
+            print(
+                f"ERROR: normal analysis fallback returned an invalid already_resolved verdict: {mismatch}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        fallback_attempted = True
+        if not verified:
+            warning = (
+                f"WARNING: {tid}: rejected already_resolved verdict because {mismatch}; "
+                "requesting a normal analysis pass"
+            )
+            visibility.emit("already_resolved_rejected", warning)
+            print(warning, file=sys.stderr)
+            try:
+                retry_raw, analyze_session_id = call_model_with_failover(
+                    prompt + "\n\nThe prior already_resolved claim did not match the current worktree. "
+                    "Provide a normal analysis response with touches and close_criteria; do not return "
+                    "already_resolved."
+                )
+                raw = retry_raw
+                visibility.executor_output(raw)
+                result = _parse_response(raw)
+            except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                print(f"ERROR: normal analysis fallback failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+
+    close_criteria = result.get("close_criteria", "")
+    if isinstance(close_criteria, str):
+        close_criteria = close_criteria.strip()
+
+    # Restore the ticket's acceptance contract before close_criteria influences
+    # any derived state, including already_resolved branches, inferred touches,
+    # and companion docs.
+    original_criteria = ticket.get("close_criteria", "")
+    if _close_criteria_drifted(original_criteria, close_criteria):
+        visibility.emit(
+            "drift",
+            f"WARNING: {tid}: model rewrote close_criteria — restoring original wording",
+        )
+        print(
+            f"WARNING: {tid}: model rewrote close_criteria — restoring original wording",
+            file=sys.stderr,
+        )
+        close_criteria = original_criteria
+        result["close_criteria"] = original_criteria
 
     already_resolved = bool(result.get("already_resolved"))
     already_resolved_reason = (result.get("already_resolved_reason") or "").strip()
@@ -2722,7 +2873,6 @@ def _cmd_analyze_core(
         sys.exit(0)
 
     touches = result.get("touches")
-    close_criteria = result.get("close_criteria", "").strip()
     depends_on = result.get("depends_on") or []
     change_notes = result.get("change_notes") or {}
     model = result.get("model")
@@ -2734,9 +2884,9 @@ def _cmd_analyze_core(
             "ERROR: model returned empty or non-list touches; ticket left as draft", file=sys.stderr
         )
         sys.exit(1)
-    if not close_criteria:
-        print("ERROR: model returned empty close_criteria; ticket left as draft", file=sys.stderr)
-        sys.exit(1)
+    # NOTE: empty close_criteria is checked *after* the drift guard above so
+    # that a model that omits criteria for a ticket with an existing one can
+    # have the original restored before we decide whether to hard-fail.
 
     existing_touches = ticket.get("touches") or []
     merged_touches: list[str] = []
@@ -2764,7 +2914,7 @@ def _cmd_analyze_core(
     # Augment touches with files statically implied by close_criteria + title.
     # Do NOT include _body: background prose ("lanegate board is broken") would
     # inject false file references for things the fix never touches.
-    scan_text = ticket.get("title", "") + " " + close_criteria
+    scan_text = ticket.get("title", "") + " " + _close_criteria_as_str(close_criteria)
     inferred = infer_touches_from_criteria(scan_text, repo_root)
     for path in inferred:
         if path not in touches_set:
@@ -2873,6 +3023,12 @@ def _cmd_analyze_core(
             file=sys.stderr,
         )
         overlap_review = None
+
+    # After the drift guard has had the chance to restore an omitted original,
+    # fail only if close_criteria is still empty (no prior criteria existed either).
+    if not close_criteria:
+        print("ERROR: model returned empty close_criteria; ticket left as draft", file=sys.stderr)
+        sys.exit(1)
 
     # Apply to ticket
     ticket["touches"] = merged_touches

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.config import (
+    CONFIG_FILENAME,
     ConfigError,
     resolve_model,
     resolve_trunk_branch,
@@ -26,6 +27,7 @@ from lanegate.config import (
 )
 from lanegate.executor import (
     _CLAUDE_SUBPROCESS_TYPES,
+    _check_aider_parser_rejection,
     build_executor_cmd,
     executor_types_with,
     get_executor_config,
@@ -42,6 +44,7 @@ from lanegate.executor_events import (
     phase_for_step,
     redact_transcript_text,
 )
+from lanegate.lifecycle.touches import check_touches_compliance
 from lanegate.reviewer import get_worktree_diff
 from lanegate.ticket import branch_name
 
@@ -127,6 +130,67 @@ def _assert_path_in_worktree(tool_name: str, path: str | Path, worktree_root: Pa
     raise WorktreeGuardViolation(
         f"[worktree-guard] {tool_name} tool call targeting path outside worktree: {path}"
     )
+
+
+def _is_main_checkout_bookkeeping_path(path: str, cfg: dict, repo_root: Path) -> bool:
+    """True if `path` is lanegate's own control-plane bookkeeping (ticket
+    status files, top-level config) rather than user source code an
+    executor's own dispatch could plausibly have touched.  These routinely
+    change in the main checkout during concurrent orchestration -- a
+    sibling ticket's status-transition commit, a human editing
+    .lanegate.yml -- and are not evidence of an executor escaping its
+    assigned worktree.
+    """
+    normalized = path.strip().strip('"')
+    if normalized == CONFIG_FILENAME:
+        return True
+    tickets_dir = str(cfg.get("tickets_dir", ".lanegate/tickets"))
+    if os.path.isabs(tickets_dir):
+        try:
+            tickets_dir = os.path.relpath(tickets_dir, repo_root)
+        except ValueError:
+            pass
+    # git porcelain paths always use "/", regardless of platform -- normalize
+    # to that separator so a Windows os.path.normpath("\\") result still
+    # compares correctly against them (see TICK-680 review).
+    tickets_dir = os.path.normpath(tickets_dir).replace(os.sep, "/")
+    return normalized == tickets_dir or normalized.startswith(tickets_dir + "/")
+
+
+def _main_checkout_leak_diff(before: str, after: str, cfg: dict, repo_root: Path) -> str:
+    """Return changed `git status --porcelain` lines that represent a real
+    main-checkout isolation leak.
+
+    A blind full-tree status diff false-positives on routine concurrent
+    activity (a sibling ticket's status-transition commit, a human editing
+    .lanegate.yml) that has nothing to do with the dispatched executor's
+    own worktree isolation -- see TICK-680.
+    """
+
+    def _relevant_lines(text: str) -> set[str]:
+        relevant: set[str] = set()
+        for line in text.splitlines():
+            if not line:
+                continue
+            status_code = line[:2]
+            raw_path = line[3:] if len(line) > 3 else ""
+            is_rename_or_copy = "R" in status_code or "C" in status_code
+            targets = (
+                raw_path.split(" -> ")
+                if is_rename_or_copy and " -> " in raw_path
+                else [raw_path]
+            )
+            if all(
+                _is_main_checkout_bookkeeping_path(t, cfg, repo_root)
+                for t in targets
+                if t
+            ):
+                continue
+            relevant.add(line)
+        return relevant
+
+    changed = _relevant_lines(after) ^ _relevant_lines(before)
+    return "\n".join(sorted(changed))
 
 
 def _check_line_for_worktree_boundary(line: str, worktree_root: Path) -> None:
@@ -768,6 +832,16 @@ def invoke_executor(
 
     status_root = repo_root if repo_root is not None else worktree_path
     status_root = Path(status_root)
+    main_checkout_status_before = None
+    if repo_root is not None:
+        main_checkout_status_before = subprocess.run(
+            ["git", "status", "--porcelain", "-uno"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        ).stdout
     # cmd_orchestrate writes the last-run pointer before it dispatches any
     # workers.  Resolving it here preserves invoke_executor's long-standing
     # callback signature while associating progress with the durable run.
@@ -904,7 +978,7 @@ def invoke_executor(
             log_stream.flush()
         else:
             sys.stderr.write(msg)
-        return _CONFIG_ERROR_EXIT_CODE, "", ""
+        return _CONFIG_ERROR_EXIT_CODE, "", msg
     if log_stream is not None:
         log_stream.write(f"[orchestrate] prompt file: {prompt_path}\n")
         log_stream.flush()
@@ -1112,10 +1186,12 @@ def invoke_executor(
         else {"timeout": exec_timeout, "budget_probe": _check_budget}
     )
     kill_reason = None
-    try:
+
+    def stream_executor(command: list[str]):
+        """Run one executor command through the ordinary streaming path."""
         if log_stream is not None:
-            rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
-                cmd,
+            return _unpack_stream_result(_stream_subprocess(
+                command,
                 str(worktree_path),
                 out_stream=log_stream,
                 err_stream=log_stream,
@@ -1125,21 +1201,92 @@ def invoke_executor(
                 on_line=handle_line,
                 **stream_kwargs,
             ))
-        else:
-            rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
-                cmd,
-                str(worktree_path),
-                stdin_text=prompt_stdin,
-                on_start=on_process_start,
-                env=executor_env,
-                on_line=handle_line,
-                **stream_kwargs,
-            ))
+        return _unpack_stream_result(_stream_subprocess(
+            command,
+            str(worktree_path),
+            stdin_text=prompt_stdin,
+            on_start=on_process_start,
+            env=executor_env,
+            on_line=handle_line,
+            **stream_kwargs,
+        ))
+
+    try:
+        rc, captured_stdout, captured_stderr, kill_reason = stream_executor(cmd)
+        resume_error = (captured_stdout + "\n" + captured_stderr).lower()
+        if (
+            rc != 0
+            and executor_type == "codex"
+            and step == "implement"
+            and resume_session_id is not None
+            and "thread/resume failed: no rollout found for thread id" in resume_error
+        ):
+            fresh_cmd = build_executor_cmd(
+                executor, prompt, command_cfg, model=model, touches=touches,
+                worktree_path=worktree_path,
+                use_stdin=prompt_stdin is not None,
+                max_turns=step_max_turns,
+            )
+            if log_stream is not None:
+                log_stream.write(
+                    f"[orchestrate] {ticket['id']}: Codex resume session expired; retrying fresh\n"
+                )
+                log_stream.flush()
+            rc, captured_stdout, captured_stderr, kill_reason = stream_executor(fresh_cmd)
     finally:
         heartbeat_stop.set()
         hb.join(timeout=1)
 
+    if repo_root is not None and kill_reason != "worktree_violation":
+        main_checkout_status_after = subprocess.run(
+            ["git", "status", "--porcelain", "-uno"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        ).stdout
+        leaked_diff = _main_checkout_leak_diff(
+            main_checkout_status_before or "", main_checkout_status_after, cfg, repo_root
+        )
+        if leaked_diff:
+            rc = 1
+            kill_reason = "main_checkout_violation"
+            msg = (
+                f"[orchestrate] {tid}: worktree isolation leak detected: tracked files in "
+                f"the main checkout changed during dispatch:\n{leaked_diff}\n"
+            )
+            captured_stderr += msg
+            if log_stream is not None:
+                log_stream.write(msg)
+                log_stream.flush()
+            if terminal_stream is not None:
+                terminal_stream.write(msg)
+                terminal_stream.flush()
+            sys.stderr.write(msg)
+
+    if (
+        executor_type == "aider"
+        and rc == 0
+        and "--dry-run" not in cmd
+        and "--edit-format" in cmd
+        and "ask" not in cmd
+        and "Commit " not in captured_stdout
+        and "Committing " not in captured_stdout
+    ):
+        _check_aider_parser_rejection(captured_stdout + "\n" + captured_stderr)
+
     _check_budget()
+    if kill_reason in ('idle', 'stall', 'ceiling', 'timeout'):
+        elapsed_diag = int(time.time() - start_time)
+        hb_count = current_status.get("heartbeat_count", 0)
+        diag_msg = f"[orchestrate] {tid}: dispatch terminated due to '{kill_reason}' after {elapsed_diag}s ({hb_count} heartbeats received)\n"
+        captured_stderr += diag_msg
+        if log_stream is not None:
+            log_stream.write(diag_msg)
+            log_stream.flush()
+        sys.stderr.write(diag_msg)
+
     if budget_exceeded_flag or kill_reason == "budget_exceeded":
         if rc == 0:
             rc = 1
@@ -1344,8 +1491,13 @@ def check_worktree_has_commits(worktree_path: Path) -> bool:
 
 
 def commit_worktree_changes(
-    worktree_path: Path, ticket_id: str, message: str | None = None
-) -> bool:
+    worktree_path: Path,
+    ticket_id: str,
+    message: str | None = None,
+    *,
+    ticket: dict | None = None,
+    paths: list[str] | None = None,
+) -> tuple[bool, str | None]:
     """Commit executor-produced worktree edits, if any.
 
     Some executors return successfully after editing files but do not create a
@@ -1355,11 +1507,16 @@ def commit_worktree_changes(
     Args:
         message: Commit message to use. Defaults to "feat: implement
             <ticket_id>" (the implement-step message); callers committing a
-            fix pass should pass a distinct message so the commit log doesn't
+        fix pass should pass a distinct message so the commit log doesn't
             mislabel a fix as the original implementation.
+        paths: When provided, stage only these worktree-relative paths. This
+            is required for recovery commits, which must not sweep unrelated
+            worktree edits into a conflict-resolution commit.
     """
     if not worktree_path.exists():
-        return False
+        return False, None
+    if paths == []:
+        return False, None
 
     status = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -1368,20 +1525,20 @@ def commit_worktree_changes(
         text=True, encoding="utf-8",
     )
     if status.returncode != 0 or not status.stdout.strip():
-        return False
+        return False, None
 
+    pathspec = [f":(literal){p}" for p in paths] if paths is not None else [".", ":(exclude).lanegate/**"]
     add = subprocess.run(
-        # Exclude .lanegate/ so LaneGate's own audit/prompt artifacts (written inside
-        # the worktree by _write_prompt_file and fix-pass status files) never
-        # land on the ticket branch, regardless of whether the project's
-        # committed .gitignore covers .lanegate/ yet.
-        ["git", "add", "-A", "--", ".", ":(exclude).lanegate/**"],
+        # Exclude .lanegate/ for regular executor commits so LaneGate's own
+        # audit artifacts never land on the ticket branch. Scoped callers may
+        # deliberately include a conflicted metadata file.
+        ["git", "add", "-A", "--", *pathspec],
         cwd=str(worktree_path),
         capture_output=True,
         text=True, encoding="utf-8",
     )
     if add.returncode != 0:
-        return False
+        return False, None
 
     staged = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
@@ -1390,14 +1547,27 @@ def commit_worktree_changes(
         text=True, encoding="utf-8",
     )
     if staged.returncode == 0:
-        return False
+        return False, None
     elif staged.returncode != 1:
-        return False
+        return False, None
+
+    if ticket is not None:
+        try:
+            check_touches_compliance(ticket_id, ticket, worktree_path)
+        except SystemExit:
+            subprocess.run(["git", "restore", "--staged", "."], cwd=str(worktree_path))
+            return False, None
+
+    commit_cmd = ["git", "commit", "-s", "-m", message or f"feat: implement {ticket_id}"]
+    if paths is not None:
+        commit_cmd.extend(["--", *pathspec])
 
     commit = subprocess.run(
-        ["git", "commit", "-s", "-m", message or f"feat: implement {ticket_id}"],
+        commit_cmd,
         cwd=str(worktree_path),
         capture_output=True,
         text=True, encoding="utf-8",
     )
-    return commit.returncode == 0
+    if commit.returncode != 0:
+        return False, commit.stderr.strip() or commit.stdout.strip()
+    return True, None

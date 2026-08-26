@@ -6,6 +6,8 @@ Split out of the former monolithic tests/test_orchestrate.py (TICK-316).
 
 from __future__ import annotations
 
+import datetime
+
 from lanegate.git import GitText
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
@@ -357,7 +359,7 @@ class TestConflictAwareResume:
                 "lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True
             ) as mock_rebase_fix,
             patch("lanegate.orchestrate._continue_rebase", return_value=(True, "")) as mock_continue,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -440,7 +442,7 @@ class TestConflictAwareResume:
             patch("lanegate.orchestrate._worktree_is_dirty", return_value=True) as mock_dirty,
             patch("lanegate.orchestrate._run_rebase") as mock_rebase,
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -458,6 +460,51 @@ class TestConflictAwareResume:
         mock_needs_review.assert_not_called()
         assert captured_bodies
         assert "Resuming with pending uncommitted changes" in captured_bodies[0]
+
+    def test_ready_to_merge_red_lane_ticket_with_matching_approval_sha_skips_escalation(self, tmp_path):
+        """A red-lane ticket already approved by a human at the current HEAD sha
+        must not be re-escalated by the pre-merge risk-lane re-scan."""
+        from types import SimpleNamespace
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
+        path.write_text(
+            path.read_text().replace(
+                "close_criteria:",
+                "review_verdict: approved\nred_lane_approved_at_sha: deadbeef1234\nclose_criteria:",
+            )
+        )
+        (tmp_path / "worktrees" / "tick-001").mkdir()
+
+        def fake_git_text(argv, *_args, **_kwargs):
+            if argv[:2] == ["git", "diff"]:
+                return SimpleNamespace(ok=True, text="+ token = 'sk-red-lane'")
+            if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                return SimpleNamespace(ok=True, text="deadbeef1234")
+            return SimpleNamespace(ok=True, text="")
+
+        def fake_merge(tid, cfg_, repo_root):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_review", "status: merged"))
+
+        with (
+            patch(
+                "lanegate.orchestrate.loop._git_text",
+                side_effect=fake_git_text,
+            ),
+            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red"),
+            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge) as mock_merge,
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.orchestrate.spawn_watch_daemon"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_merge.assert_called_once()
+        ticket = parse_ticket(path)
+        assert ticket["status"] == "merged"
 
 
 # ---------------------------------------------------------------------------
@@ -708,14 +755,37 @@ def test_orchestrate_can_run_twice_after_generated_ticket_writes_without_manual_
 
 
 class TestCmdOrchestrateLock:
+    def test_lock_acquisition_never_kills_live_holder(self, tmp_path):
+        """Startup does no process reaping before rejecting a live holder."""
+        cfg = _default_cfg(tmp_path)
+        import sys
+
+        from lanegate.concurrency import acquire_orchestrator_lock, release_orchestrator_lock
+
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        acquire_orchestrator_lock(tmp_path, pid=holder.pid)
+        try:
+            with (
+                patch("lanegate.orchestrate.loop._reap_orphaned_executor_processes") as reap,
+                pytest.raises(SystemExit) as exc_info,
+            ):
+                cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+            assert exc_info.value.code == 1
+            reap.assert_not_called()
+        finally:
+            release_orchestrator_lock(tmp_path, pid=holder.pid)
+            holder.terminate()
+            holder.wait(timeout=5)
+
     def test_lock_acquired_and_released_on_normal_exit(self, tmp_path):
         cfg = _default_cfg(tmp_path)
         # No tickets — loop exits immediately
 
         events = []
 
-        def track_acquire(root):
+        def track_acquire(root, **kwargs):
             events.append(("acquire", root))
+            kwargs["before_claim"]()
             return 9999
 
         def track_write_pointer(root, session_ts, log_path):
@@ -976,7 +1046,7 @@ class TestCmdOrchestrateWatchDaemon:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=tracked_start),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
             patch("lanegate.lifecycle.cmd_complete", side_effect=tracked_complete),
@@ -1176,7 +1246,7 @@ class TestCmdOrchestrateWatchDaemon:
             patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
             patch("lanegate.orchestrate._is_rate_limit", return_value=False),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -1370,7 +1440,7 @@ class TestSiblingRetryOnRateLimit:
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
             patch("lanegate.orchestrate._ticket_has_real_progress", return_value=True),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -1496,6 +1566,54 @@ def _pool_failure_signature_scenario(tmp_path, num_tickets):
     for i in range(1, num_tickets + 1):
         _write_ticket(tickets_dir, f"TICK-{i:03d}", "open", touches=[f"f{i}.py"], priority=i)
     return cfg, tickets_dir
+
+
+class TestPoolInstanceHealthy:
+    def test_pool_instance_healthy_live_cooldown_and_recent_marker_block_instance(self, tmp_path):
+        from lanegate.executor import write_cooldown
+        from lanegate.orchestrate.loop import _pool_instance_healthy, resolve_pool_executor
+        from lanegate.ticket import _RATE_LIMIT_MARKER
+
+        cfg = _default_cfg(tmp_path)
+        cfg["pools"] = {"default": {"executors": ["codex", "claude"], "strategy": "round-robin"}}
+        tickets_dir = Path(cfg["tickets_dir"])
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        recent = datetime.datetime.now(datetime.UTC).isoformat()
+        path.write_text(
+            path.read_text()
+            .replace("status: hibernated", f"status: hibernated\nstatus_changed_at: {recent}")
+            .replace("Body.", f"## Hibernation Reason\n{_RATE_LIMIT_MARKER}\npool instance: codex")
+        )
+
+        assert _pool_instance_healthy(tmp_path, cfg, "codex") is False
+        assert resolve_pool_executor("implement", {}, cfg, tmp_path, pool_name="default") == "claude"
+
+        write_cooldown(tmp_path, "claude", "rate limit or quota interruption")
+        assert _pool_instance_healthy(tmp_path, cfg, "claude") is False
+
+    @pytest.mark.parametrize("status_changed_at", [None, "not-a-timestamp", "2000-01-01T00:00:00Z"])
+    def test_pool_instance_healthy_stale_or_invalid_marker_fails_open(self, tmp_path, status_changed_at):
+        from lanegate.orchestrate.loop import _pool_instance_healthy
+        from lanegate.ticket import _RATE_LIMIT_MARKER
+
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = Path(cfg["tickets_dir"])
+        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
+        timestamp = "" if status_changed_at is None else f"status_changed_at: {status_changed_at}\n"
+        path.write_text(
+            path.read_text()
+            .replace("status: hibernated", f"status: hibernated\n{timestamp}")
+            .replace("Body.", f"## Hibernation Reason\n{_RATE_LIMIT_MARKER}\npool instance: codex")
+        )
+
+        assert _pool_instance_healthy(tmp_path, cfg, "codex") is True
+
+    def test_pool_instance_healthy_malformed_ticket_directory_fails_open(self, tmp_path):
+        from lanegate.orchestrate.loop import _pool_instance_healthy
+
+        cfg = _default_cfg(tmp_path)
+        with patch("lanegate.orchestrate.loop.load_all_tickets", side_effect=ValueError):
+            assert _pool_instance_healthy(tmp_path, cfg, "codex") is True
 
 
 class TestConsecutiveFailureSignatureFallback:
@@ -2201,7 +2319,7 @@ class TestPreCompleteGuardNotesExemption:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py", ".lanegate/notes/global.md"}),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
@@ -2230,7 +2348,7 @@ class TestPreCompleteGuardNotesExemption:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py", ".lanegate/notes/global.md", "other.py"}),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
@@ -2831,7 +2949,7 @@ class TestCombinedModeReviewAttribution:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_stream),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]) as static_analysis,
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -2875,7 +2993,7 @@ class TestCombinedModeReviewAttribution:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_stream),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]) as static_analysis,
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -2901,7 +3019,7 @@ class TestCombinedModeReviewAttribution:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.loop.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.loop.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.loop.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.loop.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate.loop._committed_files", return_value=set()),
             patch("lanegate.orchestrate.loop._run_static_analysis", return_value=[]),
@@ -2944,7 +3062,7 @@ class TestCombinedModeReviewAttribution:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
             patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
@@ -3130,7 +3248,7 @@ class TestAutoFixCycleGatesMerge:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=True),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -3190,7 +3308,7 @@ class TestAutoFixCycleGatesMerge:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -3252,7 +3370,7 @@ class TestAutoFixCycleGatesMerge:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -3304,7 +3422,7 @@ class TestAutoFixCycleGatesMerge:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -3400,7 +3518,7 @@ class TestAutonomyLanesAutoFixAndEscalation:
             with (
                 patch("lanegate.lifecycle.cmd_start"),
                 patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-                patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+                patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
                 patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
                 patch("lanegate.orchestrate._is_combined_mode", return_value=False),
                 patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
@@ -3442,7 +3560,7 @@ class TestAutonomyLanesAutoFixAndEscalation:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.orchestrate.loop._git_text", return_value=GitText("")),
@@ -3465,6 +3583,65 @@ class TestAutonomyLanesAutoFixAndEscalation:
         assert ticket.get("branch") is None
         assert ticket.get("worktree") is None
 
+    def test_dispatch_red_lane_escalation_skipped_when_approval_sha_matches_head(self, tmp_path):
+        """A ticket already approved by a human at the current HEAD sha must
+        not be re-escalated by the post-dispatch risk-lane scan, even though
+        the diff still classifies as red -- unlike the fresh red-lane case
+        above, which has no prior approval and must still escalate."""
+        from lanegate.ticket import parse_ticket
+
+        cfg = _default_cfg(tmp_path)
+        cfg["autonomy"] = "full"
+        tickets_dir = tmp_path / "tickets"
+        path = _write_ticket(tickets_dir, "TICK-005", "open", touches=["b.py"])
+        path.write_text(
+            path.read_text().replace(
+                "close_criteria:",
+                "red_lane_approved_at_sha: deadbeef1234\nclose_criteria:",
+            )
+        )
+
+        def fake_complete(tid, cfg_, repo_root):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(p.read_text().replace("status: in_progress", "status: code_complete"))
+
+        def fake_review(tid, cfg_, repo_root, **kwargs):
+            p = tickets_dir / f"{tid}.md"
+            p.write_text(
+                p.read_text().replace(
+                    "status: code_complete",
+                    "status: in_review\nreview_verdict: approved",
+                )
+            )
+
+        def fake_git_text(argv, *_args, **_kwargs):
+            if argv[:2] == ["git", "diff"]:
+                return GitText("+ token = 'sk-red-lane'")
+            if argv[:3] == ["git", "rev-parse", "HEAD"]:
+                return GitText("deadbeef1234")
+            return GitText("")
+
+        with (
+            patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+            patch("lanegate.orchestrate.loop._git_text", side_effect=fake_git_text),
+            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red"),
+            patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete) as mock_complete,
+            patch("lanegate.lifecycle.cmd_review", side_effect=fake_review),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+        mock_complete.assert_called_once()
+        ticket = parse_ticket(tickets_dir / "TICK-005.md")
+        assert ticket["status"] == "merged"
+        assert "## Human Escalation" not in ticket["_body"]
+
     def test_diff_capture_failure_escalates_to_needs_review(self, tmp_path):
         from lanegate.ticket import parse_ticket
 
@@ -3476,7 +3653,7 @@ class TestAutonomyLanesAutoFixAndEscalation:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch(
@@ -3524,7 +3701,7 @@ class TestAutonomyLanesAutoFixAndEscalation:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=fake_stream),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate.loop._git_text",
@@ -3783,3 +3960,26 @@ def test_run_start_event_records_manual_trigger_by_default(tmp_path, monkeypatch
     run_start_latest = next(e for e in events_latest if e.get("event") == "run_start")
     assert run_start_latest["triggered_by"] == "resume-watch"
     assert run_start_latest["trigger_reason"] == "rate limit on TICK-1"
+
+def test_loop_surfaces_commit_worktree_changes_stderr(tmp_path):
+    """If commit_worktree_changes returns a hook error, the ticket should fail with that error message."""
+    from lanegate.ticket import parse_ticket
+    from lanegate.orchestrate.loop import cmd_orchestrate
+
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+    with (
+        patch("lanegate.lifecycle.cmd_start"),
+        patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "", None)),
+        patch("lanegate.orchestrate.loop.commit_worktree_changes", return_value=(False, "hook error: file too large")),
+        patch("lanegate.orchestrate.loop.check_worktree_has_commits", return_value=False),
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, all_milestones=True)
+
+    t = parse_ticket(tickets_dir / "TICK-001.md")
+    assert t["status"] == "failed"
+    assert "auto-commit rejected: hook error: file too large" in t["_body"]

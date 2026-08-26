@@ -1666,6 +1666,49 @@ def test_cmd_route_updates_executor_pin(tickets_root, capsys):
     assert "Updated routing for TICK-001: executor → claude-b" in capsys.readouterr().out
 
 
+def test_cmd_route_rejects_executor_incompatible_with_global_model(tickets_root, capsys):
+    _make_ticket(tickets_root / "tickets", "TICK-001", "draft")
+    path = tickets_root / "tickets" / "TICK-001.md"
+    before = path.read_text()
+    cfg = dict(_BASE_CFG, models={"implement": "gemini-3.1-pro-high"})
+
+    with pytest.raises(SystemExit):
+        cmd_route(cfg, tickets_root, "TICK-001", executor="codex")
+
+    assert path.read_text() == before
+    assert "unmapped model 'gemini-3.1-pro-high' for executor 'codex'" in capsys.readouterr().err
+
+
+def test_cmd_route_named_executor_model_override_bypasses_global_model(tickets_root):
+    _make_ticket(tickets_root / "tickets", "TICK-001", "draft")
+    cfg = dict(
+        _BASE_CFG,
+        models={"implement": "gemini-3.1-pro-high"},
+        executors={"codex-1": {"type": "codex", "model": "gpt-5.6-terra"}},
+    )
+
+    cmd_route(cfg, tickets_root, "TICK-001", executor="codex-1")
+
+    assert parse_ticket(tickets_root / "tickets" / "TICK-001.md")["executor"] == "codex-1"
+
+
+def test_cmd_route_rejects_model_incompatible_with_executor_provider(tickets_root, capsys):
+    _make_ticket(tickets_root / "tickets", "TICK-001", "draft")
+    path = tickets_root / "tickets" / "TICK-001.md"
+    before = path.read_text()
+    cfg = dict(
+        _BASE_CFG,
+        models={"implement": "gpt-4"},
+        executors={"aider-local": {"type": "aider", "provider": "ollama"}},
+    )
+
+    with pytest.raises(SystemExit):
+        cmd_route(cfg, tickets_root, "TICK-001", executor="aider-local")
+
+    assert path.read_text() == before
+    assert "unmapped model 'gpt-4' for executor 'aider'" in capsys.readouterr().err
+
+
 def test_cmd_route_updates_model_pin(tickets_root, capsys):
     from lanegate.board import cmd_route
     from lanegate.ticket import parse_ticket
@@ -1714,6 +1757,23 @@ def test_cmd_route_rejects_model_incompatible_with_resolved_reviewer(tickets_roo
 
     assert path.read_text() == before
     assert "unmapped model 'claude-sonnet-5' for executor 'codex'" in capsys.readouterr().err
+
+
+def test_cmd_route_rejects_model_incompatible_with_reviewer_provider(tickets_root, capsys):
+    _make_ticket(tickets_root / "tickets", "TICK-001", "draft")
+    path = tickets_root / "tickets" / "TICK-001.md"
+    before = path.read_text()
+    cfg = {
+        **_BASE_CFG,
+        "reviewer": "aider-local",
+        "executors": {"aider-local": {"type": "aider", "provider": "ollama"}},
+    }
+
+    with pytest.raises(SystemExit):
+        cmd_route(cfg, tickets_root, "TICK-001", model="gpt-4")
+
+    assert path.read_text() == before
+    assert "unmapped model 'gpt-4' for executor 'aider'" in capsys.readouterr().err
 
 
 def test_cmd_route_rejects_reviewer_incompatible_with_existing_model_pin(tickets_root, capsys):

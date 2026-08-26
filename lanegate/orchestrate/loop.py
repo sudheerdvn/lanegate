@@ -45,6 +45,7 @@ from lanegate.config import (
     resolve_ticket_pool,
 )
 from lanegate.executor import (
+    DEFAULT_COOLDOWN_TTL_SECONDS,
     available_instances as _available_executor_instances,
     build_executor_cmd,
     clear_failure_streak as _clear_pool_failure_streak,
@@ -358,8 +359,31 @@ def _reap_orphaned_executor_processes(
 # ---------------------------------------------------------------------------
 
 
+def _recent_hibernation_status(ticket: dict) -> bool:
+    """Whether a hibernation timestamp is still within the cooldown window."""
+    raw = ticket.get("status_changed_at")
+    if not isinstance(raw, str):
+        return False
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        changed_at = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if changed_at.tzinfo is None:
+        return False
+    now = datetime.datetime.now(datetime.UTC)
+    return now - datetime.timedelta(seconds=DEFAULT_COOLDOWN_TTL_SECONDS) <= changed_at <= now
+
+
 def _pool_instance_healthy(repo_root: Path, cfg: dict, instance_name: str) -> bool:
-    """Return whether a named pool instance is available for new work."""
+    """Return whether a named pool instance is available for new work.
+
+    The executor cooldown is authoritative. A hibernated ticket marker only
+    fills the brief persistence gap while that cooldown is being recorded, so
+    legacy markers expire with the same fallback TTL as executor cooldowns.
+    """
     if _executor_is_cooling_down(repo_root, instance_name):
         return False
     tickets_dir = repo_root / cfg.get("tickets_dir", ".lanegate/tickets")
@@ -373,6 +397,7 @@ def _pool_instance_healthy(repo_root: Path, cfg: dict, instance_name: str) -> bo
     return not any(
         t.get("status") == "hibernated"
         and _active_rate_limit_hibernation(t)
+        and _recent_hibernation_status(t)
         and marker in (t.get("_body") or "")
         for t in tickets
     )
@@ -1786,25 +1811,31 @@ def _cmd_orchestrate_body(
 
             if not dry_run:
                 assert report_session_ts is not None  # report_session_ts is session_ts whenever not dry_run
-                # Detect and kill orphaned executor children *before*
-                # acquiring the lock below — once this process holds the lock,
-                # `_collect_live_lanegate_processes` sees a live orchestrator again
-                # and would no longer flag a prior driver's abandoned child as
-                # orphaned, even though this run never dispatched it.
-                reaped = _reap_orphaned_executor_processes(
-                    cfg, repo_root, out_stream=sys.stderr, session_ts=report_session_ts
-                )
+                reaped: list[str] = []
+
+                def reap_before_claim() -> None:
+                    # The acquisition guard has rejected any live holder, while
+                    # the stale holder remains visible to orphan detection.
+                    reaped.extend(
+                        _reap_orphaned_executor_processes(
+                            cfg,
+                            repo_root,
+                            out_stream=sys.stderr,
+                            session_ts=report_session_ts,
+                        )
+                    )
+
+                try:
+                    pid = acquire_orchestrator_lock(repo_root, before_claim=reap_before_claim)
+                    print(f"[orchestrate] lock acquired (PID {pid})")
+                except OrchestratorLockError as e:
+                    print(f"ERROR: {e}", file=sys.stderr)
+                    sys.exit(1)
                 if reaped:
                     print(
                         f"[orchestrate] reaped {len(reaped)} orphaned executor "
                         f"process(es) from a dead driver: {', '.join(reaped)}"
                     )
-                try:
-                    pid = acquire_orchestrator_lock(repo_root)
-                    print(f"[orchestrate] lock acquired (PID {pid})")
-                except OrchestratorLockError as e:
-                    print(f"ERROR: {e}", file=sys.stderr)
-                    sys.exit(1)
 
                 _write_last_run_pointer(repo_root, report_session_ts, log_path)
                 _append_run_event(
@@ -2215,9 +2246,18 @@ def _drain_loop(
             risk_lane = scan_risk_lane(
                 diff_capture.text if diff_capture.ok else "", ticket
             )
-            if risk_lane_requires_human_review(
+            red_signal_triggered = risk_lane_requires_human_review(
                 risk_lane, resolve_human_escalation(cfg)
-            ):
+            )
+            if red_signal_triggered:
+                approved_sha = ticket.get("red_lane_approved_at_sha")
+                if approved_sha:
+                    head_capture = _git_text(
+                        ["git", "rev-parse", "HEAD"], merge_worktree
+                    )
+                    if head_capture.ok and head_capture.text.strip() == approved_sha:
+                        red_signal_triggered = False
+            if red_signal_triggered:
                 reason = (
                     "red-lane escalation: diff scan classified this change as "
                     "'red' (external credentials, security-sensitive, or irreversible "
@@ -3418,7 +3458,7 @@ def _drain_loop(
                     except (OSError, json.JSONDecodeError):
                         audit_bundle_path = None
 
-            commit_worktree_changes(wt, tid)
+            committed_ok, commit_err = commit_worktree_changes(wt, tid)
 
             # --- validate that at least one file was committed ---
             try:
@@ -3439,7 +3479,10 @@ def _drain_loop(
                 log_path_hint = (
                     _log_f.name if (_log_f is not None and hasattr(_log_f, "name")) else None
                 )
-                reason = "executor exited 0 but produced no commits"
+                if commit_err:
+                    reason = f"auto-commit rejected: {commit_err}"
+                else:
+                    reason = "executor exited 0 but produced no commits"
                 print(
                     f"ERROR: {tid} — executor exited 0 but made no commits. Marked as failed, batch continues.\n"
                     f"  Common causes:\n"
@@ -3543,6 +3586,12 @@ def _drain_loop(
                 red_signal_triggered = risk_lane_requires_human_review(
                     risk_lane, escalation_triggers
                 )
+                if red_signal_triggered:
+                    approved_sha = fresh_ticket.get("red_lane_approved_at_sha")
+                    if approved_sha:
+                        head_capture = _git_text(["git", "rev-parse", "HEAD"], wt)
+                        if head_capture.ok and head_capture.text.strip() == approved_sha:
+                            red_signal_triggered = False
                 reason = (
                     "red-lane escalation: diff scan classified this change as "
                     "'red' (external credentials, security-sensitive, or irreversible "

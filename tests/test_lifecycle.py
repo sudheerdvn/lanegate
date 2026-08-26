@@ -3626,11 +3626,9 @@ def test_reopen_and_fresh_dispatch_after_failure_starts_clean(tmp_path):
     _write_ticket(tickets_dir, "TICK-043", "open", touches=["README.md"])
     cmd_start("TICK-043", cfg, repo_root)
 
-    # Simulate bad commits made in the worktree during failed attempt
+    # Simulate bad uncommitted work made in the worktree during failed attempt
     wt_path = worktree_path(worktrees_dir, "TICK-043")
     (wt_path / "bad_file.py").write_text("# bad work")
-    subprocess.run(["git", "add", "."], cwd=wt_path, check=True)
-    subprocess.run(["git", "commit", "-m", "bad commit"], cwd=wt_path, check=True)
 
     # Fail ticket
     cmd_fail("TICK-043", cfg, repo_root, reason="bad attempt")
@@ -3786,6 +3784,43 @@ def test_cmd_fail_preserves_worktree_when_changes_requested(tmp_path):
     assert not wt_path.exists()
     br_res_after = subprocess.run(["git", "rev-parse", "--verify", "tick-045"], cwd=repo_root, capture_output=True)
     assert br_res_after.returncode != 0
+
+
+def test_cmd_fail_preserves_worktree_with_commits(tmp_path):
+    """cmd_fail preserves worktree/branch when worktree branch has commits ahead of trunk."""
+    repo_root = tmp_path
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_root, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_root, check=True)
+    (repo_root / "README.md").write_text("hello")
+    subprocess.run(["git", "add", "."], cwd=repo_root, check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_root, check=True)
+
+    tickets_dir = repo_root / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+    worktrees_dir = repo_root / ".lanegate" / "worktrees"
+    worktrees_dir.mkdir(parents=True)
+    cfg = _default_cfg(tickets_dir, worktrees_dir)
+    cfg["tickets_dir"] = ".lanegate/tickets"
+    cfg["worktrees_dir"] = ".lanegate/worktrees"
+
+    _write_ticket(tickets_dir, "TICK-045", "open", touches=["README.md"])
+    cmd_start("TICK-045", cfg, repo_root)
+
+    wt_path = worktree_path(worktrees_dir, "TICK-045")
+    assert wt_path.exists()
+
+    # Simulate a real commit in the worktree
+    (wt_path / "README.md").write_text("hello world")
+    subprocess.run(["git", "add", "README.md"], cwd=wt_path, check=True)
+    subprocess.run(["git", "commit", "-m", "real commit"], cwd=wt_path, check=True)
+
+    cmd_fail("TICK-045", cfg, repo_root, reason="timeout")
+
+    # Verify preserved for inspection
+    assert wt_path.exists()
+    br_res = subprocess.run(["git", "rev-parse", "--verify", "tick-045"], cwd=repo_root, capture_output=True)
+    assert br_res.returncode == 0
 
 
 def test_fail_and_reopen_do_not_remove_untrusted_worktree_metadata(tmp_path):
@@ -4332,6 +4367,51 @@ def test_human_review_approve_sets_close_criteria_drift_fields_and_survives_unre
     assert ticket.get("close_criteria_drift_approved_snapshot") == "feature() does X"
 
 
+def test_human_review_approve_records_red_lane_approved_sha(tmp_path):
+    """cmd_human_review_approve must record red_lane_approved_at_sha at the
+    worktree's current HEAD so loop.py's red-lane diff re-scans can recognize
+    an unchanged diff and skip re-escalating it."""
+    if shutil.which("git") is None:
+        pytest.skip("git is required for this test")
+
+    from lanegate.lifecycle import cmd_human_review_approve
+
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    worktrees_dir = tmp_path / "worktrees"
+    worktrees_dir.mkdir()
+    cfg = _default_cfg(tickets_dir, worktrees_dir)
+
+    wt_path = worktrees_dir / "tick-699"
+    wt_path.mkdir()
+    _init_git_repo(wt_path)
+    (wt_path / "shared.py").write_text("line1\n")
+    _commit_all(wt_path, "base")
+    subprocess.run(["git", "checkout", "-b", "tick-699"], cwd=wt_path, check=True, capture_output=True)
+    (wt_path / "feature.py").write_text("line1\n")
+    _commit_all(wt_path, "ticket work")
+
+    path = tickets_dir / "TICK-699.md"
+    path.write_text(
+        f"---\nid: TICK-699\ntitle: T\nstatus: needs_review\nworktree: {wt_path}\n"
+        "branch: tick-699\n"
+        "---\n"
+        "Background.\n\n## Needs Review Reason\n\nred-lane escalation\n"
+    )
+
+    cmd_human_review_approve(
+        "TICK-699", cfg, tmp_path, rationale="Reviewed and approved the credential-like string."
+    )
+
+    expected_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt_path, capture_output=True, text=True
+    ).stdout.strip()
+
+    ticket = parse_ticket(path)
+    assert ticket["status"] == "code_complete"
+    assert ticket.get("red_lane_approved_at_sha") == expected_sha
+
+
 def test_clear_human_review_approval_removes_both_fields():
     """Every direct needs_review transition shares this invalidation helper."""
     from lanegate.lifecycle import _clear_human_review_approval
@@ -4344,6 +4424,7 @@ def test_clear_human_review_approval_removes_both_fields():
         "human_review_rationale": "Previously inspected state.",
         "human_review_actor": "human",
         "close_criteria_drift_approved_at": "2026-08-10T21:00:00Z",
+        "red_lane_approved_at_sha": "deadbeef",
         "title": "keep unrelated metadata",
     }
 
@@ -4355,6 +4436,7 @@ def test_clear_human_review_approval_removes_both_fields():
     assert "human_review_approved_at" not in ticket
     assert "human_review_rationale" not in ticket
     assert "human_review_actor" not in ticket
+    assert "red_lane_approved_at_sha" not in ticket
     assert ticket.get("close_criteria_drift_approved_at") == "2026-08-10T21:00:00Z"
     assert ticket["title"] == "keep unrelated metadata"
 

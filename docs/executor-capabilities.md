@@ -162,7 +162,7 @@ Antigravity CLI, Google's successor to the Gemini CLI (`gemini` type). Google re
 
 **Recommended use:** Teams standardized on Google's Antigravity CLI. Pin `agy` to >= 1.1.1 before relying on it for unattended `lanegate run` runs.
 
-**Known caveats:** New integration with comparatively little LaneGate test coverage. The CLI is actively evolving post-rebrand. Pin the `agy` version in your development environment and watch for JSON envelope changes.
+**Known caveats:** New integration with comparatively little LaneGate test coverage. The CLI is actively evolving post-rebrand. Pin the `agy` version in your development environment and watch for JSON envelope changes. Agy searches upward for a `.git` directory and can bypass a worktree's `.git` file, incorrectly writing edits to the main control checkout instead of the assigned worktree. LaneGate detects tracked-file changes to the control checkout after dispatch and fails the step, but operators should inspect and clean any leaked partial edits before continuing.
 
 ---
 

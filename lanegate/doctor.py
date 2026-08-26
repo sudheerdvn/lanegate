@@ -26,13 +26,18 @@ _TREESITTER_MODULES: dict[str, str] = {
 }
 
 from lanegate.config import (
+    _CODEX_HEADLESS_FLAGS,
     _SCOPED_CLAUDE_HEADLESS_FLAGS,
+    _VALID_EXECUTOR_TYPES,
+    _VALID_REVIEWERS,
     detect_test_runner_safeguards,
     find_repo_root,
     load_config,
     resolve_executor,
+    resolve_model,
     suggested_safeguards_yaml,
 )
+from lanegate.executor import get_executor_config
 from lanegate.orchestrate.autofix import combined_mode_capable
 from lanegate.ticket import load_all_tickets
 
@@ -59,6 +64,19 @@ def _has_headless_permission_config(flags: list[str]) -> bool:
         if idx + 1 < len(flags) and flags[idx + 1] in _NON_INTERACTIVE_PERMISSION_MODES:
             return True
     return False
+
+
+def _has_codex_sandbox_bypass(flags: list[str]) -> bool:
+    """Return True when Codex will not start its internal bwrap sandbox."""
+    return (
+        "--dangerously-bypass-approvals-and-sandbox" in flags
+        or "--sandbox=danger-full-access" in flags
+        or any(
+            flags[index] in {"--sandbox", "-s"} and index + 1 < len(flags)
+            and flags[index + 1] == "danger-full-access"
+            for index in range(len(flags))
+        )
+    )
 
 _PY_SECURITY_INSTALL = (
     "python3 -m pip install 'lanegate[security]'  OR  "
@@ -341,6 +359,7 @@ def cmd_doctor(cfg: dict | None = None) -> int:
     categories = ["core", "runtime", "analysis", "sandbox"]
     any_required_missing = False
     any_optional_missing = False
+    invalid_executor_config = False
     unhealthy_tools: list[_Tool] = []
 
     for category in categories:
@@ -443,21 +462,80 @@ def cmd_doctor(cfg: dict | None = None) -> int:
         print("         Add this block to .lanegate.yml:")
         print(suggested_safeguards_yaml(detections))
 
-    executor = cfg.get("executor", "").lower()
-    if executor == "claude":
-        executors_cfg = cfg.get("executors") or {}
-        claude_cfg = executors_cfg.get("claude", {})
-        flags = claude_cfg.get("flags", [])
-        if not _has_headless_permission_config(flags):
-            print("\n[doctor] WARNING: Claude executor requires headless flags for orchestrate.")
-            print("         Without one of these, orchestrate will hang waiting for interactive prompts.")
-            print("         Recommended — a scoped permission set, add this to .lanegate.yml:")
-            print("         executors:")
-            print("           claude:")
-            print(f"             flags: {_SCOPED_CLAUDE_HEADLESS_FLAGS!r}")
-            print("         Also valid: a non-interactive --permission-mode "
-                  f"({sorted(_NON_INTERACTIVE_PERMISSION_MODES)}), or the")
-            print('         bypass flag: flags: ["--dangerously-skip-permissions"]')
+    executor_names = list((cfg.get("executors") or {}).keys())
+    executor_names.extend(cfg.get(field) for field in ("executor", "reviewer") if cfg.get(field))
+    checked_executors: set[tuple[str, str]] = set()
+    for configured_name in executor_names:
+        try:
+            entry = get_executor_config(configured_name, cfg)
+        except Exception:
+            continue
+        name = entry.get("instance", configured_name)
+        executor_type = entry.get("type", configured_name)
+        identity = (name, executor_type)
+        if identity in checked_executors:
+            continue
+        checked_executors.add(identity)
+        flags = entry.get("flags") or []
+        if executor_type in {"claude", "claude-subagent", "claude-process"}:
+            if not _has_headless_permission_config(flags):
+                print("\n[doctor] WARNING: Claude executor requires headless flags for orchestrate.")
+                print(f"         Affected instance: {name!r} (type {executor_type!r}).")
+                print("         Without one of these, orchestrate will hang waiting for interactive prompts.")
+                print("         Recommended — a scoped permission set, add this to .lanegate.yml:")
+                print("         executors:")
+                print(f"           {name}:")
+                print(f"             type: {executor_type}")
+                print(f"             flags: {_SCOPED_CLAUDE_HEADLESS_FLAGS!r}")
+                print("         Also valid: a non-interactive --permission-mode "
+                      f"({sorted(_NON_INTERACTIVE_PERMISSION_MODES)}), or the")
+                print('         bypass flag: flags: ["--dangerously-skip-permissions"]')
+        elif executor_type == "agy":
+            required_flags = {"--dangerously-skip-permissions", "--disable-slash-commands"}
+            missing_flags = sorted(required_flags - set(flags))
+            if missing_flags:
+                print(f"\n[doctor] WARNING: agy executor {name!r} requires unattended-mode flags.")
+                print(f"         Missing: {', '.join(missing_flags)}")
+        elif executor_type == "codex":
+            missing_flags = [flag for flag in _CODEX_HEADLESS_FLAGS if flag not in flags]
+            if missing_flags:
+                print(f"\n[doctor] WARNING: codex executor {name!r} requires unattended-mode flags.")
+                print(f"         Missing: {', '.join(missing_flags)}")
+        elif executor_type == "aider":
+            required_flags = {"--yes-always", "--no-gitignore"}
+            missing_flags = sorted(required_flags - set(flags))
+            if missing_flags:
+                print(f"\n[doctor] WARNING: aider executor {name!r} requires unattended-mode flags.")
+                print(f"         Missing: {', '.join(missing_flags)}")
+
+    executors_cfg = cfg.get("executors") or {}
+    codex_executors = []
+    for name in executors_cfg:
+        try:
+            ex_cfg = get_executor_config(name, cfg)
+        except Exception:
+            continue
+        if ex_cfg.get("type") == "codex":
+            codex_executors.append((ex_cfg.get("instance", name), ex_cfg))
+    if cfg.get("executor"):
+        top_ex_cfg: dict | None = None
+        try:
+            top_ex_cfg = get_executor_config(cfg["executor"], cfg)
+        except Exception:
+            top_ex_cfg = None
+        if top_ex_cfg and top_ex_cfg.get("type") == "codex":
+            name = top_ex_cfg.get("instance", cfg["executor"])
+            if not any(candidate_name == name for candidate_name, _ in codex_executors):
+                codex_executors.append((name, top_ex_cfg))
+    for name, ex_cfg in codex_executors:
+        flags = ex_cfg.get("flags", [])
+        if not isinstance(flags, list) or not _has_codex_sandbox_bypass(flags):
+            invalid_executor_config = True
+            print(f"\n[doctor] ERROR: Codex executor '{name}' must bypass its internal sandbox.")
+            print("         Without this, Codex can emit a verdict after bwrap prevents every command from running.")
+            print("         Add this to .lanegate.yml:")
+            print("         flags: [\"--dangerously-bypass-approvals-and-sandbox\"]")
+            print("         Equivalent: --sandbox danger-full-access")
 
     if "architecture_doc" in cfg:
         print("\n[doctor] WARNING: 'architecture_doc' in .lanegate.yml is deprecated.")
@@ -472,8 +550,11 @@ def cmd_doctor(cfg: dict | None = None) -> int:
         print("             - docs/ARCHITECTURE.md")
 
     if cfg.get("reviewer"):
-        implement_driver = resolve_executor(cfg, "implement")
-        review_driver = resolve_executor(cfg, "review")
+        step_routes = cfg.get("steps") or {}
+        implement_driver = (step_routes.get("implement") or {}).get("driver") or resolve_executor(
+            cfg, "implement"
+        )
+        review_driver = (step_routes.get("review") or {}).get("driver") or resolve_executor(cfg, "review")
         if implement_driver == review_driver and combined_mode_capable(implement_driver, cfg):
             print("\n[doctor] WARNING: reviewer resolves identically to the implement executor.")
             print(f"         reviewer: {review_driver!r} == executor: {implement_driver!r}")
@@ -487,14 +568,26 @@ def cmd_doctor(cfg: dict | None = None) -> int:
         top_executor = cfg.get("executor")
         top_reviewer = cfg.get("reviewer")
         for field_name, value in (("executor", top_executor), ("reviewer", top_reviewer)):
-            if value and value not in executors_cfg and value not in pools_cfg:
+            if not value:
+                continue
+            try:
+                resolved = get_executor_config(value, cfg)
+            except Exception:
+                continue
+            resolved_instance = resolved.get("instance")
+            valid_bare_values = _VALID_REVIEWERS if field_name == "reviewer" else _VALID_EXECUTOR_TYPES
+            if (
+                value not in valid_bare_values
+                and value not in pools_cfg
+                and resolved_instance not in executors_cfg
+            ):
                 print(f"\n[doctor] WARNING: top-level '{field_name}: {value}' does not name any real executor instance or pool.")
                 print(f"         Real instance names: {', '.join(real_instance_names)}")
                 print("         Per-ticket executor/reviewer pins and default_pool/pools routing")
                 print("         (resolve_pool_executor in orchestrate/loop.py) govern actual dispatch.")
                 print(f"         This field only serves as the resolve_max_parallel_detail (config.py ~L1263)")
                 print("         fallback base and the default for new tickets without a pin.")
-                print(f"         Set '{field_name}' to a real executors[] key or pool name, or remove it.")
+                print(f"         Set '{field_name}' to a real executors[] key, pool name, or bare type, or remove it.")
 
     model_without_executor_pin = [
         ticket
@@ -548,4 +641,47 @@ def cmd_doctor(cfg: dict | None = None) -> int:
     if pg_info["has_pending"]:
         print(f"\n[doctor] {format_pending_globals_notice(pg_info)}")
 
-    return 1 if (any_required_missing or quarantined) else 0
+    executors_cfg = cfg.get("executors") or {}
+    aider_models: dict[str, set[str]] = {}
+
+    for ex_name, ex_cfg in executors_cfg.items():
+        if isinstance(ex_cfg, dict) and ex_cfg.get("type", ex_name) == "aider":
+            if ex_name not in aider_models:
+                aider_models[ex_name] = set()
+            ex_model = ex_cfg.get("model")
+            if ex_model:
+                aider_models[ex_name].add(ex_model)
+            for m in (ex_cfg.get("models") or {}).values():
+                if m:
+                    aider_models[ex_name].add(m)
+
+    for step in ["analyze", "implement", "review", "review_escalation", "fix", "drift_check"]:
+        try:
+            ex_name = resolve_executor(cfg, step)
+        except Exception:
+            continue
+        ex_cfg = executors_cfg.get(ex_name) or {}
+        is_aider = False
+        if isinstance(ex_cfg, dict):
+            is_aider = ex_cfg.get("type", ex_name) == "aider"
+        elif not ex_cfg and ex_name == "aider":
+            is_aider = True
+
+        if is_aider:
+            resolved_m = resolve_model(cfg, step)
+            if resolved_m:
+                if ex_name not in aider_models:
+                    aider_models[ex_name] = set()
+                aider_models[ex_name].add(resolved_m)
+
+    for ex_name, models in aider_models.items():
+        ex_cfg = executors_cfg.get(ex_name) or {}
+        model_settings = ex_cfg.get("model_settings") or {}
+        for m in sorted(models):
+            if "/" in m:
+                if model_settings.get(m, {}).get("edit_format") is None:
+                    print(f"\n[doctor] WARNING: aider executor '{ex_name}' uses custom model {m!r}")
+                    print("         but lacks an explicit 'edit_format' override in model_settings.")
+                    print("         Aider may fall back to 'whole' format and silently drop diff-shaped edits.")
+
+    return 1 if (any_required_missing or quarantined or invalid_executor_config) else 0

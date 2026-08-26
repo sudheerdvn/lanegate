@@ -520,6 +520,31 @@ class TestReviewerCombinedModeCollapse:
         out = capsys.readouterr().out
         assert "reviewer resolves identically to the implement executor" in out
 
+    def test_doctor_no_warning_when_steps_route_to_distinct_drivers(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "claude",
+            "reviewer": "claude",
+            "drivers": {
+                "claude-implement": {"type": "claude"},
+                "claude-review": {"type": "claude"},
+            },
+            "steps": {
+                "implement": {"driver": "claude-implement"},
+                "review": {"driver": "claude-review"},
+            },
+            "executors": {},
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "reviewer resolves identically" not in out
+
     def test_doctor_no_warning_when_reviewer_differs(self, capsys):
         all_binaries = [t.binary for t in _TOOLS]
         cfg = {
@@ -555,10 +580,63 @@ class TestReviewerCombinedModeCollapse:
 
 
 class TestTopLevelExecutorPoolMismatch:
-    def test_doctor_warns_when_top_level_executor_not_in_pools(self, capsys):
+    def test_doctor_no_warning_when_top_level_executor_is_bare_type_with_named_instance(self, capsys):
         all_binaries = [t.binary for t in _TOOLS]
         cfg = {
-            "executor": "aider",
+            "executor": "codex",
+            "reviewer": "agy",
+            "executors": {
+                "codex-1": {"type": "codex", "flags": ["--dangerously-bypass-approvals-and-sandbox"]},
+                "codex-2": {"type": "codex", "flags": ["--dangerously-bypass-approvals-and-sandbox"]},
+                "agy-1": {"type": "agy", "flags": ["--dangerously-skip-permissions", "--disable-slash-commands"]},
+            },
+            "pools": {"dev": {"executors": ["codex-1", "agy-1"]}},
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            result = cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Codex executor 'codex' must bypass its internal sandbox" not in out
+        assert "does not name any real executor instance or pool" not in out
+
+    def test_doctor_no_warning_when_top_level_executor_is_unconfigured_bare_type(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "codex",
+            "executors": {},
+            "pools": {"dev": {}},
+            "safeguards": {},
+        }
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+        ):
+            cmd_doctor(cfg=cfg)
+        out = capsys.readouterr().out
+        assert "does not name any real executor instance or pool" not in out
+
+    def test_doctor_does_not_crash_when_executor_resolution_fails(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {"executor": "codex", "pools": {"dev": {}}, "safeguards": {}}
+        with (
+            patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+            patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+            patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+            patch("lanegate.doctor.get_executor_config", side_effect=RuntimeError("bad config")),
+        ):
+            assert cmd_doctor(cfg=cfg) == 0
+        capsys.readouterr()
+
+    def test_doctor_warns_when_invalid_top_level_executor_not_in_pools(self, capsys):
+        all_binaries = [t.binary for t in _TOOLS]
+        cfg = {
+            "executor": "bogus",
             "executors": {"claude-a": {}, "claude-b": {}},
             "pools": {"claude-a": {}, "claude-b": {}},
             "default_pool": "claude-a",
@@ -572,7 +650,7 @@ class TestTopLevelExecutorPoolMismatch:
             cmd_doctor(cfg=cfg)
         out = capsys.readouterr().out
         assert "does not name any real executor instance or pool" in out
-        assert "executor: aider" in out
+        assert "executor: bogus" in out
         assert "claude-a" in out
         assert "claude-b" in out
 
@@ -610,11 +688,11 @@ class TestTopLevelExecutorPoolMismatch:
         out = capsys.readouterr().out
         assert "does not name any real executor instance or pool" not in out
 
-    def test_doctor_warns_when_top_level_reviewer_not_in_pools(self, capsys):
+    def test_doctor_warns_when_invalid_top_level_reviewer_not_in_pools(self, capsys):
         all_binaries = [t.binary for t in _TOOLS]
         cfg = {
             "executor": "claude-a",
-            "reviewer": "agy",
+            "reviewer": "bogus",
             "executors": {"claude-a": {}, "claude-b": {}},
             "pools": {"claude-a": {}, "claude-b": {}},
             "default_pool": "claude-a",
@@ -628,7 +706,7 @@ class TestTopLevelExecutorPoolMismatch:
             cmd_doctor(cfg=cfg)
         out = capsys.readouterr().out
         assert "does not name any real executor instance or pool" in out
-        assert "reviewer: agy" in out
+        assert "reviewer: bogus" in out
         assert "claude-a" in out
         assert "claude-b" in out
 
@@ -654,7 +732,7 @@ class TestTopLevelExecutorPoolMismatch:
     def test_doctor_warns_when_pools_configured_and_executors_key_is_null(self, capsys):
         all_binaries = [t.binary for t in _TOOLS]
         cfg = {
-            "executor": "aider",
+            "executor": "bogus",
             "executors": None,
             "pools": {"claude-a": {}},
             "default_pool": "claude-a",
@@ -668,7 +746,7 @@ class TestTopLevelExecutorPoolMismatch:
             cmd_doctor(cfg=cfg)
         out = capsys.readouterr().out
         assert "does not name any real executor instance or pool" in out
-        assert "executor: aider" in out
+        assert "executor: bogus" in out
 
     def test_doctor_no_warning_when_no_pools_configured_reviewer(self, capsys):
         all_binaries = [t.binary for t in _TOOLS]
@@ -799,10 +877,9 @@ class TestHasHeadlessPermissionConfig:
 
 
 class TestDoctorHeadlessPermissionWarning:
-    def _cfg(self, flags):
+    def _cfg(self, executors=None):
         return {
-            "executor": "claude",
-            "executors": {"claude": {"flags": flags}},
+            "executors": executors,
             "safeguards": {},
         }
 
@@ -817,29 +894,104 @@ class TestDoctorHeadlessPermissionWarning:
         return capsys.readouterr().out
 
     def test_warns_when_no_headless_config_present(self, capsys):
-        out = self._run(self._cfg([]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": []}}), capsys)
+        assert "Claude executor requires headless flags for orchestrate" in out
+
+    def test_warns_for_unconfigured_top_level_bare_claude(self, capsys):
+        cfg = self._cfg({})
+        cfg["executor"] = "claude"
+        out = self._run(cfg, capsys)
         assert "Claude executor requires headless flags for orchestrate" in out
 
     def test_recommends_scoped_form_first(self, capsys):
-        out = self._run(self._cfg([]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": []}}), capsys)
         assert "Recommended — a scoped permission set" in out
         assert "--allowedTools" in out
 
+    def test_recommendation_preserves_custom_instance_type(self, capsys):
+        out = self._run(self._cfg({
+            "reviewer": {"type": "claude-subagent", "flags": []},
+        }), capsys)
+        assert "           reviewer:\n             type: claude-subagent\n" in out
+
     def test_no_warning_with_bypass_flag(self, capsys):
-        out = self._run(self._cfg(["--dangerously-skip-permissions"]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": ["--dangerously-skip-permissions"]}}), capsys)
         assert "Claude executor requires headless flags" not in out
 
     def test_no_warning_with_allowed_tools(self, capsys):
-        out = self._run(self._cfg(["--allowedTools", "Bash,Edit,Write,Read"]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": ["--allowedTools", "Bash,Edit,Write,Read"]}}), capsys)
         assert "Claude executor requires headless flags" not in out
 
     def test_no_warning_with_non_interactive_permission_mode(self, capsys):
-        out = self._run(self._cfg(["--permission-mode", "dontAsk"]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": ["--permission-mode", "dontAsk"]}}), capsys)
         assert "Claude executor requires headless flags" not in out
 
     def test_still_warns_with_interactive_permission_mode(self, capsys):
-        out = self._run(self._cfg(["--permission-mode", "manual"]), capsys)
+        out = self._run(self._cfg({"claude": {"flags": ["--permission-mode", "manual"]}}), capsys)
         assert "Claude executor requires headless flags for orchestrate" in out
+
+    def test_no_warning_when_executors_absent_or_empty(self, capsys):
+        assert "unattended-mode flags" not in self._run(self._cfg(), capsys)
+        assert "unattended-mode flags" not in self._run(self._cfg({}), capsys)
+
+    @pytest.mark.parametrize("executor_type", ["agy", "codex", "claude", "aider"])
+    def test_warns_when_executor_block_is_null(self, executor_type, capsys):
+        out = self._run(self._cfg({executor_type: None}), capsys)
+        assert "requires unattended-mode flags" in out or "requires headless flags" in out
+
+    @pytest.mark.parametrize("executor_type", ["agy", "codex", "claude", "aider"])
+    def test_warns_when_flags_are_null(self, executor_type, capsys):
+        instance = f"{executor_type}-1"
+        out = self._run(self._cfg({instance: {"type": executor_type, "flags": None}}), capsys)
+        assert "requires unattended-mode flags" in out or "requires headless flags" in out
+
+    def test_warns_when_agy_disable_slash_flag_missing(self, capsys):
+        out = self._run(self._cfg({
+            "agy-1": {"type": "agy", "flags": ["--dangerously-skip-permissions"]},
+        }), capsys)
+        assert "agy executor 'agy-1' requires unattended-mode flags" in out
+        assert "--disable-slash-commands" in out
+
+    def test_warns_when_codex_flags_are_missing(self, capsys):
+        out = self._run(self._cfg({"codex-1": {"type": "codex", "flags": []}}), capsys)
+        assert "codex executor 'codex-1' requires unattended-mode flags" in out
+        assert "--dangerously-bypass-approvals-and-sandbox" in out
+
+    def test_warns_when_aider_flags_are_missing(self, capsys):
+        out = self._run(self._cfg({"aider-1": {"type": "aider", "flags": []}}), capsys)
+        assert "aider executor 'aider-1' requires unattended-mode flags" in out
+        assert "--yes-always" in out
+        assert "--no-gitignore" in out
+
+    @pytest.mark.parametrize("executor_type", ["claude-subagent", "claude-process"])
+    def test_warns_when_claude_variant_lacks_headless_flags(self, executor_type, capsys):
+        out = self._run(self._cfg({"claude-1": {"type": executor_type, "flags": []}}), capsys)
+        assert "Claude executor requires headless flags for orchestrate" in out
+        assert f"type '{executor_type}'" in out
+
+    def test_warns_for_legacy_bare_key_claude(self, capsys):
+        out = self._run(self._cfg({"claude": {"flags": []}}), capsys)
+        assert "Claude executor requires headless flags for orchestrate" in out
+
+    def test_ignores_unknown_executor_type(self, capsys):
+        out = self._run(self._cfg({"mock-1": {"type": "mock-driver", "flags": []}}), capsys)
+        assert "unattended-mode flags" not in out
+
+
+def test_doctor_fails_codex_executor_without_sandbox_bypass(capsys):
+    all_binaries = [tool.binary for tool in _TOOLS]
+    cfg = {
+        "executor": "codex-1",
+        "executors": {"codex-1": {"type": "codex", "flags": []}},
+        "safeguards": {},
+    }
+    with (
+        patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+        patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+        patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+    ):
+        assert cmd_doctor(cfg=cfg) == 1
+    assert "Codex executor 'codex-1' must bypass its internal sandbox" in capsys.readouterr().out
 
 
 def test_doctor_warns_on_deprecated_architecture_doc(tmp_path, capsys):
@@ -910,3 +1062,129 @@ def test_doctor_does_not_warn_about_unused_language_grammars(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "missing tree-sitter grammar" not in out
+import pytest
+from lanegate.doctor import cmd_doctor
+def test_doctor_warns_custom_aider_model_missing_edit_format(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import yaml
+    cfg = {
+        "executors": {
+            "aider": {
+                "model": "ollama_chat/qwen30b",
+            }
+        }
+    }
+    with open(".lanegate.yml", "w") as f:
+        yaml.dump(cfg, f)
+    # mock find_repo_root
+    import lanegate.doctor
+    monkeypatch.setattr(lanegate.doctor, "find_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(lanegate.doctor, "load_all_tickets", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(lanegate.doctor, "_TOOLS", [])
+    
+    cmd_doctor(cfg)
+    captured = capsys.readouterr()
+    assert "WARNING: aider executor 'aider' uses custom model 'ollama_chat/qwen30b'" in captured.out
+    assert "lacks an explicit 'edit_format' override" in captured.out
+
+def test_doctor_no_warning_custom_aider_model_with_edit_format(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import yaml
+    cfg = {
+        "executors": {
+            "aider": {
+                "model": "ollama_chat/qwen30b",
+                "model_settings": {
+                    "ollama_chat/qwen30b": {
+                        "edit_format": "diff"
+                    }
+                }
+            }
+        }
+    }
+    with open(".lanegate.yml", "w") as f:
+        yaml.dump(cfg, f)
+    import lanegate.doctor
+    monkeypatch.setattr(lanegate.doctor, "find_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(lanegate.doctor, "load_all_tickets", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(lanegate.doctor, "_TOOLS", [])
+    
+    cmd_doctor(cfg)
+    captured = capsys.readouterr()
+    assert "WARNING: aider executor 'aider' uses custom model" not in captured.out
+
+
+def test_doctor_warns_custom_aider_model_explicit_null_edit_format(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import yaml
+    cfg = {
+        "executors": {
+            "aider": {
+                "model": "ollama_chat/qwen30b",
+                "model_settings": {
+                    "ollama_chat/qwen30b": {
+                        "edit_format": None
+                    }
+                }
+            }
+        }
+    }
+    with open(".lanegate.yml", "w") as f:
+        yaml.dump(cfg, f)
+    import lanegate.doctor
+    monkeypatch.setattr(lanegate.doctor, "find_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(lanegate.doctor, "load_all_tickets", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(lanegate.doctor, "_TOOLS", [])
+    
+    cmd_doctor(cfg)
+    captured = capsys.readouterr()
+    assert "WARNING: aider executor 'aider' uses custom model 'ollama_chat/qwen30b'" in captured.out
+    assert "lacks an explicit 'edit_format' override" in captured.out
+
+def test_doctor_warns_custom_aider_model_step_resolved(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import yaml
+    cfg = {
+        "executor": "aider",
+        "models": {
+            "implement": "ollama_chat/qwen30b"
+        },
+        "executors": {
+            "aider": {}
+        }
+    }
+    with open(".lanegate.yml", "w") as f:
+        yaml.dump(cfg, f)
+    import lanegate.doctor
+    monkeypatch.setattr(lanegate.doctor, "find_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(lanegate.doctor, "load_all_tickets", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(lanegate.doctor, "_TOOLS", [])
+
+    cmd_doctor(cfg)
+    captured = capsys.readouterr()
+    assert "WARNING: aider executor 'aider' uses custom model 'ollama_chat/qwen30b'" in captured.out
+    assert "lacks an explicit 'edit_format' override" in captured.out
+
+def test_doctor_warns_custom_aider_model_drift_check_step_resolved(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    import yaml
+    cfg = {
+        "executor": "aider",
+        "models": {
+            "drift_check": "ollama_chat/qwen30b"
+        },
+        "executors": {
+            "aider": {}
+        }
+    }
+    with open(".lanegate.yml", "w") as f:
+        yaml.dump(cfg, f)
+    import lanegate.doctor
+    monkeypatch.setattr(lanegate.doctor, "find_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(lanegate.doctor, "load_all_tickets", lambda *args, **kwargs: ([], []))
+    monkeypatch.setattr(lanegate.doctor, "_TOOLS", [])
+
+    cmd_doctor(cfg)
+    captured = capsys.readouterr()
+    assert "WARNING: aider executor 'aider' uses custom model 'ollama_chat/qwen30b'" in captured.out
+    assert "lacks an explicit 'edit_format' override" in captured.out

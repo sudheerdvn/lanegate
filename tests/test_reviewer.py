@@ -213,6 +213,24 @@ class TestParseReviewResultApproved:
         result = parse_review_result(raw)
         assert result.findings == ""
 
+    def test_bwrap_error_flags_verification_as_not_possible(self):
+        raw = json.dumps({
+            "verdict": "changes_requested",
+            "summary": "bwrap: Creating new namespace failed: Operation not permitted",
+        })
+        result = parse_review_result(raw)
+        assert result.verification_not_possible is True
+        assert "Verification was not actually possible" in result.notes
+
+    def test_loopback_error_flags_verification_as_not_possible(self):
+        raw = json.dumps({
+            "verdict": "changes_requested",
+            "summary": "loopback: Failed RTM_NEWADDR: Operation not permitted",
+        })
+        result = parse_review_result(raw)
+        assert result.verification_not_possible is True
+        assert "Verification was not actually possible" in result.notes
+
 
 # ---------------------------------------------------------------------------
 # parse_review_result — fail-closed paths
@@ -381,6 +399,38 @@ class TestAcceptanceContractAuditReviewGate:
         fence_start = prompt.index("<untrusted-data>")
         assert "/api/runs/current" not in prompt[:fence_start]
         assert "/api/runs/current" in prompt[fence_start:]
+
+    def test_diff_access_note_interpolates_trunk_branch(self):
+        from lanegate.reviewer import _diff_access_note
+
+        result = _diff_access_note(non_tool_reviewer=False, has_diff=True, trunk_branch="v3")
+
+        assert "git diff v3...HEAD" in result
+        assert "git diff main" not in result
+
+    def test_build_review_prompt_uses_configured_trunk_branch_in_diff_access_note(self, tmp_path):
+        ticket = {
+            "id": "TICK-146",
+            "title": "API contract",
+            "close_criteria": "tests/test_api.py passes.",
+            "_body": "Body.",
+        }
+
+        prompt = build_review_prompt(ticket, project_root=tmp_path, cfg={"trunk_branch": "v3"})
+
+        assert "git diff v3...HEAD" in prompt
+
+    def test_build_review_prompt_falls_back_to_main_when_trunk_branch_not_configured(self, tmp_path):
+        ticket = {
+            "id": "TICK-146",
+            "title": "API contract",
+            "close_criteria": "tests/test_api.py passes.",
+            "_body": "Body.",
+        }
+
+        prompt = build_review_prompt(ticket, project_root=tmp_path, cfg={})
+
+        assert "git diff main...HEAD" in prompt
 
     def test_build_review_prompt_puts_prior_review_findings_in_untrusted_layer(self, tmp_path):
         ticket = {
@@ -822,7 +872,7 @@ class TestRunReviewAgentFailClosed:
         ticket = self._make_ticket()
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = "not json output from the agent"
+        mock_result.stdout = "not valid json at all"
         with (
             self._patch_diff(),
             patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
@@ -832,6 +882,154 @@ class TestRunReviewAgentFailClosed:
 
             result = run_review_agent(ticket, tmp_path)
         assert result is False
+
+    def test_malformed_json_in_error_envelope_returns_false(self, tmp_path):
+        ticket = self._make_ticket()
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = json.dumps(
+            {
+                "status": "ERROR",
+                "response": "not json output from the agent",
+                "error": "invalid tool call error (invalid_args)",
+            }
+        )
+        with (
+            self._patch_diff(),
+            patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            from lanegate.orchestrate import run_review_agent
+
+            result = run_review_agent(ticket, tmp_path, cfg={"executor": "agy"})
+        assert result is False
+
+    def test_run_review_agent_recovers_verdict_on_error(self, tmp_path):
+        """A post-verdict agy tool failure must not discard the review result."""
+        ticket = self._make_ticket()
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = json.dumps(
+            {
+                "status": "ERROR",
+                "response": json.dumps(
+                    {
+                        "verdict": "changes_requested",
+                        "summary": "Missing regression coverage",
+                        "findings": "foo.py:10 lacks an error-path test",
+                    }
+                ),
+                "error": "invalid tool call error (invalid_args)",
+            }
+        )
+        with (
+            self._patch_diff(),
+            patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            from lanegate.orchestrate import run_review_agent
+
+            result = run_review_agent(ticket, tmp_path, cfg={"executor": "agy"})
+
+        assert result is False
+        kwargs = mock_cmd_review.call_args.kwargs
+        assert kwargs["verdict"] == "changes_requested"
+        assert kwargs["summary"] == "Missing regression coverage"
+        assert kwargs["findings"] == "foo.py:10 lacks an error-path test"
+
+    def test_error_recovery_tolerates_missing_findings(self, tmp_path):
+        """A valid recovered verdict without a findings field must be accepted."""
+        ticket = self._make_ticket()
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = json.dumps(
+            {
+                "status": "ERROR",
+                "response": json.dumps(
+                    {
+                        "verdict": "approved",
+                        "summary": "Looks clean",
+                    }
+                ),
+                "error": "invalid tool call error (invalid_args)",
+            }
+        )
+        with (
+            self._patch_diff(),
+            patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            from lanegate.orchestrate import run_review_agent
+
+            result = run_review_agent(ticket, tmp_path, cfg={"executor": "agy"})
+
+        assert result is True
+        kwargs = mock_cmd_review.call_args.kwargs
+        assert kwargs["verdict"] == "approved"
+        assert kwargs["summary"] == "Looks clean"
+        assert not kwargs.get("findings")
+
+    def test_error_recovery_rejects_invalid_verdict_value(self, tmp_path):
+        ticket = self._make_ticket()
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = json.dumps(
+            {
+                "status": "ERROR",
+                "response": json.dumps(
+                    {
+                        "verdict": "unknown",
+                        "summary": "Invalid verdict",
+                        "findings": "foo.py:10",
+                    }
+                ),
+                "error": "invalid tool call error (invalid_args)",
+            }
+        )
+        with (
+            self._patch_diff(),
+            patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+            patch(
+                "lanegate.orchestrate.review._escalate_harness_error",
+                return_value=False,
+            ) as mock_escalate,
+        ):
+            from lanegate.orchestrate import run_review_agent
+
+            result = run_review_agent(ticket, tmp_path, cfg={"executor": "agy"})
+
+        assert result is False
+        mock_cmd_review.assert_not_called()
+        assert mock_escalate.call_args.args[1].harness_error is True
+
+    def test_error_recovery_handles_null_response(self, tmp_path):
+        ticket = self._make_ticket()
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = json.dumps(
+            {
+                "status": "ERROR",
+                "response": None,
+                "error": "invalid tool call error (invalid_args)",
+            }
+        )
+        with (
+            self._patch_diff(),
+            patch("lanegate.orchestrate.subprocess.run", return_value=mock_result),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+            patch(
+                "lanegate.orchestrate.review._escalate_harness_error",
+                return_value=False,
+            ) as mock_escalate,
+        ):
+            from lanegate.orchestrate import run_review_agent
+
+            result = run_review_agent(ticket, tmp_path, cfg={"executor": "agy"})
+
+        assert result is False
+        mock_cmd_review.assert_not_called()
+        assert mock_escalate.called
 
     def test_missing_verdict_field_returns_false(self, tmp_path):
         ticket = self._make_ticket()
@@ -1231,9 +1429,12 @@ class TestRunReviewAgentWorktreeDiff:
     _SAMPLE_DIFF = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n+x = 1\n"
 
     def test_reviewer_prompt_omits_diff_but_still_precheck_via_worktree(self, tmp_path):
-        """run_review_agent uses get_worktree_diff only as a pre-flight check;
-        the diff text itself is never embedded in the prompt (agent inspects
-        the branch itself via git/file tools instead)."""
+        """run_review_agent uses get_worktree_diff as a pre-flight check, and
+        also embeds the diff in the prompt for a Claude reviewer -- review
+        dispatch always passes read_only=True, which blocks Claude's Bash
+        tool entirely (disallowed_tools), leaving no way for it to self-fetch
+        the diff itself, so it must be inlined instead (same as a genuinely
+        non-tool-capable reviewer)."""
         from lanegate.orchestrate import run_review_agent
 
         ticket = self._make_ticket()
@@ -1261,9 +1462,9 @@ class TestRunReviewAgentWorktreeDiff:
         assert result is True
         assert mock_get_diff.called
         assert len(captured_prompt) == 1
-        # The diff text itself must NOT appear in the prompt — only ticket
-        # metadata; the agent inspects the branch itself via tool access.
-        assert mock_diff not in captured_prompt[0]
+        # read_only=True blocks Claude's Bash tool entirely, so it cannot
+        # self-fetch the diff -- it must be inlined instead.
+        assert mock_diff in captured_prompt[0]
         assert "<untrusted-data>" in captured_prompt[0]
 
     def test_missing_worktree_returns_false(self, tmp_path):
@@ -1815,6 +2016,47 @@ class TestNonToolReviewerDiffInlining:
         assert "full git, file, and test-execution tool access" in prompt
         assert "GIT DIFF" not in prompt
 
+    def test_claude_reviewer_under_read_only_gets_diff_inlined(self, tmp_path):
+        """Review dispatch passes read_only=True for every reviewer type,
+        which blocks the Bash tool entirely for Claude (disallowed_tools=
+        ["Bash","Write","Edit"]) -- it has no way left to self-fetch the
+        diff, even though it's otherwise a tool-capable, agentic executor.
+        The prompt must not claim it has full tool access in that case.
+
+        But disallowed_tools only disables Bash, not Read/Glob/Grep --
+        Claude's own file-reading tools remain available. The prompt must
+        not tell it it has NO file-read access either (that's only true for
+        a genuinely non-tool reviewer like aider/ollama); it should point it
+        at Read/Glob/Grep for anything beyond the inlined diff."""
+        diff_text = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            reviewer_type="claude", diff=diff_text, read_only=True,
+        )
+        assert "GIT DIFF" in prompt
+        assert diff_text in prompt
+        assert "full git, file, and test-execution tool access" not in prompt
+        assert "Run `git diff main...HEAD`" not in prompt
+        assert "do not have shell or file-read tool access" not in prompt
+        assert "Read, Glob, and Grep" in prompt
+
+    def test_codex_reviewer_under_read_only_gets_read_only_repro_instructions(self, tmp_path):
+        """codex/agy enforce read_only via a sandbox flag (--sandbox
+        read-only / --mode plan) that still permits reads -- unlike Claude,
+        they CAN still self-fetch the diff via `git diff`. Only the repro
+        instructions need to change, since the normal ones prescribe
+        filesystem writes (revert a file, test, restore) that a read-only
+        sandbox denies."""
+        prompt = build_review_prompt(
+            self._ticket(), project_root=tmp_path, cfg={},
+            reviewer_type="codex", diff="+++ diff", read_only=True,
+        )
+        assert "Run `git diff main...HEAD`" in prompt
+        assert "GIT DIFF" not in prompt
+        assert "cannot write or edit any file" in prompt
+        assert "git checkout <parent-sha> -- <path>" not in prompt
+        assert "do not revert, stash, or otherwise modify the working tree" in prompt
+
     @pytest.mark.parametrize("reviewer_type", ["aider", "ollama"])
     def test_non_tool_reviewer_inlines_diff_and_suppresses_tool_instructions(
         self, tmp_path, reviewer_type
@@ -1900,3 +2142,17 @@ class TestNonToolReviewerDiffInlining:
         assert "second.py" in prompt  # named in the truncation note
         assert "was truncated" in prompt
         assert "Do not treat their absence as evidence" in prompt
+from lanegate.reviewer import build_review_prompt
+
+def test_build_review_prompt_refactor(tmp_path):
+    ticket_refactor = {"id": "TICK-1", "title": "Refactor the subsystem"}
+    prompt_refactor = build_review_prompt(ticket_refactor, project_root=tmp_path)
+    assert "(a) diff every relocated function/class/method" in prompt_refactor
+    # Resolve the omitted prompt-contract item from the review template:
+    # If trusted instructions include acceptance-contract audit findings, treat them as blocking until the ticket metadata or diff shows the omitted contract items are resolved; do not approve solely because new tests pass.
+    assert "Do not artificially restrict your review just to TOUCHES" in prompt_refactor
+
+    ticket_normal = {"id": "TICK-2", "title": "Add a new feature"}
+    prompt_normal = build_review_prompt(ticket_normal, project_root=tmp_path)
+    assert "Scope your review to what actually changed on this branch" in prompt_normal
+    assert "(a) diff every relocated function/class/method" not in prompt_normal

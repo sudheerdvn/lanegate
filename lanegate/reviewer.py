@@ -16,7 +16,7 @@ from pathlib import Path
 
 from lanegate.config import load_config, resolve_trunk_branch
 from lanegate import executor
-from lanegate.executor import matching_verification_groups
+from lanegate.executor import _CLAUDE_SUBPROCESS_TYPES, matching_verification_groups
 from lanegate.safeguards import effective_safeguards
 from lanegate.ticket import load_acceptance_contract_audit, load_change_notes
 from lanegate.prompts import (
@@ -72,6 +72,17 @@ class ReviewResult:
     # judgment. Keep it distinct from a real changes_requested verdict, which
     # is the only outcome eligible for an auto-fix cycle.
     harness_error: bool = field(default=False)
+    # The reviewer made a verdict, but its own transcript shows it could not
+    # execute verification commands. Auto-fix must not act on that verdict.
+    verification_not_possible: bool = field(default=False)
+
+
+def _verification_not_possible(raw: str) -> bool:
+    """Detect executor failures that leave a review unable to verify claims."""
+    output = raw.casefold()
+    if "bwrap:" in output or "loopback:" in output:
+        return True
+    return sum(output.count(marker) for marker in ("command not found", "permission denied")) >= 2
 
 
 def _trunk_branch(repo_root: Path) -> str:
@@ -239,7 +250,16 @@ def parse_review_result(raw: str) -> ReviewResult:
         findings = data.get("findings", "")
         if not isinstance(findings, str):
             findings = ""
-        return ReviewResult(verdict=verdict, notes=notes, findings=findings)
+        verification_not_possible = _verification_not_possible(raw)
+        if verification_not_possible:
+            flag = "Verification was not actually possible"
+            notes = f"{flag}: executor output showed command-execution failures. {notes}".strip()
+        return ReviewResult(
+            verdict=verdict,
+            notes=notes,
+            findings=findings,
+            verification_not_possible=verification_not_possible,
+        )
     except Exception as exc:
         # Fail closed: any parse failure is a rejection
         return ReviewResult(
@@ -333,15 +353,53 @@ def is_non_tool_reviewer(reviewer_type: str | None) -> bool:
     return not executor.has_capability(reviewer_type, "tool_dispatch_loop")
 
 
-def _diff_access_note(non_tool_reviewer: bool, has_diff: bool) -> str:
+def _diff_access_note(
+    non_tool_reviewer: bool,
+    has_diff: bool,
+    trunk_branch: str,
+    read_only: bool = False,
+    claude_blocked_by_read_only: bool = False,
+) -> str:
     if not non_tool_reviewer:
+        if read_only:
+            return (
+                "with read-only git and file access, the same environment "
+                "the implementer used — you can run read commands (`git "
+                "diff`, `git log -p`, `git show`, `cat`) but cannot write or "
+                "edit any file. Do not search for it or run commands from "
+                f"any other directory. Run `git diff {trunk_branch}...HEAD` (or `git "
+                "log -p`) yourself and read the full surrounding context of "
+                "each changed file before judging anything; do not evaluate "
+                "from a pasted hunk."
+            )
         return (
             "with full git, file, and test-execution tool access, the same "
             "environment the implementer used. Do not search for it or run "
-            "commands from any other directory. Run `git diff main...HEAD` "
+            "commands from any other directory. "
+            f"Run `git diff {trunk_branch}...HEAD` "
             "(or `git log -p`) yourself and read the full surrounding "
             "context of each changed file before judging anything; do not "
             "evaluate from a pasted hunk."
+        )
+    if claude_blocked_by_read_only:
+        if has_diff:
+            return (
+                "with your Bash tool disabled, so you cannot run `git diff` "
+                "or any other shell command yourself — the full diff of this "
+                "branch is provided below as GIT DIFF, inspect it directly. "
+                "Your Read, Glob, and Grep tools remain available: use them "
+                "to read the full surrounding context of any changed file "
+                "beyond what the inlined diff and FILE SKELETONS below show, "
+                "the same way a tool-capable reviewer would with `git diff` "
+                "-- do not evaluate from a pasted hunk alone."
+            )
+        return (
+            "with your Bash tool disabled, so you cannot run `git diff` or "
+            "any other shell command yourself, and no branch diff could be "
+            "extracted to include below. Your Read, Glob, and Grep tools "
+            "remain available -- use them to read the full surrounding "
+            "context of files named in FILE SKELETONS, COMMIT MESSAGES, and "
+            "the other untrusted-data sections below."
         )
     if has_diff:
         return (
@@ -359,8 +417,29 @@ def _diff_access_note(non_tool_reviewer: bool, has_diff: bool) -> str:
     )
 
 
-def _repro_execution_note(non_tool_reviewer: bool, has_diff: bool = False) -> str:
+def _repro_execution_note(
+    non_tool_reviewer: bool,
+    has_diff: bool = False,
+    read_only: bool = False,
+    claude_blocked_by_read_only: bool = False,
+) -> str:
     if not non_tool_reviewer:
+        if read_only:
+            return (
+                "construct and verify a minimal repro using only read "
+                "commands (`git diff`, `git log -p`, `git show "
+                "<sha>:<path>`, `cat`) and, if the project's existing test "
+                "suite already covers the behavior, running it as-is — you "
+                "cannot write or edit any file in this session, so do not "
+                "revert, stash, or otherwise modify the working tree to "
+                "test a pre-change state. To reason about a pre-change "
+                "state, read it directly with `git show <parent-sha>:<path>` "
+                "and trace the logic by comparison instead of actually "
+                "reverting the file. If verifying the finding genuinely "
+                "requires a filesystem write (e.g. a new one-off test you'd "
+                "need to add), say so explicitly and record the finding as "
+                "unverified by execution rather than silently dropping it."
+            )
         return (
             "construct and execute a minimal repro — a single targeted test "
             "or a few git commands, not the full test suite — using your "
@@ -385,6 +464,18 @@ def _repro_execution_note(non_tool_reviewer: bool, has_diff: bool = False) -> st
             "dropping it."
         )
     source = "GIT DIFF and FILE SKELETONS" if has_diff else "FILE SKELETONS"
+    if claude_blocked_by_read_only:
+        return (
+            f"trace through a minimal repro, starting from {source} but "
+            "also using your Read, Glob, and Grep tools to read the full "
+            "surrounding context of any file involved -- name the concrete "
+            "input or state and the exact resulting behavior. Your Bash "
+            "tool is disabled, so you cannot run git, run tests, or execute "
+            "any command; do not assert a failure without spelling out that "
+            "trace from what you can read. If what you can read is not "
+            "enough to construct a concrete trace, say so explicitly and "
+            "record the finding as unverified rather than silently dropping it."
+        )
     return (
         f"trace through a minimal repro by reading {source} — name the "
         "concrete input or state and the exact resulting behavior. You do "
@@ -407,6 +498,7 @@ def build_review_prompt(
     worktree_path: Path | None = None,
     reviewer_type: str | None = None,
     diff: str | None = None,
+    read_only: bool = False,
 ) -> str:
     """Return a trust-separated prompt for reviewing *ticket*.
 
@@ -444,11 +536,21 @@ def build_review_prompt(
             ``None`` (the default) keeps the original tool-capable instructions.
         diff: The branch's git diff (see ``get_worktree_diff``), forwarded
             into the prompt only when *reviewer_type* is non-tool-capable.
+        read_only: Whether the review dispatch enforces read-only tool
+            access (``build_executor_cmd(..., read_only=True)``). For a
+            Claude-type reviewer this blocks the Bash tool entirely
+            (``disallowed_tools``), leaving no way to self-fetch the diff —
+            treated the same as a non-tool reviewer for that purpose. For
+            other tool-capable reviewers (codex ``--sandbox read-only``, agy
+            ``--mode plan``) reads still work, so only the repro-execution
+            instructions change to avoid prescribing filesystem writes.
 
     Returns:
         A fully-rendered prompt string safe to pass to the review agent.
     """
     non_tool_reviewer = is_non_tool_reviewer(reviewer_type)
+    claude_blocked_by_read_only = read_only and reviewer_type in _CLAUDE_SUBPROCESS_TYPES
+    effective_non_tool_reviewer = non_tool_reviewer or claude_blocked_by_read_only
     raw_root = project_root if project_root is not None else Path.cwd()
     wt = worktree_path if worktree_path is not None else raw_root
     root = _resolve_control_root(raw_root)
@@ -469,9 +571,30 @@ def build_review_prompt(
     # parse (new files, non-code files) and get zero skeletons back.
     review_skeletons = load_file_skeletons(ticket, wt, regenerate=True)
     has_diff = bool(diff and diff.strip())
+    trunk_branch = resolve_trunk_branch(cfg if cfg is not None else load_config(root), root)
 
     # Load the instruction text from the configurable template
     template = load_prompt_template("review", root)
+    
+    num_touches = len(ticket.get("touches") or [])
+    is_refactor = (
+        "refactor" in title.lower()
+        or "split" in title.lower()
+        or "extract" in title.lower()
+        or ("move" in title.lower() and num_touches > 1)
+    )
+    if is_refactor:
+        refactor_guidance = (
+            "This is a refactor/split ticket. Do not artificially restrict your review just to TOUCHES if "
+            "verifying the move requires checking callers or state across boundaries. You MUST:\n"
+            "(a) diff every relocated function/class/method against its pre-change location, byte for byte outside of mechanical relocation and rename, and treat any divergence as a finding;\n"
+            "(b) enumerate every self.* attribute and module-level global touched by moved code and confirm a reader and a writer both still exist after the move;\n"
+            "(c) grep the whole repository (not just the diff) for every import site of every touched module and flag any inconsistency in how the same file gets imported (bare vs qualified, relative vs absolute) as a finding, not just within the diff's own files;\n"
+            "(d) trace any CLI flag, config key, or constructor parameter touched by the diff from its entry point to where it's actually consumed, confirming it still reaches there."
+        )
+    else:
+        refactor_guidance = "Scope your review to what actually changed on this branch — cross-check against TOUCHES below — and do not flag pre-existing code you did not touch."
+
     instruction = render_prompt(
         template,
         ticket_id=tid,
@@ -482,8 +605,20 @@ def build_review_prompt(
         discovery_guidance=render_discovery_guidance(
             cfg, has_skeletons=bool(review_skeletons)
         ),
-        diff_access_note=_diff_access_note(non_tool_reviewer, has_diff),
-        repro_execution_note=_repro_execution_note(non_tool_reviewer, has_diff),
+        diff_access_note=_diff_access_note(
+            effective_non_tool_reviewer,
+            has_diff,
+            trunk_branch,
+            read_only=read_only,
+            claude_blocked_by_read_only=claude_blocked_by_read_only,
+        ),
+        repro_execution_note=_repro_execution_note(
+            effective_non_tool_reviewer,
+            has_diff,
+            read_only=read_only,
+            claude_blocked_by_read_only=claude_blocked_by_read_only,
+        ),
+        refactor_guidance=refactor_guidance,
     ).strip()
 
     # Build the trusted instruction layer with base instruction + prior findings.
@@ -600,6 +735,10 @@ def build_review_prompt(
     # the trusted layer; the findings content itself is untrusted data (F38) —
     # quoted attacker-controlled diff content must not gain instruction-level
     # standing just because a prior reviewer echoed it.
+    # Note: `ticket.get('review_findings')` DOES explicitly pass prior findings. 
+    # This means TICK-004 in the source project was a correlated model hallucination,
+    # not a plumbing gap. The reviewer was told what was found last time and 
+    # still flipped to approved without the diff resolving them.
     review_findings = ticket.get("review_findings") or []
     if review_findings:
         trusted_parts.append(
@@ -671,7 +810,7 @@ def build_review_prompt(
     if bounded_skeletons:
         untrusted_sections["FILE SKELETONS"] = bounded_skeletons
     bounded_diff = ""
-    if non_tool_reviewer and has_diff and diff is not None:
+    if effective_non_tool_reviewer and has_diff and diff is not None:
         bounded_diff, _diff_truncated, _diff_omitted = truncate_diff_to_budget(
             diff, get_payload_budget("review", cfg)
         )
@@ -736,8 +875,8 @@ def build_review_prompt(
         ))
         _components.append(_component(
             "branch-diff", "worktree git diff", "review", bounded_diff,
-            reason="non-tool-reviewer" if non_tool_reviewer and has_diff
-            else ("tool-capable-reviewer" if not non_tool_reviewer else "no-diff-available"),
+            reason="non-tool-reviewer" if effective_non_tool_reviewer and has_diff
+            else ("tool-capable-reviewer" if not effective_non_tool_reviewer else "no-diff-available"),
         ))
 
     return build_prompt(

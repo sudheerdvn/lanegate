@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from lanegate.pidutil import force_kill_pid, pid_alive, terminate_pid
+from lanegate.pidutil import force_kill_pid, pid_alive, pid_cwd, terminate_pid
 
 
 def test_pid_alive_true_for_current_process():
@@ -28,6 +28,37 @@ def test_pid_alive_is_non_destructive():
     for _ in range(5):
         assert pid_alive(os.getpid()) is True
     assert pid_alive(os.getpid()) is True
+
+
+def test_pid_cwd_returns_current_process_directory_when_supported():
+    cwd = pid_cwd(os.getpid())
+    if sys.platform == "win32":
+        assert cwd is None
+    else:
+        assert cwd == os.getcwd()
+
+
+def test_pid_cwd_returns_none_for_invalid_pid():
+    assert pid_cwd(0) is None
+
+
+def test_pid_cwd_uses_lsof_on_darwin(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    fake_result = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="p123\nfcwd\nn/Users/foo/project\n", stderr=""
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: fake_result)
+    assert pid_cwd(123) == "/Users/foo/project"
+
+
+def test_pid_cwd_darwin_returns_none_when_lsof_fails(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    def raise_oserror(*a, **k):
+        raise OSError("lsof not found")
+
+    monkeypatch.setattr(subprocess, "run", raise_oserror)
+    assert pid_cwd(123) is None
 
 
 def test_pid_alive_false_for_nonpositive_pids():

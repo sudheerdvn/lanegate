@@ -485,7 +485,7 @@ def test_slot_refill_and_concurrency_cap(tmp_path):
             patch("lanegate.orchestrate.next_batch", side_effect=recording_next_batch),
             patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -608,7 +608,7 @@ def test_continue_after_pause(tmp_path, capsys):
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
             patch("lanegate.orchestrate._is_rate_limit", return_value=False),
             patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -708,7 +708,7 @@ def test_paused_top_ticket_does_not_starve_touch_conflicting_peers(tmp_path, cap
         patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
         patch("lanegate.orchestrate._is_rate_limit", return_value=False),
         patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail_as_hibernated),
-        patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+        patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
         patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
         patch("lanegate.orchestrate._committed_files", return_value=set()),
         patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -789,7 +789,7 @@ def test_needs_review_gate_continues_drain_loop(tmp_path, capsys):
         patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
         patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
         patch("lanegate.orchestrate._is_rate_limit", return_value=False),
-        patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+        patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
         patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
         patch("lanegate.orchestrate._committed_files", return_value=set()),
         patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -864,7 +864,7 @@ def test_chaos_crash_at_each_phase_pauses_one_ticket(tmp_path, capsys, crash_pha
     def fake_commit(wt, tid):
         if tid == "TICK-001" and crash_phase == "commit":
             raise RuntimeError("simulated commit-phase crash")
-        return False
+        return False, None
 
     def fake_complete(tid, cfg_, repo_root):
         p = tickets_dir / f"{tid}.md"
@@ -990,7 +990,7 @@ def test_real_system_exit_from_guard_call_pauses_one_ticket(tmp_path, capsys, ma
         patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
         patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
         patch("lanegate.orchestrate._is_rate_limit", return_value=False),
-        patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+        patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
         patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
         patch("lanegate.orchestrate._committed_files", return_value=set()),
         patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -1110,7 +1110,7 @@ def test_orchestrate_handles_missing_worktree_mid_run(tmp_path, capsys):
     with (
         patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
         patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-        patch("lanegate.orchestrate.commit_worktree_changes", return_value=True),
+        patch("lanegate.orchestrate.commit_worktree_changes", return_value=(True, None)),
         # check_worktree_has_commits will receive a missing worktree path and must not crash
         patch("lanegate.orchestrate._committed_files", return_value=set()),
         patch("lanegate.orchestrate._run_static_analysis", return_value=[]),

@@ -312,7 +312,9 @@ def _current_git_branch(repo_root: Path) -> str | None:
     return branch or None
 
 
-def _recommend_aider_edit_format(repo_root: Path) -> tuple[str, str | None]:
+def _recommend_aider_edit_format(
+    repo_root: Path, touches: set[str] | None = None
+) -> tuple[str, str | None]:
     """Suggest an aider edit_format default from the largest tracked file.
 
     "whole" makes the model rewrite the entire file every turn: reliable on
@@ -338,7 +340,8 @@ def _recommend_aider_edit_format(repo_root: Path) -> tuple[str, str | None]:
     # silently recommending "whole" with no warning even though that file
     # would break it.
     sized: list[tuple[int, str]] = []
-    for rel_path in _repo_tracked_files(repo_root):
+    tracked = touches if touches is not None else _repo_tracked_files(repo_root)
+    for rel_path in tracked:
         path = repo_root / rel_path
         try:
             size = path.stat().st_size
@@ -464,14 +467,16 @@ def _is_positive_int(value: Any) -> bool:
 def _validate_executor(cfg: dict) -> None:
     """Validate the top-level executor value."""
     executor = cfg.get("executor")
-    if executor not in _VALID_EXECUTOR_TYPES:
+    configured_names = set((cfg.get("executors") or {}).keys()) | set((cfg.get("pools") or {}).keys())
+    if executor not in _VALID_EXECUTOR_TYPES and executor not in configured_names:
         raise ValueError(f"invalid executor '{executor}' — must be one of {_VALID_EXECUTOR_TYPES}")
 
 
 def _validate_reviewer(cfg: dict) -> None:
     """Validate the optional top-level reviewer value."""
     reviewer = cfg.get("reviewer")
-    if reviewer is not None and reviewer not in _VALID_REVIEWERS:
+    configured_names = set((cfg.get("executors") or {}).keys()) | set((cfg.get("pools") or {}).keys())
+    if reviewer is not None and reviewer not in _VALID_REVIEWERS and reviewer not in configured_names:
         raise ValueError(f"invalid reviewer '{reviewer}' — must be one of {_VALID_REVIEWERS}")
 
 
@@ -877,6 +882,14 @@ def _validate_aider_model_settings(cfg: dict) -> None:
             aider_cfgs.append((name, entry))
 
     for executor_name, aider_cfg in aider_cfgs:
+        neutralize = aider_cfg.get("neutralize_touches") is True
+        
+        if neutralize and aider_cfg.get("edit_format") == "whole":
+            raise ConfigError(
+                f"executors['{executor_name}'] cannot combine neutralize_touches: true "
+                "with edit_format: 'whole'"
+            )
+
         model_settings = aider_cfg.get("model_settings")
         if model_settings is None:
             continue
@@ -919,6 +932,11 @@ def _validate_aider_model_settings(cfg: dict) -> None:
                         f"executors.aider.model_settings[{model_key!r}].edit_format "
                         f"{ef!r} is not a valid aider edit format; "
                         f"valid values are {sorted(_VALID_AIDER_EDIT_FORMATS)}"
+                    )
+                if neutralize and ef == "whole":
+                    raise ConfigError(
+                        f"executors['{executor_name}'].model_settings[{model_key!r}] "
+                        "cannot combine neutralize_touches: true with edit_format: 'whole'"
                     )
 
 
@@ -2129,6 +2147,54 @@ def _control_checkout_root(start: Path) -> Path | None:
         raise ConfigError("unable to determine a trusted Git control checkout")
     primary = Path(primary_text)
     return (primary if primary.is_absolute() else common_dir / primary).resolve()
+
+
+def is_linked_worktree(start: Path) -> bool | None:
+    """Whether *start* is inside a linked worktree rather than its control checkout.
+
+    A linked worktree has its own ``--git-dir`` (``<control>/.git/worktrees/<name>``)
+    distinct from the shared ``--git-common-dir`` (``<control>/.git``); the control
+    checkout itself reports the same path for both. This distinction is independent
+    of filesystem layout — unlike a path-containment check against the control
+    checkout's root, it is not fooled by a worktree nested *underneath* the control
+    checkout (e.g. a ``worktrees_dir`` configured inside the repo itself), since a
+    nested worktree still has its own distinct git-dir.
+
+    Returns ``None`` when *start* is not inside a Git repository at all (nothing to
+    classify). Uses the same trusted, ownership-verified Git executable and
+    ``GIT_*``-stripped environment as ``_control_checkout_root`` — see that
+    function's docstring for why an untrusted probe cannot be used here.
+    """
+    git = _trusted_git_executable()
+    probe_env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    probe_env["GIT_TERMINAL_PROMPT"] = "0"
+    probe_env["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            [git, "-C", str(start), "rev-parse", "--git-dir", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            env=probe_env,
+        )
+    except OSError as exc:
+        raise ConfigError("unable to determine whether this is a linked worktree") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.lower()
+        if "not a git repository" in stderr:
+            return None
+        raise ConfigError("unable to determine whether this is a linked worktree")
+
+    lines = result.stdout.splitlines()
+    if len(lines) != 2:
+        raise ConfigError("unable to determine whether this is a linked worktree")
+    git_dir, common_dir = (Path(line) for line in lines)
+    if not git_dir.is_absolute():
+        git_dir = start / git_dir
+    if not common_dir.is_absolute():
+        common_dir = start / common_dir
+    return git_dir.resolve() != common_dir.resolve()
 
 
 def find_config(start: Path | None = None) -> Path | None:

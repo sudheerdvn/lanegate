@@ -677,6 +677,56 @@ def test_build_executor_cmd_aider_edit_format_invalid_raises_config_error(tmp_pa
         build_executor_cmd("aider", "implement this", cfg, touches=["small.py"])
 
 
+def test_build_executor_cmd_aider_dynamic_format(tmp_path, monkeypatch):
+    """Dynamic format chooses 'whole' for small files, 'diff' for large files
+    when worktree_path is available and no strict override like 'diff-fenced' applies."""
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    small = tmp_path / "small.py"
+    small.write_text("\n".join(f"line {i}" for i in range(10)))
+    large = tmp_path / "large.py"
+    large.write_text("\n".join(f"line {i}" for i in range(400)))
+    subprocess.run(["git", "add", "small.py", "large.py"], cwd=tmp_path, check=True)
+
+    # With only small touched, selects 'whole'
+    cmd_small = build_executor_cmd(
+        "aider", "implement", {"executors": {"aider": {}}}, touches=["small.py"], worktree_path=tmp_path
+    )
+    assert "--edit-format" in cmd_small
+    assert cmd_small[cmd_small.index("--edit-format") + 1] == "whole"
+
+    # With large touched, selects 'diff'
+    cmd_large = build_executor_cmd(
+        "aider", "implement", {"executors": {"aider": {}}}, touches=["large.py"], worktree_path=tmp_path
+    )
+    assert "--edit-format" in cmd_large
+    assert cmd_large[cmd_large.index("--edit-format") + 1] == "diff"
+
+    # With static override like 'diff-fenced', it does not override
+    cmd_static = build_executor_cmd(
+        "aider", "implement", {"executors": {"aider": {"edit_format": "diff-fenced"}}}, touches=["small.py"], worktree_path=tmp_path
+    )
+    assert "--edit-format" in cmd_static
+    assert cmd_static[cmd_static.index("--edit-format") + 1] == "diff-fenced"
+
+
+def test_build_executor_cmd_aider_dynamic_format_neutralize_override(tmp_path, monkeypatch):
+    """Dynamic format forces 'diff' even for small files if neutralize_touches is true."""
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    small = tmp_path / "small.py"
+    small.write_text("\n".join(f"line {i}" for i in range(10)))
+    subprocess.run(["git", "add", "small.py"], cwd=tmp_path, check=True)
+
+    cfg = {"executors": {"aider": {"neutralize_touches": True}}}
+    cmd = build_executor_cmd(
+        "aider", "implement", cfg, touches=["small.py"], worktree_path=tmp_path
+    )
+    
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"
+
+
 @pytest.mark.parametrize(
     "executor_type,flag,flag_value",
     [
@@ -1828,6 +1878,75 @@ def test_check_aider_context_budget_calls_discovery():
             mock_log.assert_called_once()
 
 
+def test_check_aider_context_budget_discovers_ollama_budget():
+    from lanegate.executor import _check_aider_context_budget, ConfigError
+    import pytest
+
+    cfg = {
+        "drivers": {
+            "local-ollama": {
+                "type": "ollama",
+                "base_url": "http://localhost:11434",
+                "provider": "ollama",
+            }
+        }
+    }
+
+    executor_cfg = {
+        "type": "aider",
+        "instance": "aider-ollama",
+        "provider": "ollama",
+        "base_url": "http://localhost:11434",
+    }
+
+    with mock.patch("lanegate.executor.discover_ollama_context") as mock_discover:
+        mock_discover.return_value = (5, "runtime")
+        
+        with pytest.raises(ConfigError, match="estimated .* tokens exceeds configured budget 5"):
+            _check_aider_context_budget(
+                prompt="this is a prompt longer than five tokens definitely",
+                touches=[],
+                executor_cfg=executor_cfg,
+                model="llama2",
+                executor="aider-ollama",
+                cfg=cfg,
+            )
+
+
+def test_check_aider_context_budget_ignores_ollama_metadata_budget():
+    from lanegate.executor import _check_aider_context_budget
+
+    cfg = {
+        "drivers": {
+            "local-ollama": {
+                "type": "ollama",
+                "base_url": "http://localhost:11434",
+                "provider": "ollama",
+            }
+        }
+    }
+
+    executor_cfg = {
+        "type": "aider",
+        "instance": "aider-ollama",
+        "provider": "ollama",
+        "base_url": "http://localhost:11434",
+    }
+
+    with mock.patch("lanegate.executor.discover_ollama_context") as mock_discover:
+        mock_discover.return_value = (5, "model_metadata")
+        
+        # Should not raise ConfigError
+        _check_aider_context_budget(
+            prompt="this is a prompt longer than five tokens definitely",
+            touches=[],
+            executor_cfg=executor_cfg,
+            model="llama2",
+            executor="aider-ollama",
+            cfg=cfg,
+        )
+
+
 def test_check_aider_context_budget_does_not_compare_static_metadata():
     """A static /api/show value is informative, never a runtime mismatch warning."""
     from lanegate.executor import _check_aider_context_budget
@@ -2923,3 +3042,74 @@ def test_aider_model_settings_named_executor_instance(tmp_path, monkeypatch):
             touches=["small.py"],
         )
 
+
+def test_aider_edit_format_explicit_preservation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "large.py").write_text("x = 1\n" * 500)
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "diff",
+                "context_window_tokens": 65536,
+            }
+        }
+    }
+    def boom(*args, **kwargs):
+        raise AssertionError("_recommend_aider_edit_format should not be called")
+    
+    import lanegate.config
+    monkeypatch.setattr(lanegate.config, "_recommend_aider_edit_format", boom)
+    
+    cmd = build_executor_cmd(
+        "aider",
+        "implement this",
+        cfg,
+        model="gpt-4",
+        touches=["large.py"],
+        worktree_path=tmp_path
+    )
+    
+    assert "--edit-format" in cmd
+    idx = cmd.index("--edit-format")
+    assert cmd[idx + 1] == "diff"
+
+
+def test_aider_parser_rejection_detection(capsys):
+    from lanegate.executor import _check_aider_parser_rejection
+    stdout_udiff = "some text\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+    _check_aider_parser_rejection(stdout_udiff)
+    captured = capsys.readouterr()
+    assert "WARNING: Aider parser mismatch detected" in captured.err
+    assert "unified diff hunk" in captured.err
+
+    stdout_sr = "some text\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n"
+    _check_aider_parser_rejection(stdout_sr)
+    captured = capsys.readouterr()
+    assert "WARNING: Aider parser mismatch detected" in captured.err
+    assert "SEARCH/REPLACE" in captured.err
+
+def test_aider_model_settings_null_edit_format_fallback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "small.py").write_text("x = 1\n")
+    cfg = {
+        "executors": {
+            "aider": {
+                "edit_format": "whole",
+                "context_window_tokens": 65536,
+                "model_settings": {
+                    "m": {
+                        "edit_format": None
+                    }
+                }
+            }
+        }
+    }
+    
+    import lanegate.config
+    monkeypatch.setattr(lanegate.config, "_recommend_aider_edit_format", lambda *args, **kwargs: ("diff", None))
+    
+    cmd = build_executor_cmd(
+        "aider", "implement this", cfg, model="m", touches=["small.py"], worktree_path=tmp_path
+    )
+    assert "--edit-format" in cmd
+    assert cmd[cmd.index("--edit-format") + 1] == "diff"

@@ -314,15 +314,15 @@ _PROMPT_ARTIFACT_FILENAME_PATTERNS = (
 _MAX_TICKET_MARKDOWN_BYTES = 40000
 
 _OPERATIONAL_SECTION_RE = re.compile(
-    r"\n##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+"
-    r"|Review Findings|Acceptance Contract Audit|Status History|Lifecycle Timeline"
+    r"(?:^|\n)##\s*(Needs Review Reason|Hibernation Reason|Auto-Fix Attempt \d+"
+    r"|Review Findings|Dismissal Rationale|Acceptance Contract Audit|Status History|Lifecycle Timeline"
     r"|Post-Merge Verification Diagnostic)"
     r".*?(?=\n##\s|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 
 _PROMPT_ARTIFACT_PATTERNS = (
-    r"\{\s*\"(role|type)\"\s*:\s*\"(user|assistant|system|USER_INPUT|PLANNER_RESPONSE|SYSTEM|USER_EXPLICIT|MODEL)\"",
+    r"\{[^\n{}]*\"(?:role|type)\"\s*:\s*\"(?:user|assistant|system|USER_INPUT|PLANNER_RESPONSE|SYSTEM|USER_EXPLICIT|MODEL)\"",
     r"\"(tool_calls|tool_use|tool_result|planner_response|user_input)\"\s*:",
     r"<\/?(system|assistant|untrusted-data|user-request|task|instructions)>",
     r"===\s*(PROMPT|TRANSCRIPT)\s*===",
@@ -404,7 +404,7 @@ def _find_prompt_artifact_violations(
                         is_artifact = True
 
                 if not is_artifact:
-                    sections = re.split(r"\n(?=##\s)", content)
+                    sections = re.split(r"\n(?=##\s)", stripped)
                     for sec in sections:
                         if len(sec.encode("utf-8")) > _MAX_TICKET_MARKDOWN_BYTES:
                             is_artifact = True

@@ -3,6 +3,8 @@
 import json
 import os
 import subprocess
+from types import SimpleNamespace
+import sys
 from importlib.metadata import version
 from pathlib import Path
 from unittest.mock import patch
@@ -743,6 +745,18 @@ def test_orchestrator_lock_status_held(repo, capsys):
     assert "STALE" in out or "HELD" in out
 
 
+def test_orchestrator_lock_status_shows_cwd(repo, capsys):
+    import os
+
+    _run_cli(["orchestrator-lock", "acquire", "--pid", str(os.getpid())], repo)
+    capsys.readouterr()
+    _run_cli(["orchestrator-lock", "status"], repo)
+    out = capsys.readouterr().out
+    assert "HELD" in out
+    assert "cwd:" in out
+    _run_cli(["orchestrator-lock", "release", "--pid", str(os.getpid())], repo)
+
+
 # --- lanegate executor status / reset (TICK-090) ---
 
 
@@ -1087,6 +1101,213 @@ def test_run_command_and_lane_alias(repo):
         with patch("lanegate.orchestrate.cmd_orchestrate") as mock_cmd:
             _run_cli([subcmd], repo)
             assert mock_cmd.called, f"Expected cmd_orchestrate to be called for subcommand '{subcmd}'"
+
+
+def test_cmd_run_blocked_in_worktree(repo):
+    """Neither spelling of the singleton command may run from a linked worktree."""
+    main_checkout = repo / "main"
+    worktree = repo / "worktree"
+    subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main_checkout),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(main_checkout), "worktree", "add", "-q", str(worktree)],
+        check=True,
+    )
+
+    for subcmd in ["run", "orchestrate"]:
+        with (
+            patch("lanegate.cli.Path.cwd", return_value=worktree),
+            patch("lanegate.orchestrate.cmd_orchestrate") as mock_cmd,
+            pytest.raises(SystemExit, match="main checkout"),
+        ):
+            _run_cli([subcmd], main_checkout)
+        mock_cmd.assert_not_called()
+
+
+def test_cmd_run_blocked_in_worktree_despite_git_env_poisoning(repo, monkeypatch):
+    """A poisoned GIT_* env var must not fail the guard open.
+
+    The untrusted-probe version of this guard ran a bare `git` with the
+    caller's full environment and returned (allowed) on any non-zero exit.
+    GIT_COMMON_DIR redirects even an absolute git executable and makes the
+    probe fail with a non-repository-shaped error, which would have hit that
+    fail-open branch from inside a real linked worktree -- the exact case
+    this guard exists to block."""
+    from lanegate.cli import _require_main_checkout
+
+    main_checkout = repo / "main"
+    worktree = repo / "worktree"
+    subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(main_checkout), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(main_checkout), "worktree", "add", "-q", str(worktree)],
+        check=True,
+    )
+    monkeypatch.chdir(worktree)
+    monkeypatch.setenv("GIT_COMMON_DIR", "/nonexistent-poisoned-path")
+
+    with pytest.raises(SystemExit, match="main checkout"):
+        _require_main_checkout(worktree)
+
+
+def test_cmd_run_allowed_from_main_checkout_subdirectory(repo, monkeypatch):
+    """A command launched below the main checkout is still allowed."""
+    from lanegate.cli import _require_main_checkout
+
+    main_checkout = repo / "main"
+    subdir = main_checkout / "lanegate"
+    subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+    subdir.mkdir()
+    monkeypatch.chdir(subdir)
+
+    _require_main_checkout(main_checkout)
+
+
+def test_cmd_run_allowed_from_submodule_checkout(repo, monkeypatch):
+    """A submodule's external git dir is its common dir, not a linked worktree."""
+    from lanegate.cli import _require_main_checkout
+
+    source = repo / "source"
+    superproject = repo / "super"
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "init", "-q", str(superproject)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(superproject),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(source),
+            "sub",
+        ],
+        check=True,
+    )
+    submodule = superproject / "sub"
+    monkeypatch.chdir(submodule)
+
+    _require_main_checkout(submodule)
+
+
+def test_cmd_run_blocked_in_worktree_nested_under_main_checkout(repo, monkeypatch):
+    """A linked worktree living *underneath* the main checkout (e.g. a
+    worktrees_dir configured inside the repo itself, such as
+    .lanegate/worktrees/<ticket>) must still be blocked.
+
+    A path-containment check against the control checkout's root is fooled
+    here: the nested worktree's path is "under" the main checkout, but it is
+    still a distinct linked worktree with its own git-dir. Only a git-dir
+    vs. git-common-dir comparison (nesting-independent) catches this."""
+    from lanegate.cli import _require_main_checkout
+
+    main_checkout = repo / "main"
+    nested_worktree = main_checkout / ".lanegate" / "worktrees" / "ticket"
+    subprocess.run(["git", "init", "-q", str(main_checkout)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(main_checkout), "-c", "user.name=Test",
+            "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial",
+        ],
+        check=True,
+    )
+    nested_worktree.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(main_checkout), "worktree", "add", "-q", str(nested_worktree)],
+        check=True,
+    )
+    monkeypatch.chdir(nested_worktree)
+
+    with pytest.raises(SystemExit, match="main checkout"):
+        _require_main_checkout(nested_worktree)
+
+
+def test_run_command_sets_process_title(repo):
+    with (
+        patch("lanegate.cli.sys.platform", "linux"),
+        patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}, clear=False),
+        patch("lanegate.cli.os.execv") as mock_execv,
+        patch("lanegate.orchestrate.cmd_orchestrate"),
+    ):
+        os.environ.pop("PYTEST_CURRENT_TEST")
+        os.environ.pop("_LANEGATE_REEXEC", None)
+        _run_cli(["run"], repo)
+
+    mock_execv.assert_called_once_with(
+        sys.executable,
+        [f"lanegate run [{repo}]", "lanegate", "run"],
+    )
+
+
+def test_run_command_pins_real_executable_before_reexec(repo):
+    """os.execv's synthetic argv[0] leaves sys.executable unresolvable in the
+    re-exec'd process, so it must be pinned via env var and restored on the
+    other side -- otherwise every subprocess.run([sys.executable, ...]) call
+    downstream (pytest safeguards included) fails with command-not-found."""
+    real_executable = sys.executable
+    with (
+        patch("lanegate.cli.sys.platform", "linux"),
+        patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}, clear=False),
+        patch("lanegate.cli.os.execv"),
+        patch("lanegate.orchestrate.cmd_orchestrate"),
+    ):
+        os.environ.pop("PYTEST_CURRENT_TEST")
+        os.environ.pop("_LANEGATE_REEXEC", None)
+        _run_cli(["run"], repo)
+
+        assert os.environ["_LANEGATE_REAL_EXECUTABLE"] == real_executable
+
+        with patch("lanegate.cli.sys.executable", "lanegate run [/repo]"):
+            _run_cli(["run"], repo)
+            assert sys.executable == real_executable
+
+        # Both vars must be gone once consumed, on the far side of the exec
+        # -- otherwise a later subprocess spawned by this same process (e.g.
+        # resume-watch's own `lanegate run` retry, which copies os.environ)
+        # would inherit _LANEGATE_REEXEC, skip its own re-exec/title-setting
+        # entirely, and clobber its own correct sys.executable with this
+        # process's now-stale pinned value.
+        assert "_LANEGATE_REAL_EXECUTABLE" not in os.environ
+        assert "_LANEGATE_REEXEC" not in os.environ
 
 
 def test_orchestrate_executors_flag_parses_comma_list(repo):

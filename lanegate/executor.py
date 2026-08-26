@@ -1258,7 +1258,16 @@ def _check_aider_context_budget(
         _model_override = (executor_cfg.get("model_settings") or {}).get(model, {})
         budget = _model_override.get("context_window_tokens", budget)
     if budget is None:
-        return
+        if executor and cfg and model:
+            provider = _aider_provider(executor, cfg, executor_cfg)
+            if provider == "ollama":
+                base_url = executor_cfg.get("base_url")
+                if base_url:
+                    discovered, source = discover_ollama_context(base_url, model)
+                    if discovered is not None and source == "runtime":
+                        budget = discovered
+        if budget is None:
+            return
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         raise ConfigError(
             "executors.aider.context_window_tokens must be a positive integer"
@@ -1491,6 +1500,7 @@ def build_executor_cmd(
             repo_map_flags = []
             file_args = [] if neutralize_touches else (list(touches) if touches else [])
         edit_format = executor_cfg.get("edit_format")
+        explicit_edit_format = edit_format is not None
         if edit_format is not None and (not isinstance(edit_format, str) or not edit_format):
             raise ConfigError("executors.aider.edit_format must be a non-empty string")
         # Apply per-model edit_format override from model_settings.  model here
@@ -1502,7 +1512,20 @@ def build_executor_cmd(
         # Only override when not read_only — read_only forces "ask" below regardless.
         if model and not read_only:
             _ef_override = (executor_cfg.get("model_settings") or {}).get(model, {})
-            edit_format = _ef_override.get("edit_format", edit_format)
+            if "edit_format" in _ef_override:
+                edit_format = _ef_override["edit_format"]
+                explicit_edit_format = edit_format is not None
+            
+        if not explicit_edit_format and worktree_path is not None:
+            from lanegate.config import _recommend_aider_edit_format
+            dynamic_format, _ = _recommend_aider_edit_format(
+                repo_root=worktree_path,
+                touches=set(touches) if touches is not None else None
+            )
+            if dynamic_format == "whole" and neutralize_touches:
+                dynamic_format = "diff"
+            edit_format = dynamic_format
+            
         # A read-only call (analyze) never edits or commits -- --dry-run
         # already guarantees that -- so force aider's own "ask" coder
         # regardless of any configured edit_format. Without this, aider
@@ -1799,6 +1822,18 @@ def parse_structured_result(executor_type: str, stdout: str) -> dict | None:
     return parser(stdout)
 
 
+def _check_aider_parser_rejection(stdout: str) -> None:
+    import re
+    import sys
+    udiff = re.search(r'(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*?)(?:\n\n|\Z)', stdout, re.DOTALL)
+    if udiff:
+        print(f"\nWARNING: Aider parser mismatch detected! The model emitted a unified diff hunk but the active edit_format rejected it. Snippet:\n{udiff.group(1)[:200]}", file=sys.stderr)
+        return
+    sr = re.search(r'(<<<<<<< SEARCH.*?=======.*?>>>>>>> REPLACE)', stdout, re.DOTALL)
+    if sr:
+        print(f"\nWARNING: Aider parser mismatch detected! The model emitted a SEARCH/REPLACE block but the active edit_format rejected it. Snippet:\n{sr.group(1)[:200]}", file=sys.stderr)
+        return
+
 def dispatch_executor(
     executor: str,
     prompt: str,
@@ -1852,7 +1887,14 @@ def dispatch_executor(
     cmd = build_executor_cmd(
         executor, prompt, cfg, model=model, touches=touches, worktree_path=Path(cwd), use_stdin=use_stdin
     )
-    return subprocess.run(cmd, cwd=str(cwd), env=env, **kwargs)
+    result = subprocess.run(cmd, cwd=str(cwd), env=env, **kwargs)
+    
+    if executor_type == "aider" and result.returncode == 0:
+        if "--dry-run" not in cmd and "--edit-format" in cmd and "ask" not in cmd:
+            if "Commit " not in result.stdout and "Committing " not in result.stdout:
+                _check_aider_parser_rejection(result.stdout)
+                
+    return result
 
 
 def build_implement_prompt(

@@ -30,3 +30,4 @@ graphify-out/
 
 # Local MCP client configuration (machine/user-specific)
 .mcp.json
+.aider*

@@ -726,6 +726,7 @@ def _clear_human_review_approval(ticket: dict) -> None:
     ticket.pop("human_review_approved_at", None)
     ticket.pop("human_review_rationale", None)
     ticket.pop("human_review_actor", None)
+    ticket.pop("red_lane_approved_at_sha", None)
     # close_criteria_drift_approved_* is deliberately left untouched here: it is
     # scoped to the approved close_criteria text (see _close_criteria_drift_finding),
     # not to this diff, so an unrelated needs_review bounce must not invalidate it.
@@ -1058,6 +1059,18 @@ def cmd_human_review_approve(
     ticket["close_criteria_drift_approved_rationale"] = rationale
     ticket["close_criteria_drift_approved_actor"] = actor
     ticket["close_criteria_drift_approved_snapshot"] = _flatten_close_criteria(ticket.get("close_criteria"))
+
+    # Record the exact commit this approval covers so loop.py's red-lane
+    # diff re-scans can recognize an unchanged diff and skip re-escalating.
+    head_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if head_result.returncode == 0:
+        ticket["red_lane_approved_at_sha"] = head_result.stdout.strip()
 
     if current == "code_complete":
         summary = ticket.get("review_summary")
@@ -1434,10 +1447,12 @@ def cmd_fail(
     # The ticket body is executor-writable; cleanup may only delete the
     # branch derived from the canonical ticket ID.
     branch = branch_name(tid)
+    
+    preserve = ticket.get("review_verdict") == "changes_requested" or _worktree_has_commits(ticket, cfg, repo_root)
 
     # Validate ownership before mutating lifecycle state. A canonical pathname
     # alone is not authority to force-remove a different or detached worktree.
-    if ticket.get("review_verdict") != "changes_requested":
+    if not preserve:
         from lanegate.config import protected_branches
         from lanegate.worktree import worktree_path
 
@@ -1456,8 +1471,8 @@ def cmd_fail(
     ticket["status"] = "failed"
     _remove_recovery_file(repo_root, tid)
 
-    # Preserve worktree if ticket has review_verdict=changes_requested
-    if ticket.get("review_verdict") != "changes_requested":
+    # Preserve worktree if ticket has review_verdict=changes_requested or has commits
+    if not preserve:
         ticket["worktree"] = None
         ticket["branch"] = None
 
@@ -1474,8 +1489,8 @@ def cmd_fail(
 
     _commit_generated_ticket_write(repo_root, ticket["_path"], tid, "failed", cfg)
 
-    # Remove the worktree so the touches lock is freed (unless changes_requested)
-    if ticket.get("review_verdict") != "changes_requested":
+    # Remove the worktree so the touches lock is freed (unless preserved)
+    if not preserve:
         for companion in ticket.get("companion_repos") or []:
             companion_worktree_cleanup(repo_root, companion, tid)
 
@@ -1498,8 +1513,9 @@ def cmd_fail(
             if r_verify.returncode == 0:
                 raise RuntimeError(f"ERROR: Failed to delete git branch '{branch}': {r_br.stderr}")
     else:
+        trigger = "review_verdict=changes_requested" if ticket.get("review_verdict") == "changes_requested" else "has_commits"
         print(
-            f"[lifecycle] skipping worktree cleanup for {tid} (review_verdict=changes_requested) — preserved for inspection",
+            f"[lifecycle] skipping worktree cleanup for {tid} ({trigger}) — preserved for inspection",
             file=sys.stderr,
         )
 

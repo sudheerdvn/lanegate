@@ -1402,6 +1402,24 @@ def test_no_transcript_in_tickets_allows_accumulated_operational_history(tmp_pat
     assert violations == []
 
 
+def test_no_transcript_in_tickets_allows_large_dismissal_rationale(tmp_path):
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    full_content = (
+        "## Dismissal Rationale\n"
+        + ("Dismissed review finding detail.\n" * 1600)
+        + "\n## Background\nAuthored body text.\n"
+    )
+    assert len(full_content.encode("utf-8")) > 40000
+    (tickets_dir / "TICK-001.md").write_text(full_content)
+
+    violations = _find_prompt_artifact_violations(
+        tickets_dir, own_ticket_id="TICK-001"
+    )
+
+    assert violations == []
+
+
 def test_no_transcript_in_tickets_rejects_pasted_transcript_under_operational_section(tmp_path):
     tickets_dir = tmp_path / "tickets"
     tickets_dir.mkdir()
@@ -1420,14 +1438,14 @@ def test_no_transcript_in_tickets_rejects_pasted_transcript_under_operational_se
     assert "TICK-001.md" in violations[0]
 
 
-def test_no_transcript_in_tickets_rejects_oversized_single_operational_section(tmp_path):
+def test_no_transcript_in_tickets_rejects_oversized_single_authored_section(tmp_path):
     tickets_dir = tmp_path / "tickets"
     tickets_dir.mkdir()
     authored_content = "---\nid: TICK-001\n---\n# Title\n\nAuthored body text.\n"
-    huge_review_findings = (
-        "\n## Review Findings\n" + ("x" * 50000)
+    huge_authored_section = (
+        "\n## Background\n" + ("x" * 50000)
     )
-    full_content = authored_content + huge_review_findings
+    full_content = authored_content + huge_authored_section
     assert len(full_content.encode("utf-8")) > 40000
     (tickets_dir / "TICK-001.md").write_text(full_content)
 
@@ -1795,5 +1813,4 @@ def test_collect_control_plane_touches_handles_staged_rename(tmp_path):
     with patch("subprocess.run", side_effect=fake_run):
         found, branch = collect_control_plane_touches(ticket, tmp_path, cfg)
         assert "lanegate/safeguards.py" in found
-
 

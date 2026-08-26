@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Callable
 import subprocess
 from pathlib import Path
 
@@ -157,7 +158,13 @@ class OrchestratorLockError(RuntimeError):
     """Raised when the orchestrator advisory lock is already held by a live process."""
 
 
-def acquire_orchestrator_lock(repo_root: Path, pid: int | None = None, force: bool = False) -> int:
+def acquire_orchestrator_lock(
+    repo_root: Path,
+    pid: int | None = None,
+    force: bool = False,
+    *,
+    before_claim: Callable[[], None] | None = None,
+) -> int:
     """
     Atomically claim the single-orchestrator advisory lock for `pid` (default: current PID).
 
@@ -165,17 +172,28 @@ def acquire_orchestrator_lock(repo_root: Path, pid: int | None = None, force: bo
     already holds it (unless force=True). A stale lock (holder PID is dead) is reclaimed
     automatically. The PID file persists after this call returns — it represents the
     orchestrator session, not this process — so the caller (or `release_orchestrator_lock`)
-    is responsible for removing it.
+    is responsible for removing it. ``before_claim`` runs while the atomic guard is held,
+    after any live-holder conflict has been rejected but before the lock is replaced.
+
+    ``force`` and ``before_claim`` are mutually exclusive: forcibly overriding a live
+    holder is meant for an operator-initiated wedged-lock recovery, not for the
+    cwd-verification hook, so combining them would silently make ``force`` a no-op
+    against a live holder rather than doing what either knob promises on its own.
     """
+    if force and before_claim is not None:
+        raise ValueError("acquire_orchestrator_lock: force and before_claim are mutually exclusive")
     pid = os.getpid() if pid is None else pid
     lock_path = _orchestrator_lock_path(repo_root)
     with _flock_guard(repo_root):
         existing = _read_lock_pid(lock_path)
-        if existing is not None and existing != pid and pid_alive(existing) and not force:
+        live_other_holder = existing is not None and existing != pid and pid_alive(existing)
+        if live_other_holder and not force:
             raise OrchestratorLockError(
                 f"an orchestrator (PID {existing}) is already running for this repo. "
                 f"Use --force to override a wedged lock, or attach read-only with status."
             )
+        if before_claim is not None:
+            before_claim()
         lock_path.write_text(f"{pid}\n", encoding="utf-8")
     return pid
 

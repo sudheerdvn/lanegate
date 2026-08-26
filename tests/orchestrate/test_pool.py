@@ -6,10 +6,17 @@ Split out of the former monolithic tests/test_orchestrate.py (TICK-316).
 
 from __future__ import annotations
 
+import datetime
+import os
+
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
 from lanegate.orchestrate.audit import has_step_bundle
-from lanegate.orchestrate.pool import _CONFIG_ERROR_EXIT_CODE, capture_manual_implement_step_run
+from lanegate.orchestrate.pool import (
+    _CONFIG_ERROR_EXIT_CODE,
+    _is_main_checkout_bookkeeping_path,
+    capture_manual_implement_step_run,
+)
 
 
 class TestBuildExecutorCmd:
@@ -115,6 +122,52 @@ class TestBuildExecutorCmd:
         assert "mistral" in cmd
 
 
+
+    def test_rebase_conflict_commit_scopes_to_conflict_files(self, tmp_path):
+        """Regression test for TICK-686: commit_worktree_changes must isolate the
+        commit to the requested paths, even if other files were already staged or untracked."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return __import__("subprocess").run(
+                ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+            )
+
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test User")
+
+        (repo / "base.txt").write_text("base")
+        git("add", "base.txt")
+        git("commit", "-m", "base")
+
+        conflict_file = repo / "conflict.txt"
+        conflict_file.write_text("resolved")
+
+        unrelated_staged = repo / "unrelated.txt"
+        unrelated_staged.write_text("unrelated")
+        git("add", "unrelated.txt")
+
+        unrelated_untracked = repo / "untracked.txt"
+        unrelated_untracked.write_text("untracked")
+
+        from lanegate.orchestrate.pool import commit_worktree_changes
+        result = commit_worktree_changes(repo, "TICK-686", paths=["conflict.txt"])
+
+        assert result[0] is True
+
+        committed_files = git("show", "--format=", "--name-only", "HEAD").stdout.splitlines()
+        assert "conflict.txt" in committed_files
+        assert "unrelated.txt" not in committed_files
+        assert "untracked.txt" not in committed_files
+
+        # unrelated.txt should still be staged
+        status = git("status", "--porcelain").stdout
+        assert "A  unrelated.txt" in status or "A  unrelated.txt" in status.replace("AM", "A ")
+        assert "?? untracked.txt" in status
+
+
 # ---------------------------------------------------------------------------
 # invoke_executor
 # ---------------------------------------------------------------------------
@@ -172,6 +225,42 @@ def test_invoke_executor_rejects_ollama_for_implement(tmp_path):
 
     assert exit_code == _CONFIG_ERROR_EXIT_CODE
     mock_ollama.assert_not_called()
+
+
+def test_invoke_executor_config_error_stderr(tmp_path):
+    ticket = {
+        "id": "TICK-ERR",
+        "title": "Err title",
+        "touches": ["a.py"],
+        "close_criteria": "Done.",
+        "_body": "Body.",
+    }
+    cfg = {"executor": "aider"}
+    
+    with patch("lanegate.orchestrate.pool.build_executor_cmd", side_effect=ConfigError("test message 123")):
+        exit_code, captured_stdout, captured_stderr = invoke_executor(ticket, cfg, tmp_path, step="implement")
+        
+    assert exit_code == _CONFIG_ERROR_EXIT_CODE
+    assert "test message 123" in captured_stderr
+    assert "executor configuration failed for 'aider'" in captured_stderr
+
+
+def test_invoke_executor_timeout_diagnostic(tmp_path):
+    ticket = {
+        "id": "TICK-TIMEOUT",
+        "title": "Timeout title",
+        "touches": ["a.py"],
+        "close_criteria": "Done.",
+        "_body": "Body.",
+    }
+    cfg = {"executor": "aider"}
+    
+    with patch("lanegate.orchestrate.pool.build_executor_cmd", return_value=["echo", "hello"]), \
+         patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "out", "err", "stall")):
+        exit_code, captured_stdout, captured_stderr = invoke_executor(ticket, cfg, tmp_path, step="implement")
+    
+    assert "dispatch terminated due to 'stall' after" in captured_stderr
+    assert "heartbeats received" in captured_stderr
 
 
 def test_ticket_executor_pins_implement_and_every_fix_dispatch_away_from_global_codex(tmp_path):
@@ -302,6 +391,233 @@ def test_lifecycle_resolve_reviewer_checks_steps_review_driver():
 
 
 class TestInvokeExecutor:
+    def test_main_checkout_violation_caught_post_dispatch(self, tmp_path, capsys):
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+
+        real_run = subprocess.run
+        statuses = iter(["", " M leaked_file.py\n"])
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "worktree isolation leak" in stderr
+        assert "leaked_file.py" in stderr
+
+    def test_main_checkout_violation_catches_reverted_tracked_file(self, tmp_path, capsys):
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+
+        real_run = subprocess.run
+        statuses = iter([" M leaked_file.py\n", ""])
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "worktree isolation leak" in stderr
+        assert "leaked_file.py" in stderr
+
+    def test_main_checkout_violation_ignores_sibling_ticket_and_config_changes(
+        self, tmp_path, capsys
+    ):
+        """Regression for TICK-680: a sibling ticket's status-transition
+        commit or a human editing .lanegate.yml concurrently must not be
+        mistaken for this ticket's executor leaking writes into the main
+        checkout."""
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+        cfg["tickets_dir"] = "./.lanegate/tickets"
+        tickets_relpath = ".lanegate/tickets"
+
+        real_run = subprocess.run
+        statuses = iter(
+            [
+                "",
+                f" M {tickets_relpath}/TICK-999.md\n M .lanegate.yml\n",
+            ]
+        )
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 0
+        assert "worktree isolation leak" not in capsys.readouterr().err
+
+    def test_main_checkout_violation_catches_source_amid_bookkeeping_changes(
+        self, tmp_path, capsys
+    ):
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+        tickets_relpath = os.path.relpath(cfg["tickets_dir"], tmp_path)
+
+        real_run = subprocess.run
+        statuses = iter(
+            [
+                "",
+                f" M {tickets_relpath}/TICK-999.md\n"
+                " M .lanegate.yml\n"
+                " M lanegate/orchestrate/pool.py\n",
+            ]
+        )
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "worktree isolation leak" in stderr
+        assert "lanegate/orchestrate/pool.py" in stderr
+        assert "TICK-999.md" not in stderr
+        assert ".lanegate.yml" not in stderr
+
+    def test_main_checkout_violation_not_hidden_by_arrow_in_literal_filename(
+        self, tmp_path, capsys
+    ):
+        """Regression for TICK-680 review: a leaked file whose literal name
+        contains ' -> ' (not a rename -- status code is plain 'A ') must not
+        be split into two bookkeeping-looking halves and waved through."""
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+
+        real_run = subprocess.run
+        statuses = iter(["", "A  .lanegate.yml -> .lanegate.yml\n"])
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "worktree isolation leak" in stderr
+        assert ".lanegate.yml -> .lanegate.yml" in stderr
+
+    def test_main_checkout_violation_catches_lanegate_yaml_not_the_real_config(
+        self, tmp_path, capsys
+    ):
+        """Regression for TICK-680 review: only '.lanegate.yml' (CONFIG_FILENAME)
+        is real lanegate config. A tracked '.lanegate.yaml' is not the config
+        file lanegate actually reads, so an executor writing one is a genuine
+        leak and must still be reported, not silently exempted."""
+        ticket = {
+            "id": "TICK-670",
+            "title": "Detect main checkout writes",
+            "touches": ["leaked_file.py"],
+            "close_criteria": "Detect isolation leaks.",
+            "_body": "Body.",
+        }
+        cfg = _default_cfg(tmp_path)
+
+        real_run = subprocess.run
+        statuses = iter(["", "A  .lanegate.yaml\n"])
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses))
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=fake_run),
+        ):
+            exit_code, *_ = invoke_executor(ticket, cfg, tmp_path, repo_root=tmp_path)
+
+        assert exit_code == 1
+        stderr = capsys.readouterr().err
+        assert "worktree isolation leak" in stderr
+        assert ".lanegate.yaml" in stderr
+
+    def test_main_checkout_bookkeeping_tickets_dir_uses_posix_separator(self, tmp_path):
+        """Regression for TICK-680 review: on Windows, os.path.normpath()
+        renders tickets_dir with backslashes, which never matches git
+        porcelain output (always '/'). Simulate Windows normpath behavior
+        on this POSIX test runner to exercise the replace(os.sep, "/") fix."""
+        cfg = _default_cfg(tmp_path)
+        cfg["tickets_dir"] = ".lanegate/tickets"
+
+        with (
+            patch("lanegate.orchestrate.pool.os.sep", "\\"),
+            patch(
+                "lanegate.orchestrate.pool.os.path.normpath",
+                side_effect=lambda p: p.replace("/", "\\"),
+            ),
+        ):
+            assert _is_main_checkout_bookkeeping_path(
+                ".lanegate/tickets/TICK-999.md", cfg, tmp_path
+            )
+
     def test_only_incremental_executors_receive_output_idle_timeout(self, tmp_path):
         ticket = {
             "id": "TICK-TIMEOUT", "title": "Timeout policy", "touches": [],
@@ -359,6 +675,31 @@ class TestInvokeExecutor:
         with patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=reject_long_argv):
             rc, *_ = invoke_executor(ticket, cfg, tmp_path)
         assert rc == 0
+
+    def test_aider_parser_mismatch_warns_on_production_dispatch_path(self, tmp_path, capsys):
+        """TICK-657 attempt-4 finding: the parser-rejection warning lived only in
+        dispatch_executor, which production orchestration never calls — invoke_executor
+        (via _stream_subprocess) reached the generic 'made no commits' failure with no
+        diagnostic. Assert the warning now fires on this real dispatch path too."""
+        ticket = {
+            "id": "TICK-PARSER", "title": "Parser mismatch", "touches": [],
+            "close_criteria": "ok", "_body": "",
+        }
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "aider"
+        cfg["executors"] = {"aider": {"edit_format": "diff"}}
+        diff_stdout = "@@ -1 +1 @@\n-old\n+new\n"
+
+        with patch(
+            "lanegate.orchestrate.pool._stream_subprocess",
+            return_value=(0, diff_stdout, ""),
+        ) as mock_stream:
+            rc, *_ = invoke_executor(ticket, cfg, tmp_path)
+
+        cmd = mock_stream.call_args.args[0]
+        assert "--edit-format" in cmd
+        assert rc == 0
+        assert "Aider parser mismatch detected" in capsys.readouterr().err
 
     def test_calls_correct_subprocess_for_claude_process(self, tmp_path):
         ticket = {
@@ -624,6 +965,47 @@ class TestInvokeExecutor:
         cmd = captured_cmd["cmd"]
         assert "--resume" in cmd
         assert cmd[cmd.index("--resume") + 1] == "sess-abc123"
+
+    def test_codex_expired_resume_retries_once_fresh(self, tmp_path):
+        """An expired Codex rollout retries once without its stale resume ID."""
+        ticket = {
+            "id": "TICK-012A",
+            "title": "Expired Codex resume",
+            "touches": ["r.py"],
+            "close_criteria": "Done.",
+            "_body": "Body.",
+            "analyze_session_id": "expired-session",
+            "analyze_session_executor": "codex",
+            "analyze_session_model": "gpt-5.6-terra",
+        }
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "codex"
+        cfg["executors"] = {"codex": {"type": "codex", "models": {"implement": "gpt-5.6-terra"}}}
+        calls = []
+
+        def expired_then_success(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return 1, "", "Error: thread/resume failed: no rollout found for thread id expired-session"
+            return 0, "", ""
+
+        with patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=expired_then_success):
+            assert invoke_executor(ticket, cfg, tmp_path) == (0, "", "")
+
+        assert len(calls) == 2
+        assert calls[0][:3] == ["codex", "exec", "resume"]
+        assert calls[1][:2] == ["codex", "exec"]
+        assert "resume" not in calls[1]
+        assert "expired-session" not in calls[1]
+
+        calls.clear()
+        with patch(
+            "lanegate.orchestrate.pool._stream_subprocess",
+            side_effect=lambda cmd, *args, **kwargs: (calls.append(cmd) or (1, "", "generic failure")),
+        ):
+            assert invoke_executor(ticket, cfg, tmp_path) == (1, "", "generic failure")
+
+        assert len(calls) == 1
 
     def test_invoke_executor_does_not_resume_session_from_other_executor(self, tmp_path):
         """A pool switch must start fresh rather than pass an Agy/Claude ID to Codex."""
@@ -1888,7 +2270,7 @@ def _pool_dispatch_scenario(tmp_path, *, pool_strategy: str, max_parallel: int =
     with (
         patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
         patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-        patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+        patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
         patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
         patch("lanegate.orchestrate._committed_files", return_value=set()),
         patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2120,7 +2502,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2188,7 +2570,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2235,6 +2617,7 @@ class TestResolvedDispatchDisplay:
             "id: TICK-900\n"
             "title: Test TICK-900\n"
             "status: hibernated\n"
+            f"status_changed_at: {datetime.datetime.now(datetime.UTC).isoformat()}\n"
             "milestone: old\n"
             "priority: 1\n"
             "parallel_safe: true\n"
@@ -2268,7 +2651,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2345,7 +2728,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2417,7 +2800,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2459,7 +2842,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2532,7 +2915,7 @@ class TestResolvedDispatchDisplay:
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
             patch("lanegate.orchestrate._is_rate_limit", side_effect=fake_is_rate_limit),
             patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2722,7 +3105,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2862,7 +3245,7 @@ class TestResolvedDispatchDisplay:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_override),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2938,8 +3321,15 @@ class TestCommitWorktreeChanges:
             mock_run.return_value = MagicMock(returncode=0, stdout="")
             result = commit_worktree_changes(tmp_path, "TICK-001")
 
-        assert result is False
+        assert result[0] is False
         assert mock_run.call_args_list[0].args[0] == ["git", "status", "--porcelain"]
+
+    def test_empty_path_scope_does_not_stage_worktree(self, tmp_path):
+        with patch("lanegate.orchestrate.subprocess.run") as mock_run:
+            result = commit_worktree_changes(tmp_path, "TICK-001", paths=[])
+
+        assert result == (False, None)
+        mock_run.assert_not_called()
 
     def test_commits_dirty_worktree(self, tmp_path):
         calls = [
@@ -2952,7 +3342,7 @@ class TestCommitWorktreeChanges:
         with patch("lanegate.orchestrate.subprocess.run", side_effect=calls) as mock_run:
             result = commit_worktree_changes(tmp_path, "TICK-001")
 
-        assert result is True
+        assert result[0] is True
         assert mock_run.call_args_list[1].args[0] == [
             "git",
             "add",
@@ -2986,6 +3376,28 @@ class TestCommitWorktreeChanges:
         add_cmd = mock_run.call_args_list[1].args[0]
         assert ":(exclude).lanegate/**" in add_cmd
 
+    def test_returns_false_and_unstages_when_drift_detected(self, tmp_path):
+        calls = [
+            MagicMock(returncode=0, stdout="?? scratch.py\n"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(returncode=0),
+        ]
+        ticket = {"id": "TICK-001", "touches": ["lanegate/orchestrate/pool.py"]}
+
+        with (
+            patch("lanegate.orchestrate.pool.subprocess.run", side_effect=calls) as mock_run,
+            patch(
+                "lanegate.orchestrate.pool.check_touches_compliance",
+                side_effect=SystemExit(1),
+            ) as mock_compliance,
+        ):
+            result = commit_worktree_changes(tmp_path, "TICK-001", ticket=ticket)
+
+        assert result == (False, None)
+        mock_compliance.assert_called_once_with("TICK-001", ticket, tmp_path)
+        assert mock_run.call_args_list[3].args[0] == ["git", "restore", "--staged", "."]
+
     def test_custom_message_overrides_default(self, tmp_path):
         """TICK-120: an explicit message param is used verbatim instead of the
         default 'feat: implement <tid>' — needed so fix-pass commits aren't
@@ -3002,7 +3414,7 @@ class TestCommitWorktreeChanges:
                 tmp_path, "TICK-001", message="fix: address review findings for TICK-001"
             )
 
-        assert result is True
+        assert result[0] is True
         assert mock_run.call_args_list[3].args[0] == [
             "git",
             "commit",
@@ -3010,6 +3422,43 @@ class TestCommitWorktreeChanges:
             "-m",
             "fix: address review findings for TICK-001",
         ]
+
+    def test_paths_are_treated_as_literal_pathspecs(self, tmp_path):
+        """Regression test for TICK-686: commit_worktree_changes must escape
+        paths as literal pathspecs so that files like ':(glob)**' are not
+        interpreted as wildcards sweeping in unrelated untracked files."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+            )
+
+        git("init", "-b", "main")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Test User")
+
+        (repo / "base.txt").write_text("base")
+        git("add", "base.txt")
+        git("commit", "-m", "base")
+
+        weird_file = repo / ":(glob)**"
+        weird_file.write_text("modified")
+
+        unrelated_file = repo / "unrelated.txt"
+        unrelated_file.write_text("unrelated")
+
+        result = commit_worktree_changes(repo, "TICK-686", paths=[":(glob)**"])
+
+        assert result[0] is True
+
+        committed_files = git("show", "--format=", "--name-only", "HEAD").stdout.splitlines()
+        assert ":(glob)**" in committed_files
+        assert "unrelated.txt" not in committed_files
+
+        status = git("status", "--porcelain").stdout
+        assert "?? unrelated.txt" in status
 
 
 # ---------------------------------------------------------------------------
@@ -3282,7 +3731,7 @@ class TestFailClosedOnExecutorError:
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
             patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate),
             patch("lanegate.lifecycle.cmd_fail") as mock_fail,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -3680,7 +4129,7 @@ ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","mes
             ),
             patch("lanegate.orchestrate.next_batch", side_effect=counting_next_batch),
             patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -3721,7 +4170,7 @@ ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","mes
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=False),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.lifecycle.cmd_fail") as mock_fail,
@@ -3749,7 +4198,7 @@ ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","mes
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
             patch(
-                "lanegate.orchestrate.commit_worktree_changes", return_value=True
+                "lanegate.orchestrate.commit_worktree_changes", return_value=(True, None)
             ) as mock_commit_changes,
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
@@ -3779,7 +4228,7 @@ ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","mes
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete) as mock_complete,
@@ -4310,5 +4759,3 @@ class TestWorktreeBoundaryGuard:
 
         assert meter.turns == 1
         assert meter.tokens == 5100
-
-

@@ -12,7 +12,10 @@ executor: claude             # claude | claude-subagent | claude-process | aider
 # Legacy shorthand: who reviews the code when `steps.review.driver` is not set
 # (optional — defaults to executor if omitted).
 # Set to a different executor for model review, or `human` when you want a
-# person to record each review verdict.
+# person to record each review verdict. WARNING: `executor: codex` together
+# with `reviewer: codex` resolves to combined self-review, even when different
+# per-step Codex models are configured. Use distinct same-type driver aliases
+# in `drivers:` and route `steps.implement` / `steps.review` to them instead.
 # For a batch-level human gate without changing the reviewer, run:
 #   lanegate orchestrate --human-review final
 # For per-ticket human verdicts, uncomment `reviewer: human` and run:
@@ -79,6 +82,14 @@ drivers:
     type: codex
     model: o4-mini
 
+  # Same executor type, independent review: distinct driver names keep this a
+  # split implement/review route while the shared `executors.codex.models`
+  # settings below select the model for each step.
+  codex-implement:
+    type: codex
+  codex-review:
+    type: codex
+
   # --- Fully-local, VRAM-tiered split (no cloud calls at all) ---
   #
   # On a single consumer GPU, different pipeline steps have very different
@@ -136,6 +147,17 @@ steps:
 #       driver: aider-local-implement
 #     review:
 #       driver: aider-local-review
+
+# Same-type Codex alternative: swap in for the steps: block above, not
+# alongside it. Distinct aliases are required; bare `executor: codex` and
+# `reviewer: codex` is combined self-review, regardless of per-step models.
+#   steps:
+#     implement:
+#       driver: codex-implement
+#     review:
+#       driver: codex-review
+#   # Run `lanegate route <ticket>` to confirm these resolve to distinct
+#   # implement and review drivers before relying on unattended runs.
 
 # Legacy shorthand: max tickets the orchestrator runs in parallel.
 # Effective batch = min(touch-disjoint candidates, max_parallel)
@@ -230,7 +252,11 @@ notify:
 executors:
   claude:  { max_parallel: 3, flags: ["--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"] }
   aider:   { max_parallel: 1, context_window_tokens: 32768, repo_map: true, neutralize_touches: true, flags: ["--yes-always", "--no-gitignore"] }
-  codex:   { max_parallel: 3, flags: ["--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "--ignore-rules", "--ephemeral"] }
+  codex:
+    max_parallel: 3
+    flags: ["--dangerously-bypass-approvals-and-sandbox", "--ignore-user-config", "--ignore-rules", "--ephemeral"]
+    # Shared type-level settings also apply to codex-implement/codex-review.
+    models: { implement: gpt-5.6-terra, review: gpt-5.6-sol }
   agy:     { max_parallel: 3, flags: ["--dangerously-skip-permissions", "--disable-slash-commands"] }
   ollama:  { max_parallel: 1, models: { analyze: llama3.1 } }  # text-only; see drivers: above for local coding
 

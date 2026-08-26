@@ -577,6 +577,92 @@ class TestRunReviewAgentDriverDispatch:
         assert review_kwargs["env"]["REVIEW_TOKEN"] == "review-token"
         assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
 
+    def test_review_dispatch_delegates_main_checkout_leak_check(self, tmp_path):
+        ticket = self._make_ticket()
+        cfg = {"executor": "claude-process"}
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch(
+                "lanegate.orchestrate.review._stream_subprocess",
+                return_value=(0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None),
+            ),
+            patch("lanegate.orchestrate.review._main_checkout_leak_diff", return_value="") as leak_diff,
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        before, after, passed_cfg, passed_root = leak_diff.call_args.args
+        assert before == after == ""
+        assert passed_cfg is cfg
+        assert passed_root == tmp_path
+
+    def test_review_dispatch_passes_read_only(self, tmp_path):
+        ticket = self._make_ticket()
+        cfg = {"executor": "claude-process"}
+        calls = []
+        build_cmd_calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "log"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({"verdict": "approved", "notes": "ok"}),
+                stderr="",
+            )
+
+        def spy_build_executor_cmd(*args, **kwargs):
+            build_cmd_calls.append(kwargs)
+            return _build_executor_cmd(*args, **kwargs)
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run),
+            patch("lanegate.lifecycle.cmd_review"),
+            patch(
+                "lanegate.orchestrate.review.build_executor_cmd",
+                side_effect=spy_build_executor_cmd,
+            ),
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        # The disallowedTools flag alone doesn't prove read_only=True was passed --
+        # an explicit disallowed_tools list with read_only=False produces the same
+        # flag. Assert the actual kwarg directly.
+        assert any(call.get("read_only") is True for call in build_cmd_calls)
+
+        review_cmd = next(cmd for cmd in calls if cmd[0] != "git")
+        assert "--disallowedTools" in review_cmd
+        assert review_cmd[review_cmd.index("--disallowedTools") + 1] == "Bash,Write,Edit"
+
+    def test_review_succeeds_when_sibling_status_changes_during_dispatch(self, tmp_path):
+        """TICK-688: sibling lifecycle bookkeeping must not discard a verdict."""
+        ticket = self._make_ticket()
+        cfg = {"executor": "claude-process"}
+        statuses = iter(["", " M .lanegate/tickets/TICK-999.md\n"])
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd == ["git", "status", "--porcelain", "-uno"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout=next(statuses), stderr="")
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch(
+                "lanegate.orchestrate.review._stream_subprocess",
+                return_value=(0, json.dumps({"verdict": "approved", "notes": "ok"}), "", None),
+            ),
+            patch("lanegate.orchestrate.review.subprocess.run", side_effect=fake_run),
+            patch("lanegate.lifecycle.cmd_review") as mock_cmd_review,
+        ):
+            assert run_review_agent(ticket, tmp_path, cfg=cfg) is True
+
+        assert mock_cmd_review.call_args.kwargs["verdict"] == "approved"
+
     def test_review_dispatch_uses_validated_worktree_model_but_root_policy(self, tmp_path):
         from lanegate.config import load_config, load_worktree_config
 
@@ -1000,23 +1086,26 @@ class TestRunReviewAgentDriverDispatch:
     def test_sibling_retry_rebuilds_prompt_when_crossing_tool_capable_boundary(
         self, tmp_path
     ):
-        """A rate-limited tool-capable reviewer (claude-process) failing over
-        to a non-tool-capable sibling (aider) must rebuild the review prompt
-        for the new resolved type -- otherwise the stale tool-capable "run
-        git diff yourself" prompt gets sent to aider, which has no
-        tool-dispatch loop and reproduces the TICK-644 dead-end <tool_call>
-        bug on the retry path."""
+        """A rate-limited tool-capable reviewer (codex) failing over to a
+        non-tool-capable sibling (aider) must rebuild the review prompt for
+        the new resolved type -- otherwise the stale tool-capable "run git
+        diff yourself" prompt gets sent to aider, which has no tool-dispatch
+        loop and reproduces the TICK-644 dead-end <tool_call> bug on the
+        retry path. codex specifically (not a Claude type) stays genuinely
+        tool-capable under read_only=True -- its --sandbox read-only flag
+        still permits reads, unlike Claude's disallowed_tools which blocks
+        Bash entirely."""
         ticket = self._make_ticket()
         cfg = {
             "ticket_prefix": "TICK",
             "tickets_dir": "tickets",
-            "executor": "claude-review-1",
+            "executor": "codex-review-1",
             "executors": {
-                "claude-review-1": {"type": "claude-process"},
+                "codex-review-1": {"type": "codex"},
                 "aider-review": {"type": "aider"},
             },
             "pools": {
-                "default": {"executors": ["claude-review-1", "aider-review"]}
+                "default": {"executors": ["codex-review-1", "aider-review"]}
             },
             "default_pool": "default",
         }
@@ -1029,7 +1118,7 @@ class TestRunReviewAgentDriverDispatch:
         def fake_run(cmd, **kwargs):
             if cmd[:2] == ["git", "log"]:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-            if cmd == ["claude-review-1"]:
+            if cmd == ["codex-review-1"]:
                 return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rate limit exceeded")
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=json.dumps({"verdict": "approved", "notes": "ok"}), stderr=""
@@ -1044,7 +1133,7 @@ class TestRunReviewAgentDriverDispatch:
             result = run_review_agent(ticket, tmp_path, cfg=cfg)
 
         assert result is True
-        assert [executor for executor, _ in dispatched] == ["claude-review-1", "aider-review"]
+        assert [executor for executor, _ in dispatched] == ["codex-review-1", "aider-review"]
         first_prompt = dispatched[0][1]
         second_prompt = dispatched[1][1]
         assert "Run `git diff main...HEAD`" in first_prompt
@@ -1964,7 +2053,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.orchestrate.run_review_agent") as mock_review_agent,
@@ -2016,7 +2105,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.orchestrate.run_review_agent") as mock_review_agent,
@@ -2066,7 +2155,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.orchestrate.run_review_agent") as mock_review_agent,
@@ -2125,7 +2214,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_incomplete),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
             patch("lanegate.lifecycle.cmd_review") as mock_review,
@@ -2170,7 +2259,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke_combined),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py", "other.py"}),
             patch("lanegate.lifecycle.cmd_needs_review") as mock_needs_review,
@@ -2203,7 +2292,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete) as mock_complete,
             patch("lanegate.lifecycle.cmd_review") as mock_review,
@@ -2237,7 +2326,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete) as mock_complete,
             patch("lanegate.lifecycle.cmd_review") as mock_review,
@@ -2285,7 +2374,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -2318,7 +2407,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=True),
             patch("lanegate.lifecycle.cmd_complete"),
@@ -2354,7 +2443,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -2384,7 +2473,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -2412,7 +2501,7 @@ class TestCombinedModeBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
             patch("lanegate.orchestrate.run_review_agent") as mock_review_agent,
@@ -3301,3 +3390,54 @@ class TestMinimalCfgConfigErrorPropagation:
         assert cfg["ticket_prefix"] == "TICK"
         assert cfg["tickets_dir"] == str(tickets_dir)
 
+
+from lanegate.orchestrate.review import run_review_agent
+from lanegate.ticket import REVIEW_FINDINGS_HEADER
+
+def test_circuit_breaker_recurring_findings(tmp_path, monkeypatch):
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    
+    # Body with 2 previous attempts
+    body = f"""
+{REVIEW_FINDINGS_HEADER}
+- The cache key is wrong.
+
+{REVIEW_FINDINGS_HEADER} (attempt 2)
+- The cache key is wrong.
+"""
+    
+    ticket = {
+        "id": "TICK-1",
+        "status": "in_review",
+        "_body": body,
+        "review_findings": ["The cache key is wrong."],
+        "_path": str(wt / "TICK-1.md")
+    }
+    
+    # create dummy file so `_escalate_harness_error` works
+    (wt / "TICK-1.md").write_text("dummy")
+    
+    cfg = {}
+    
+    # Mock the LLM output to return changes_requested with the same finding
+    def fake_subprocess_run(*args, **kwargs):
+        class FakeResult:
+            returncode = 0
+            stdout = '{"verdict": "changes_requested", "findings": "The cache key is wrong."}'
+            stderr = ""
+        return FakeResult()
+    
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    monkeypatch.setattr("lanegate.orchestrate.review._write_review_verdict", lambda *a, **k: None)
+    
+    escalated = {}
+    def fake_mark_needs_review(t, cfg, repo, reason=None):
+        escalated["reason"] = reason
+        t["status"] = "needs_review"
+    monkeypatch.setattr("lanegate.lifecycle._mark_needs_review", fake_mark_needs_review)
+    
+    run_review_agent(ticket, tmp_path, worktree_path=wt, cfg=cfg, pool_name="pool")
+    
+    assert "circuit breaker" in escalated.get("reason", "")
+    assert ticket["status"] == "needs_review"

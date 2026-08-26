@@ -622,11 +622,47 @@ def test_create_cross_clone_rebase_failure_raises(tmp_path):
     cfg = dict(_CFG, commit_status_changes=True)
 
     def mock_run(cmd, **kwargs):
-        if isinstance(cmd, (list, tuple)) and len(cmd) >= 3 and cmd[0] == "git" and cmd[1] == "rebase":
-            return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="rebase conflict")
+        if isinstance(cmd, (list, tuple)):
+            if len(cmd) >= 3 and cmd[0] == "git" and cmd[1] == "rebase":
+                return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="rebase conflict")
+            if len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "merge-base":
+                return _sp.CompletedProcess(cmd, returncode=1, stdout="", stderr="")
         return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     with patch("lanegate.create._has_tracking_remote", return_value=True):
         with patch("lanegate.create.subprocess.run", side_effect=mock_run):
             with pytest.raises(RuntimeError, match="Failed to rebase onto upstream tracking branch"):
                 cmd_create("Test ticket", cfg, repo)
+
+def test_create_skips_rebase_when_already_ancestor(tmp_path):
+    """When the current branch is strictly ahead of tracking branch, rebase is skipped."""
+    import shutil
+    import subprocess as _sp
+    from unittest.mock import patch
+
+    if shutil.which("git") is None:
+        pytest.skip("git is required for integration test")
+
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    _sp.run(["git", "config", "user.email", "c@example.com"], cwd=repo, check=True)
+    _sp.run(["git", "config", "user.name", "Clone User"], cwd=repo, check=True)
+
+    cfg = dict(_CFG, commit_status_changes=True)
+    rebase_calls = []
+
+    def mock_run(cmd, **kwargs):
+        if isinstance(cmd, (list, tuple)):
+            if len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "rebase":
+                rebase_calls.append(cmd)
+                return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+            if len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "merge-base":
+                return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+        return _sp.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    with patch("lanegate.create._has_tracking_remote", return_value=True):
+        with patch("lanegate.create.subprocess.run", side_effect=mock_run):
+            cmd_create("Test ticket", cfg, repo)
+
+    assert not rebase_calls

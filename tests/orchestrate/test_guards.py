@@ -68,7 +68,7 @@ class TestAcceptanceContractAuditGate:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -105,7 +105,7 @@ class TestAcceptanceContractAuditGate:
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.lifecycle.cmd_needs_review") as mock_needs_review,
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")) as mock_invoke,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -133,7 +133,7 @@ class TestAcceptanceContractAuditGate:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -601,7 +601,7 @@ class TestInjectionScanBoardClearingIntegration:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")) as mock_exec,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -749,7 +749,7 @@ class TestTrustCheckRouting:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")) as mock_exec,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -775,7 +775,7 @@ class TestTrustCheckRouting:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")) as mock_exec,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -844,7 +844,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -870,7 +870,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -900,7 +900,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -938,7 +938,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -969,7 +969,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1004,7 +1004,7 @@ class TestTouchedFilesGuard:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1061,7 +1061,7 @@ class TestTouchedFilesGuard:
             patch("lanegate.orchestrate.next_batch", side_effect=fake_next_batch),
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1115,7 +1115,7 @@ class TestTouchedFilesGuard:
             patch("lanegate.orchestrate.next_batch", side_effect=fake_next_batch),
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value=set()),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -1390,7 +1390,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1415,7 +1415,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1440,7 +1440,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py", ".env"}),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -1469,7 +1469,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1497,7 +1497,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py", ".env"}),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -1531,7 +1531,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1559,7 +1559,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1588,7 +1588,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -1614,7 +1614,7 @@ class TestBlockedFileCheckBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -2416,7 +2416,7 @@ class TestStaticAnalysisBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch(
@@ -2448,7 +2448,7 @@ class TestStaticAnalysisBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=["gitleaks: one finding"]),
@@ -2489,7 +2489,7 @@ class TestStaticAnalysisBoardClearingLoop:
             # open -> in_progress transition to exercise the status branches.
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch(
@@ -2528,7 +2528,7 @@ class TestStaticAnalysisBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=["finding1", "finding2"]),
@@ -2557,7 +2557,7 @@ class TestStaticAnalysisBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
@@ -2582,7 +2582,7 @@ class TestStaticAnalysisBoardClearingLoop:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._run_static_analysis", return_value=["gitleaks: secret"]),
@@ -2628,7 +2628,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -2654,7 +2654,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",
@@ -2689,7 +2689,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -2717,7 +2717,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -2745,7 +2745,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._committed_files", return_value={"myapp/main.py"}),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
@@ -2779,7 +2779,7 @@ class TestSecuritySensitivePathsCheck:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch(
                 "lanegate.orchestrate._committed_files",

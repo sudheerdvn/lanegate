@@ -7,12 +7,13 @@ All user-facing strings use APP_NAME so the brand is a single knob.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import textwrap
 from pathlib import Path
 
 from lanegate import APP_NAME, __version__
-from lanegate.config import find_repo_root, load_config
+from lanegate.config import ConfigError, find_repo_root, is_linked_worktree, load_config
 from lanegate.ticket import _VALID_AUTONOMY
 
 # Keep the top-level command taxonomy next to the parser registration.  A new
@@ -217,6 +218,49 @@ def _get_cfg_and_root() -> tuple[dict, Path]:
     repo_root = find_repo_root()
     cfg = load_config(repo_root)
     return cfg, repo_root
+
+
+def _require_main_checkout(repo_root: Path) -> None:
+    """Reject singleton orchestrator commands from a linked worktree.
+
+    Uses ``config.is_linked_worktree`` rather than a second, weaker probe: it
+    resolves Git through ``_trusted_git_executable()`` (PATH is only an index
+    — the resolved binary and its containing directories must be
+    ownership-verified) with every ``GIT_*`` env var stripped, since those
+    can redirect even an absolute Git executable to a different repository
+    entirely. A bare, untrusted ``git`` probe that fails open on any
+    non-zero exit (a stale ``safe.directory``/dubious-ownership refusal, a
+    poisoned ``GIT_*`` var) would let exactly the worktree this check exists
+    to block slip through.
+
+    Compares git-dir vs. git-common-dir directly rather than a path
+    containment check against the control checkout's root: containment is
+    fooled by a linked worktree nested *underneath* the control checkout
+    (e.g. a ``worktrees_dir`` configured inside the repo itself) -- such a
+    worktree's path is "under" the control root, but it is still a distinct
+    linked worktree with its own git-dir.
+    """
+    if not (repo_root / ".git").exists():
+        # Lightweight CLI test fixtures are not necessarily Git repositories.
+        # Normal repo discovery guarantees control-plane commands have this.
+        return
+    invocation_dir = Path.cwd()
+    try:
+        linked = is_linked_worktree(invocation_dir)
+    except ConfigError as exc:
+        raise SystemExit(
+            f"ERROR: cannot verify lanegate run/orchestrate is launched from the "
+            f"main checkout: {exc}"
+        ) from exc
+    if linked is None:
+        # Not a Git repository at all (mirrors the .git check above for the
+        # invocation cwd specifically) -- nothing to enforce.
+        return
+    if linked:
+        raise SystemExit(
+            "ERROR: lanegate run/orchestrate must be launched from the main checkout, "
+            "not a linked worktree."
+        )
 
 
 def _force_utf8_output() -> None:
@@ -1681,8 +1725,41 @@ def _dispatch(args) -> None:
     elif args.cmd in ("run", "orchestrate"):
         cfg, repo_root = _get_cfg_and_root()
         if args.status:
+            # Read-only; does not dispatch a second orchestrator, so the
+            # singleton-driver guard below does not apply to it.
             _cmd_orchestrate_status(repo_root, args)
         else:
+            _require_main_checkout(repo_root)
+            if (
+                sys.platform != "win32"
+                and "_LANEGATE_REEXEC" not in os.environ
+                and "PYTEST_CURRENT_TEST" not in os.environ
+            ):
+                # Re-exec'ing with a synthetic argv[0] (below) makes CPython unable to
+                # recognize the real interpreter path, so it falls back to deriving
+                # sys.executable from cwd + that synthetic string in the re-exec'd
+                # process -- e.g. "/repo/lanegate run [/repo]" instead of the real
+                # python binary. Every downstream subprocess.run([sys.executable, ...])
+                # call (pytest safeguards included) then fails with a bogus
+                # command-not-found error. Pin the real path in an env var so it can
+                # be restored once we're on the other side of the exec.
+                os.environ["_LANEGATE_REEXEC"] = "1"
+                os.environ["_LANEGATE_REAL_EXECUTABLE"] = sys.executable
+                os.execv(
+                    sys.executable,
+                    [f"lanegate {args.cmd} [{repo_root}]"] + sys.argv,
+                )
+            elif "_LANEGATE_REAL_EXECUTABLE" in os.environ:
+                # Consume and drop both vars here, on the far side of the
+                # exec: leaving them in os.environ would have this process's
+                # own descendants (e.g. resume-watch's later `lanegate run`
+                # retry, spawned with this environment) inherit
+                # _LANEGATE_REEXEC and skip their own re-exec/title-setting
+                # entirely, then clobber their own correct sys.executable
+                # with this process's now-stale pinned value.
+                sys.executable = os.environ.pop("_LANEGATE_REAL_EXECUTABLE")
+                os.environ.pop("_LANEGATE_REEXEC", None)
+
             from lanegate.orchestrate import cmd_orchestrate
 
             cmd_orchestrate(
@@ -1787,7 +1864,11 @@ def _cmd_orchestrator_lock(args, repo_root: Path) -> None:
     elif args.orch_cmd == "status":
         st = orchestrator_lock_status(repo_root)
         if st["held"]:
-            print(f"Orchestrator lock HELD by PID {st['pid']} (alive).")
+            from lanegate.pidutil import pid_cwd
+
+            cwd = pid_cwd(st["pid"])
+            cwd_text = f" (cwd: {cwd})" if cwd else ""
+            print(f"Orchestrator lock HELD by PID {st['pid']} (alive){cwd_text}.")
         elif st["pid"] is not None:
             print(f"Orchestrator lock is STALE (PID {st['pid']} not running) — reclaimable.")
         else:

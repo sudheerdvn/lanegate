@@ -186,23 +186,30 @@ def cmd_create(
                     check=False,
                     capture_output=True,
                 )
-                rebase_res = subprocess.run(
-                    ["git", "rebase", "--autostash", "--quiet", "@{u}"],
+                merge_base_res = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", "@{u}", "HEAD"],
                     cwd=repo_root,
                     check=False,
-                    capture_output=True,
-                    text=True,
                 )
-                if rebase_res.returncode != 0:
-                    subprocess.run(
-                        ["git", "rebase", "--abort"],
+                if merge_base_res.returncode != 0:
+                    rebase_res = subprocess.run(
+                        ["git", "rebase", "--autostash", "--quiet", "@{u}"],
                         cwd=repo_root,
                         check=False,
                         capture_output=True,
+                        text=True,
+                        encoding="utf-8",
                     )
-                    raise RuntimeError(
-                        f"Failed to rebase onto upstream tracking branch '@{{u}}': {rebase_res.stderr or rebase_res.stdout}"
-                    )
+                    if rebase_res.returncode != 0:
+                        subprocess.run(
+                            ["git", "rebase", "--abort"],
+                            cwd=repo_root,
+                            check=False,
+                            capture_output=True,
+                        )
+                        raise RuntimeError(
+                            f"Failed to rebase onto upstream tracking branch '@{{u}}': {rebase_res.stderr or rebase_res.stdout}"
+                        )
 
             ticket_id = _next_id(tickets_dir, prefix)
             path = tickets_dir / f"{ticket_id}.md"

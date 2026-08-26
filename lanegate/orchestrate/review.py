@@ -27,6 +27,7 @@ from lanegate.config import (
     validate_model_for_executor,
 )
 from lanegate.executor import (
+    _CLAUDE_SUBPROCESS_TYPES,
     build_executor_cmd,
     executor_types_with,
     get_executor_config,
@@ -43,6 +44,7 @@ from .pool import (
     _build_env,
     _cfg_with_driver_command_overrides,
     _get_step_budget_cap,
+    _main_checkout_leak_diff,
     _unpack_stream_result,
     capture_review_step_run,
     expand_driver,
@@ -202,6 +204,36 @@ def _extract_review_verdict_json(output: str) -> str | None:
 
     candidates = verdict_objects(output)
     return candidates[-1] if candidates else None
+
+
+def _complete_review_verdict_json(output: str) -> str | None:
+    """Return a verdict object only when all required review fields are present.
+
+    An executor can report an error after the reviewer already emitted its
+    verdict (for example, when a sandbox rejects a subsequent durable-notes
+    write). Recovery is deliberately limited to a complete, valid review
+    object so an error envelope or partial model output cannot be mistaken
+    for a completed review.
+    """
+    raw = _extract_review_verdict_json(output)
+    if raw is None:
+        return None
+    try:
+        verdict = json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(verdict, dict):
+        return None
+    v = verdict.get("verdict")
+    if v not in {"approved", "changes_requested", "APPROVE", "REJECT"}:
+        return None
+    summary = verdict.get("summary", verdict.get("notes"))
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    findings = verdict.get("findings")
+    if findings is not None and not isinstance(findings, (str, list)):
+        return None
+    return raw
 
 
 def spawn_watch_daemon(repo_root: Path) -> None:
@@ -1054,6 +1086,7 @@ def run_review_agent(
         cfg=cfg,
         reviewer_type=resolved_review_type,
         diff=diff,
+        read_only=True,
     )
     # Type the prompt above was shaped for (TICK-644's tool-capable vs.
     # non-tool-capable instruction text). A sibling rate-limit failover below
@@ -1116,6 +1149,7 @@ def run_review_agent(
                     cfg=cfg,
                     reviewer_type=resolved_review_type,
                     diff=diff,
+                    read_only=True,
                 )
                 prompt_path = write_prompt_file_best_effort(worktree_path, tid, "review", prompt)
                 prompt_built_for_type = resolved_review_type
@@ -1247,6 +1281,12 @@ def run_review_agent(
                 analyze_session_id=resume_session_id,
                 use_stdin=stdin_capable,
                 max_turns=step_max_turns,
+                disallowed_tools=(
+                    ["Bash", "Write", "Edit"]
+                    if resolved_review_type in _CLAUDE_SUBPROCESS_TYPES
+                    else None
+                ),
+                read_only=True,
                 step="review",
             )
             review_executor_env = resolve_executor_env(
@@ -1286,6 +1326,13 @@ def run_review_agent(
                 meter=meter,
                 worktree_path=worktree_path,
             )
+            main_checkout_status_before = subprocess.run(
+                ["git", "status", "--porcelain", "-uno"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
             rc, captured_stdout, captured_stderr, kill_reason = _unpack_stream_result(_stream_subprocess(
                 review_cmd,
                 cwd=str(worktree_path),
@@ -1295,6 +1342,26 @@ def run_review_agent(
                 on_line=handle_line,
                 **stream_kwargs,
             ))
+            if kill_reason != "worktree_violation":
+                main_checkout_status_after = subprocess.run(
+                    ["git", "status", "--porcelain", "-uno"],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout
+                leaked_diff = _main_checkout_leak_diff(
+                    main_checkout_status_before, main_checkout_status_after, cfg, repo_root
+                )
+                if leaked_diff:
+                    rc = 1
+                    kill_reason = "main_checkout_violation"
+                    msg = (
+                        f"[review] {tid}: worktree isolation leak detected: tracked files in "
+                        f"the main checkout changed during review:\n{leaked_diff}\n"
+                    )
+                    captured_stderr += msg
+                    print(msg, end="", file=sys.stderr)
             bundle_path = capture_review_step_run(
                 repo_root,
                 worktree_path,
@@ -1341,6 +1408,22 @@ def run_review_agent(
             if kill_reason == "ceiling":
                 review = _partial_review_from_events(captured_stdout, resolved_review_type)
                 break
+            if (
+                resolved_review_type == "agy"
+                and parsed is not None
+                and parsed.get("is_error") is True
+            ):
+                # agy can fail a later sandboxed tool call after emitting a
+                # complete verdict in its response field. Preserve that review
+                # when (and only when) the response is a complete verdict.
+                raw_for_parse = _complete_review_verdict_json(
+                    (parsed.get("result_text") or "").strip()
+                )
+                if raw_for_parse is not None:
+                    review = parse_review_result(raw_for_parse)
+                    if review.notes.startswith("Review parse error:"):
+                        review.harness_error = True
+                    break
             if rc == 0:
                 # An executor can exit 0 while its own envelope reports the run
                 # failed -- the harness died after the model emitted verdict-shaped
@@ -1349,34 +1432,28 @@ def run_review_agent(
                 # never validly completed. That is fail-open in a pipeline that is
                 # fail-closed on every other path, so treat the envelope's own
                 # failure report as authoritative over the exit code.
-                #
-                # is_error is tri-state: True means the run reported failure, False
-                # means it reported success, and None means this parser cannot tell
-                # (no status field in the envelope). Only an explicit True fails the
-                # review -- treating None as failure would fail-close every review
-                # from an executor that simply does not report status.
                 if parsed is not None and parsed.get("is_error") is True:
                     review = _make_error_review(
-                        "Executor reported the run failed despite exit code 0"
+                        "Executor reported the run failed without a complete JSON verdict"
+                    )
+                    break
+                output = (
+                    parsed["result_text"].strip()
+                    if parsed is not None
+                    else captured_stdout.strip()
+                )
+                # Review prose can quote code containing nested braces. Extract
+                # the final structured verdict with JSON's own decoder rather
+                # than treating braces as a regular-language delimiter.
+                raw_for_parse = _extract_review_verdict_json(output)
+                if raw_for_parse is None:
+                    review = _make_error_review(
+                        "Review completed but no JSON verdict could be extracted"
                     )
                 else:
-                    output = (
-                        parsed["result_text"].strip()
-                        if parsed is not None
-                        else captured_stdout.strip()
-                    )
-                    # Review prose can quote code containing nested braces. Extract
-                    # the final structured verdict with JSON's own decoder rather
-                    # than treating braces as a regular-language delimiter.
-                    raw_for_parse = _extract_review_verdict_json(output)
-                    if raw_for_parse is None:
-                        review = _make_error_review(
-                            "Review completed but no JSON verdict could be extracted"
-                        )
-                    else:
-                        review = parse_review_result(raw_for_parse)
-                        if review.notes.startswith("Review parse error:"):
-                            review.harness_error = True
+                    review = parse_review_result(raw_for_parse)
+                    if review.notes.startswith("Review parse error:"):
+                        review.harness_error = True
                 break
 
             if (
@@ -1490,8 +1567,7 @@ def run_review_agent(
 
     contract_audit = ticket.get("acceptance_contract_audit") or {}
     if (
-        review.verdict == "approved"
-        and isinstance(contract_audit, dict)
+        isinstance(contract_audit, dict)
         and contract_audit.get("ok") is False
         and resolve_acceptance_contract_mode(_cfg_for_review) == "blocker"
     ):
@@ -1500,14 +1576,49 @@ def run_review_agent(
         if contract_findings:
             from lanegate.reviewer import ReviewResult
 
+            notes = review.notes
+            if review.verdict == "approved":
+                notes = f"{notes} (overridden: acceptance-contract audit failed)" if notes else "acceptance-contract audit failed"
+            else:
+                notes = f"{notes} (also: acceptance-contract audit failed)" if notes else "acceptance-contract audit failed"
+
             review = ReviewResult(
                 verdict="changes_requested",
-                notes=(
-                    f"{review.notes} (overridden: acceptance-contract audit failed)"
-                    if review.notes
-                    else "acceptance-contract audit failed"
-                ),
+                notes=notes,
                 findings="\n".join(f for f in (review.findings, contract_findings) if f),
+            )
+            
+    if review.verdict == "changes_requested" and review.findings:
+        from lanegate.ticket import review_findings_sections
+        new_findings = [f.strip() for f in review.findings.split("\n") if f.strip()]
+        sections = review_findings_sections(ticket.get("_body", ""))
+        
+        # We need N=3 consecutive rounds (the current one + 2 past rounds)
+        n_required = 3
+        
+        if len(sections) >= n_required - 1:
+            for nf in new_findings:
+                consecutive = 1
+                for i in range(1, min(n_required, len(sections) + 1)):
+                    if nf in sections[-i][1]:
+                        consecutive += 1
+                    else:
+                        break
+                if consecutive >= n_required:
+                    # Trip the circuit breaker: escalate to human review by simulating a harness error
+                    review.harness_error = True
+                    review.notes = f"{review.notes} (circuit breaker: identical finding over {n_required} attempts)"
+                    break
+        
+        if review.harness_error:
+            return _escalate_harness_error(
+                ticket,
+                review,
+                repo_root,
+                review_driver_name,
+                review_model,
+                review_independence,
+                bundle_path=bundle_path,
             )
 
     # One write covering every substantive outcome — approve,

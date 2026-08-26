@@ -462,6 +462,13 @@ def test_orchestrator_force_overrides_live_holder(tmp_path):
     assert pid == os.getpid()
 
 
+def test_orchestrator_force_and_before_claim_are_mutually_exclusive(tmp_path):
+    """Combining them used to silently make force a no-op against a live
+    holder instead of doing what either knob promises on its own."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        acquire_orchestrator_lock(tmp_path, force=True, before_claim=lambda: None)
+
+
 @_unix_only
 def test_orchestrator_reacquire_same_pid_ok(tmp_path):
     """The same holder re-acquiring is idempotent, not a conflict."""

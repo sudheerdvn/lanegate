@@ -53,6 +53,20 @@ def test_default_prompt_root_is_fixture_root(tmp_path):
     assert "FIXTURE IMPLEMENT TEMPLATE" in prompt
 
 
+def test_prompts_forbid_orchestrator_commands():
+    from lanegate.reviewer import build_fix_prompt
+
+    ticket = {"id": "TICK-LOCK", "title": "Lock", "touches": [], "close_criteria": "", "_body": ""}
+    prompts = [
+        build_implement_prompt(ticket),
+        build_review_prompt(ticket),
+        build_fix_prompt(ticket, diff="", findings=""),
+    ]
+
+    for prompt in prompts:
+        assert "Do not invoke `lanegate run` or `lanegate orchestrate`" in prompt
+
+
 class TestTruncateToBudget:
     def test_returns_text_unchanged_when_under_budget(self):
         assert truncate_to_budget("small text", 100) == ("small text", False)

@@ -1024,6 +1024,41 @@ def cmd_route(
 
     if updated:
         validation_errors = validate_ticket(updated_ticket, cfg)
+        if executor is not None and not validation_errors:
+            # A bare executor pin can make the global implementation model
+            # apply to a different executor family.  Resolve and validate it
+            # now, before persisting a route that would fail at dispatch.
+            from lanegate.config import resolve_model
+            from lanegate.orchestrate.pool import (
+                _ticket_for_model_resolution,
+                expand_driver,
+            )
+
+            implementer = resolve_executor_route(cfg, updated_ticket)["implement"]
+            route_driver_cfg = expand_driver(implementer, cfg)
+            resolved_executor = route_driver_cfg.get("type", implementer)
+            executor_cfg = get_executor_config(resolved_executor, cfg)
+            executor_type = executor_cfg.get("type", resolved_executor)
+            effective_cfg = (
+                dict(cfg, executor=resolved_executor)
+                if resolved_executor != cfg.get("executor")
+                else cfg
+            )
+            model_ticket = _ticket_for_model_resolution(updated_ticket, executor_type)
+            effective_model = route_driver_cfg.get("model") or resolve_model(
+                effective_cfg, "implement", ticket=model_ticket
+            )
+            if effective_model is not None:
+                try:
+                    validate_model_for_executor(
+                        str(effective_model),
+                        str(executor_type),
+                        "implementation routing",
+                        provider=executor_cfg.get("provider")
+                        or route_driver_cfg.get("provider"),
+                    )
+                except ConfigError as exc:
+                    validation_errors.append(str(exc))
         effective_review_model = updated_ticket.get("review_model_pin")
         if (
             (model is not None or reviewer is not None or executor is not None)
@@ -1055,6 +1090,7 @@ def cmd_route(
             # validates again immediately before any eventual launch.
             if resolved_reviewer is None:
                 resolved_reviewer = resolve_reviewer(updated_ticket, cfg)
+            assert resolved_reviewer is not None
             drivers = cfg.get("drivers") or {}
             driver_cfg = (
                 drivers.get(resolved_reviewer, {})
@@ -1063,13 +1099,17 @@ def cmd_route(
             )
             if isinstance(driver_cfg, dict) and driver_cfg:
                 reviewer_type = driver_cfg.get("type", resolved_reviewer)
+                reviewer_executor_cfg = get_executor_config(str(reviewer_type), cfg)
             else:
-                reviewer_type = get_executor_config(resolved_reviewer, cfg).get(
-                    "type", resolved_reviewer
-                )
+                reviewer_executor_cfg = get_executor_config(resolved_reviewer, cfg)
+                reviewer_type = reviewer_executor_cfg.get("type", resolved_reviewer)
             try:
                 validate_model_for_executor(
-                    str(effective_review_model), str(reviewer_type), "review routing"
+                    str(effective_review_model),
+                    str(reviewer_type),
+                    "review routing",
+                    provider=reviewer_executor_cfg.get("provider")
+                    or driver_cfg.get("provider"),
                 )
             except ConfigError as exc:
                 validation_errors.append(str(exc))

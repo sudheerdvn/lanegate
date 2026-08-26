@@ -84,6 +84,34 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def pid_cwd(pid: int) -> str | None:
+    """Return a live process's current working directory when the OS exposes it."""
+    if pid <= 0 or sys.platform == "win32":
+        return None
+    if sys.platform == "darwin":
+        # No /proc on macOS -- lsof is the standard way to recover an
+        # arbitrary PID's cwd (Fn output: an "n"-prefixed line holds the path).
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+        return None
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
 def terminate_pid(pid: int) -> bool:
     """Send a graceful termination request to a process.
 

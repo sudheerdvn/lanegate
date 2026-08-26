@@ -16,12 +16,14 @@ import pytest
 from lanegate.analyze import (
     _HAS_TREE_SITTER,
     _TS_LANGUAGE_MAP,
+    _already_resolved_reason_matches_worktree,
     _ast_symbol_hits,
     _build_ast_index,
     _build_candidate_skeletons,
     _build_file_skeleton,
     _build_prompt,
     _call_model,
+    _close_criteria_drifted,
     _extract_acceptance_checklist,
     _import_graph_expand,
     _index_non_py_file,
@@ -825,6 +827,31 @@ def test_acceptance_contract_audit_ignores_own_prior_needs_review_reason(repo):
     assert audit.findings == []
 
 
+def test_audit_ignores_review_findings(repo):
+    """Generated review history must not become a new contract source."""
+    ticket = {
+        "id": "TICK-674",
+        "title": "Extract voice routing helper",
+        "_body": (
+            "## Review Findings\n\n"
+            "- `/api/process` must be included in the close criteria.\n\n"
+            "## Dismissal Rationale\n\n"
+            "- `/api/tts` must be included in the close criteria.\n\n"
+            "## Acceptance Contract Audit\n\n"
+            "- `/api/audit` must be included in the close criteria.\n\n"
+            "## Background\n\nExtract the routing helper.\n"
+        ),
+        "close_criteria": "Extract the routing helper.",
+    }
+
+    audit = audit_acceptance_contract(ticket, repo)
+
+    assert audit.ok is True
+    assert audit.findings == []
+    assert audit.checked_items == []
+    assert audit.omitted_items == []
+
+
 def test_acceptance_contract_audit_ignores_own_stored_audit_section(repo):
     """Regression (TICK-481): the '## Acceptance Contract Audit' section that
     lanegate appends to ticket bodies must not be re-scanned as contract
@@ -1044,7 +1071,7 @@ def test_analyze_already_resolved_flags_needs_review(repo):
     response = json.dumps(
         {
             "already_resolved": True,
-            "already_resolved_reason": "cmd_foo already exists at lanegate/foo.py:12 and does this.",
+            "already_resolved_reason": "The feature is already present in the current implementation.",
         }
     )
     with pytest.raises(SystemExit) as exc:
@@ -1054,7 +1081,103 @@ def test_analyze_already_resolved_flags_needs_review(repo):
     assert t["status"] == "needs_review"
     assert t["touches"] == []
     assert "## Needs Review Reason" in t["_body"]
-    assert "lanegate/foo.py:12" in t["_body"]
+    assert "already present" in t["_body"]
+
+
+def test_already_resolved_hallucination_fallback(repo, capsys):
+    """A false cited resolved claim is retried as ordinary analysis, not persisted."""
+    _make_draft(repo / "tickets")
+    source = repo / "lanegate"
+    source.mkdir()
+    (source / "foo.py").write_text("def actual_implementation():\n    return True\n")
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "already_resolved": True,
+                    "already_resolved_reason": (
+                        "lanegate/foo.py:1 contains `def missing_implementation()`."
+                    ),
+                }
+            ),
+            _GOOD_RESPONSE,
+        ]
+    )
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: next(responses))
+
+    ticket = parse_ticket(repo / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "open"
+    assert ticket["touches"] == ["lanegate/foo.py", "tests/test_foo.py"]
+    assert "Needs Review Reason" not in ticket["_body"]
+    assert "rejected already_resolved verdict" in capsys.readouterr().err
+
+
+def test_already_resolved_fallback_rejects_second_hallucination(repo, capsys):
+    """The fallback response cannot bypass worktree citation validation."""
+    _make_draft(repo / "tickets")
+    (repo / "Makefile").write_text("test:\n\tpytest -q\n")
+    responses = iter(
+        [
+            json.dumps(
+                {
+                    "already_resolved": True,
+                    "already_resolved_reason": "Makefile:1 contains `release: ship`.",
+                }
+            ),
+            json.dumps(
+                {
+                    "already_resolved": True,
+                    "already_resolved_reason": "Makefile:10 contains `deployment target`.",
+                }
+            ),
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: next(responses))
+
+    assert exc.value.code == 1
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "draft"
+    assert "fallback returned an invalid already_resolved verdict" in capsys.readouterr().err
+
+
+def test_already_resolved_validation_ignores_backticked_labels(repo):
+    """Backticked filenames and concepts are labels, not literal code claims."""
+    source = repo / "lanegate"
+    source.mkdir()
+    (source / "foo.py").write_text("def implemented():\n    return True\n")
+
+    assert _already_resolved_reason_matches_worktree(
+        "`lanegate/foo.py` implements `ticket routing` at lanegate/foo.py:1-2.", repo
+    ) == (True, None)
+
+
+def test_already_resolved_validation_ignores_conversational_colon_numbers(repo):
+    assert _already_resolved_reason_matches_worktree(
+        "The implementation handles Error: 404 and retries Note: 10.", repo
+    ) == (True, None)
+
+
+def test_already_resolved_validation_ignores_backticked_file_citation_as_snippet(repo):
+    source = repo / "lanegate"
+    source.mkdir()
+    (source / "foo.py").write_text("def implemented():\n    return True\n")
+
+    assert _already_resolved_reason_matches_worktree(
+        "The implementation is present at `lanegate/foo.py:1`.", repo
+    ) == (True, None)
+
+
+def test_already_resolved_validation_checks_root_file_citations(repo):
+    (repo / "Makefile").write_text("test:\n\tpytest -q\n")
+
+    verified, mismatch = _already_resolved_reason_matches_worktree(
+        "Makefile:10 contains `release: ship`.", repo
+    )
+
+    assert not verified
+    assert "is not in the worktree" in mismatch
 
 
 def test_analyze_already_resolved_without_reason_errors(repo):
@@ -1460,6 +1583,44 @@ def test_analyze_retries_rate_limited_pool_instance_on_healthy_sibling(repo):
         cmd_analyze("TICK-001", cfg, repo)
 
     assert calls == ["claude-1", "claude-2"]
+
+
+def test_analyze_fallback_retries_rate_limited_pool_instance(repo):
+    """The normal-analysis fallback uses the same healthy-sibling failover."""
+    _make_draft(repo / "tickets")
+    source = repo / "lanegate"
+    source.mkdir()
+    (source / "foo.py").write_text("def actual():\n    return True\n")
+    cfg = dict(
+        _CFG,
+        executor="claude-1",
+        executors={
+            "claude-1": {"type": "claude-process"},
+            "claude-2": {"type": "claude-process"},
+        },
+        pools={"default": {"executors": ["claude-1", "claude-2"], "strategy": "round-robin"}},
+        default_pool="default",
+    )
+    calls: list[str] = []
+
+    def fake_call_model(prompt, **kwargs):
+        calls.append(kwargs["executor"])
+        if len(calls) == 1:
+            return json.dumps(
+                {
+                    "already_resolved": True,
+                    "already_resolved_reason": "lanegate/foo.py:1 contains `def missing()`.",
+                }
+            ), None
+        if kwargs["executor"] == "claude-1":
+            raise RuntimeError("claude-1 failed (exit 1): rate limit exceeded")
+        return _GOOD_RESPONSE, None
+
+    with patch("lanegate.analyze._call_model", side_effect=fake_call_model):
+        cmd_analyze("TICK-001", cfg, repo)
+
+    assert calls == ["claude-1", "claude-1", "claude-2"]
+    assert parse_ticket(repo / "tickets" / "TICK-001.md")["status"] == "open"
 
 
 def test_analyze_cools_down_executor_after_consecutive_non_rate_limit_failures(repo):
@@ -3626,3 +3787,216 @@ def test_analyze_prompt_discloses_active_control_plane_tickets_and_proposed_touc
     assert "Active control-plane tickets" in prompt
     assert "TICK-002 (open): src/lifecycle.ext" in prompt
     assert "every acceptance_matrix list must be non-empty" in prompt
+
+
+# --- close_criteria drift detection ---
+
+
+def test_close_criteria_drifted_helper():
+    """Unit-tests for _close_criteria_drifted covering the key cases."""
+    # Identical strings → no drift
+    assert not _close_criteria_drifted("foo passes.", "foo passes.")
+
+    # Whitespace/case only differ → not drift (normalised equal)
+    assert not _close_criteria_drifted("foo  Passes.", "foo passes.")
+    assert not _close_criteria_drifted("  foo passes. ", "foo passes.")
+
+    # Genuinely reworded → drift detected
+    assert _close_criteria_drifted(
+        "test_analyze_restores_close_criteria_on_drift passes.",
+        "the drift restoration test passes and the wording is correct.",
+    )
+
+    # Empty original → gracefully not drifted (no prior criteria to restore)
+    assert not _close_criteria_drifted("", "some proposed criteria")
+
+    # Empty original AND empty proposed → no prior criteria, nothing to restore
+    assert not _close_criteria_drifted("", "")
+
+    # Empty proposed with non-empty original → model omitted a pre-existing
+    # criteria; this IS drift so the guard can restore the original wording.
+    assert _close_criteria_drifted("original criteria", "")
+
+    # --- list-typed original (YAML list close_criteria) ---
+    # List original identical to proposed string → no drift
+    assert not _close_criteria_drifted(["item 1"], "item 1")
+
+    # List original different from proposed string → drift detected; must not
+    # raise AttributeError ('list' object has no attribute 'strip').
+    assert _close_criteria_drifted(["item 1", "item 2"], "completely different wording")
+
+    # Empty list original → no prior criteria, nothing to restore
+    assert not _close_criteria_drifted([], "some proposed criteria")
+
+    # Non-empty list original, empty proposed → model omitted; this IS drift
+    assert _close_criteria_drifted(["item 1"], "")
+
+
+def test_analyze_restores_close_criteria_on_drift(repo, capsys, monkeypatch):
+    """When the model rewrites close_criteria, _cmd_analyze_core restores the original.
+
+    This is the exact regression test named in the TICK-655 acceptance matrix.
+    """
+    original_criteria = (
+        "tests/test_analyze.py::test_analyze_restores_close_criteria_on_drift passes, "
+        "proving that when the model's response rewords the close_criteria in "
+        "_cmd_analyze_core, the original wording is auto-restored before saving the ticket."
+    )
+    # Write a draft with an explicit original close_criteria so the drift guard
+    # has something to compare against.
+    ticket_path = repo / "tickets" / "TICK-001.md"
+    fm = (
+        f"id: TICK-001\ntitle: Add foo command\nstatus: draft\npriority: 3\n"
+        f"touches: []\nclose_criteria: |\n  {original_criteria}\n"
+    )
+    ticket_path.write_text(f"---\n{fm}---\n## Background\nWe need a foo command.\n")
+
+    # Model returns a reworded close_criteria (complete content change, not whitespace).
+    reworded_criteria = (
+        "The implementation is correct and all tests pass with the proper wording restored."
+    )
+    reworded_response = json.dumps({
+        "touches": ["lanegate/foo.py", "tests/test_foo.py"],
+        "close_criteria": reworded_criteria,
+        "depends_on": [],
+    })
+
+    inference_inputs = []
+
+    def inferred_from(text, _repo_root):
+        inference_inputs.append(text)
+        return ["tests/test_analyze.py"]
+
+    def companions_from(text, _repo_root, _cfg):
+        inference_inputs.append(text)
+        return ["README.md"]
+
+    monkeypatch.setattr("lanegate.analyze.infer_touches_from_criteria", inferred_from)
+    monkeypatch.setattr("lanegate.analyze.companion_docs_from_criteria", companions_from)
+
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: reworded_response)
+
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    # Original must be restored, not the model's reworded version
+    assert t["close_criteria"].strip() == original_criteria.strip()
+    assert reworded_criteria not in t["close_criteria"]
+    assert "tests/test_analyze.py" in t["touches"]
+    assert "README.md" in t["touches"]
+    assert len(inference_inputs) == 2
+    assert all(original_criteria in text for text in inference_inputs)
+    assert all(reworded_criteria not in text for text in inference_inputs)
+
+    # A warning must have been emitted (to stderr)
+    captured = capsys.readouterr()
+    assert "rewrote close_criteria" in captured.err
+
+
+
+def test_analyze_restores_close_criteria_when_model_returns_empty(repo, capsys):
+    """When the model returns an empty close_criteria for a ticket that has one,
+    the drift guard must restore the original instead of hard-failing.
+
+    This covers the sibling path to test_analyze_restores_close_criteria_on_drift:
+    model omission (empty string) is also drift and must be handled gracefully.
+    """
+    original_criteria = (
+        "tests/test_analyze.py::test_analyze_restores_close_criteria_on_drift passes, "
+        "proving that when the model's response rewords the close_criteria in "
+        "_cmd_analyze_core, the original wording is auto-restored before saving the ticket."
+    )
+    ticket_path = repo / "tickets" / "TICK-001.md"
+    fm = (
+        f"id: TICK-001\ntitle: Add foo command\nstatus: draft\npriority: 3\n"
+        f"touches: []\nclose_criteria: |\n  {original_criteria}\n"
+    )
+    ticket_path.write_text(f"---\n{fm}---\n## Background\nWe need a foo command.\n")
+
+    # Model returns an empty close_criteria — simulates a model that dropped it entirely.
+    empty_response = json.dumps({
+        "touches": ["lanegate/foo.py", "tests/test_foo.py"],
+        "close_criteria": "",
+        "depends_on": [],
+    })
+
+    # Must not raise SystemExit — the drift guard restores the original.
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: empty_response)
+
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    # Original must be restored, not an empty string
+    assert t["close_criteria"].strip() == original_criteria.strip()
+
+    # A warning about the restore must have been emitted
+    captured = capsys.readouterr()
+    assert "rewrote close_criteria" in captured.err
+
+
+def test_analyze_does_not_crash_with_list_close_criteria(repo, capsys):
+    """cmd_analyze must not crash with AttributeError when the ticket stores
+    close_criteria as a YAML list (e.g. ``- item 1``).
+
+    Regression for: 'list' object has no attribute 'strip' in _close_criteria_drifted.
+    """
+    ticket_path = repo / "tickets" / "TICK-001.md"
+    # Write a ticket with a YAML-list close_criteria
+    ticket_path.write_text(
+        "---\n"
+        "id: TICK-001\n"
+        "title: Add foo command\n"
+        "status: draft\n"
+        "priority: 3\n"
+        "touches: []\n"
+        "close_criteria:\n"
+        "  - item 1 passes\n"
+        "  - item 2 passes\n"
+        "---\n"
+        "## Background\n"
+        "We need a foo command.\n"
+    )
+
+    # Model returns a reworded single-string criteria — should trigger drift guard.
+    reworded_response = json.dumps({
+        "touches": ["lanegate/foo.py", "tests/test_foo.py"],
+        "close_criteria": "completely different wording that is not the original",
+        "depends_on": [],
+    })
+
+    # Must not raise AttributeError; drift guard must restore the original list.
+    cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: reworded_response)
+
+    t = parse_ticket(repo / "tickets" / "TICK-001.md")
+    # Original list must be preserved (drift guard restored it)
+    original = t["close_criteria"]
+    assert isinstance(original, list), f"Expected list, got {type(original)}: {original!r}"
+    assert "item 1 passes" in original[0]
+
+    # Warning about restore must be present
+    captured = capsys.readouterr()
+    assert "rewrote close_criteria" in captured.err
+
+
+def test_analyze_restores_close_criteria_on_already_resolved(repo, capsys):
+    """When the model returns already_resolved=true with a reworded close_criteria,
+    the drift guard must still detect drift and emit a warning before exiting.
+    """
+    original_criteria = "Original criteria wording that must be preserved."
+    ticket_path = repo / "tickets" / "TICK-001.md"
+    ticket_path.write_text(
+        f"---\nid: TICK-001\ntitle: Add foo\nstatus: draft\npriority: 3\ntouches: []\n"
+        f"close_criteria: |\n  {original_criteria}\n---\n## Background\n"
+    )
+
+    reworded_response = json.dumps({
+        "already_resolved": True,
+        "already_resolved_reason": "Feature is already present in master.",
+        "close_criteria": "Reworded criteria by model.",
+        "touches": ["lanegate/foo.py"],
+    })
+
+    # Running analyze should exit 0 via already_resolved path and emit the drift warning
+    try:
+        cmd_analyze("TICK-001", _CFG, repo, model_fn=lambda _prompt: reworded_response)
+    except SystemExit as e:
+        assert e.code == 0
+
+    captured = capsys.readouterr()
+    assert "rewrote close_criteria" in captured.err

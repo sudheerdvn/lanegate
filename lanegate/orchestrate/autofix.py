@@ -29,7 +29,7 @@ from lanegate.executor import (
     reject_ollama_for_code_step,
     resolve_executor_env,
 )
-from lanegate.ticket import latest_review_findings, load_all_tickets, write_ticket
+from lanegate.ticket import latest_review_findings, load_all_tickets, parse_ticket, write_ticket
 
 from .audit import _write_review_verdict
 from .pool import (
@@ -249,8 +249,8 @@ def run_fix_agent(
         print(f"WARNING: fix agent exited {exit_code} for {tid}", file=sys.stderr)
         raise FixFailedError(f"fix agent exited {exit_code} for {tid}")
 
-    commit_worktree_changes(
-        worktree_path, tid, message=f"fix: address review findings for {tid}"
+    _, _ = commit_worktree_changes(
+        worktree_path, tid, message=f"fix: address review findings for {tid}", ticket=ticket
     )
 
     head_after = _git_head_sha(worktree_path)
@@ -657,6 +657,7 @@ def run_rebase_fix_agent(
 
     try:
         step = 0
+        resolved_conflict_files: set[str] = set()
         while step < max_steps:
             step += 1
             conflict_files = _conflicted_files(worktree_path)
@@ -664,8 +665,12 @@ def run_rebase_fix_agent(
                 continued, continue_detail = _continue_rebase(worktree_path, [])
                 if continued:
                     record_human_merge_hold()
-                    commit_worktree_changes(
-                        worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                    _, _ = commit_worktree_changes(
+                        worktree_path,
+                        tid,
+                        message=f"fix: resolve rebase conflict markers for {tid}",
+                        ticket=ticket,
+                        paths=sorted(resolved_conflict_files),
                     )
                     return finish_recovery(True)
                 _abort_rebase(worktree_path)
@@ -691,6 +696,7 @@ def run_rebase_fix_agent(
                 _abort_rebase(worktree_path)
                 return finish_recovery(False)
             seen_snapshots.add(snapshot)
+            resolved_conflict_files.update(conflict_files)
 
             metadata_conflict_files = [
                 path for path in conflict_files
@@ -739,8 +745,12 @@ def run_rebase_fix_agent(
                 continued, continue_detail = _continue_rebase(worktree_path, conflict_files)
                 if continued:
                     record_human_merge_hold()
-                    commit_worktree_changes(
-                        worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                    _, _ = commit_worktree_changes(
+                        worktree_path,
+                        tid,
+                        message=f"fix: resolve rebase conflict markers for {tid}",
+                        ticket=ticket,
+                        paths=sorted(resolved_conflict_files),
                     )
                     return finish_recovery(True)
                 continue
@@ -753,8 +763,25 @@ def run_rebase_fix_agent(
                 "Instructions:\n"
                 "1. Inspect the conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`) in the conflicted files.\n"
                 "2. Edit the files to resolve the conflict markers cleanly, combining the changes correctly.\n"
-                "3. Run project tests to confirm the resolution passes tests and is syntactically valid.\n"
-                "4. Do NOT run `git rebase --continue` or `git add` yourself; save the resolved files in place."
+                "3. You MUST completely remove all conflict markers (`<<<<<<< HEAD`, `=======`, `>>>>>>>`). They are not valid syntax.\n"
+                "4. Run project tests to confirm the resolution passes tests and is syntactically valid.\n"
+                "5. Do NOT run `git rebase --continue` or `git add` yourself; save the resolved files in place.\n\n"
+                "Example resolution:\n"
+                "Before:\n"
+                "```python\n"
+                "def greet():\n"
+                "<<<<<<< HEAD\n"
+                "    print('hello from main')\n"
+                "=======\n"
+                "    print('hello from branch')\n"
+                ">>>>>>> branch-name\n"
+                "```\n"
+                "After (conflict markers completely removed):\n"
+                "```python\n"
+                "def greet():\n"
+                "    print('hello from main')\n"
+                "    print('hello from branch')\n"
+                "```"
             )
 
             record_direct_action_event(
@@ -793,8 +820,12 @@ def run_rebase_fix_agent(
             continued, continue_detail = _continue_rebase(worktree_path, source_conflict_files)
             if continued:
                 record_human_merge_hold()
-                commit_worktree_changes(
-                    worktree_path, tid, message=f"fix: resolve rebase conflict markers for {tid}"
+                _, _ = commit_worktree_changes(
+                    worktree_path,
+                    tid,
+                    message=f"fix: resolve rebase conflict markers for {tid}",
+                    ticket=ticket,
+                    paths=sorted(resolved_conflict_files),
                 )
                 return finish_recovery(True)
 
@@ -1136,6 +1167,24 @@ def run_auto_fix_cycle(
     initial = parse_ticket(ticket["_path"]) if ticket.get("_path") else ticket
     if initial is None:
         initial = ticket
+    verification_summary = str(initial.get("review_summary") or "").casefold()
+    if (
+        initial.get("verification_not_possible")
+        or "verification was not actually possible" in verification_summary
+    ):
+        record_auto_fix_attempt(
+            tid,
+            cfg,
+            repo_root,
+            attempt=0,
+            max_attempts=max_attempts,
+            note=(
+                "auto-fix declined: review verification was not actually possible — "
+                "requires a human decision"
+            ),
+            escalate=True,
+        )
+        return False
     if not _extract_review_findings(initial).strip():
         record_auto_fix_attempt(
             tid,
@@ -1207,6 +1256,13 @@ def run_auto_fix_cycle(
             )
             return False
 
+        if current.get("_path"):
+            reloaded = parse_ticket(current["_path"])
+            if reloaded:
+                for k in ("fix_session_executor", "fix_session_model", "acceptance_contract_audit", "acceptance_contract_audit_summary", "close_criteria", "change_notes"):
+                    if k in reloaded:
+                        current[k] = reloaded[k]
+
         drift = run_drift_check(
             current, cfg, repo_root, worktree_path, findings, pre_fix_sha, pool_name=pool_name
         )
@@ -1227,8 +1283,16 @@ def run_auto_fix_cycle(
             )
             return False
 
+        # Enforce model independence: the review agent should evaluate the code
+        # using a different model from the one that just wrote the fix.
+        review_ticket = dict(current)
+        if review_ticket.get("fix_session_executor"):
+            review_ticket["implement_session_executor"] = review_ticket["fix_session_executor"]
+        if review_ticket.get("fix_session_model"):
+            review_ticket["implement_session_model"] = review_ticket["fix_session_model"]
+
         approved = run_review_agent(
-            current, repo_root, worktree_path=worktree_path, cfg=cfg, pool_name=pool_name
+            review_ticket, repo_root, worktree_path=worktree_path, cfg=cfg, pool_name=pool_name
         )
 
         if approved:

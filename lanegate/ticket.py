@@ -114,14 +114,6 @@ TERMINAL_STATUSES = frozenset({"merged", "validated", "done", "failed", "closed"
 # work is present in main may unblock a dependent ticket.
 DEPENDENCY_SATISFIED_STATUSES = frozenset({"merged", "validated", "done"})
 
-# Review findings are deliberately absent here: they carry a per-attempt
-# suffix, so attention_summary reads them via latest_review_findings() instead
-# of substring-matching a fixed header.
-_ATTENTION_SECTION_HEADERS = (
-    "## Needs Review Reason",
-    "## Failure Reason",
-    "## Hibernation Reason",
-)
 
 # A hibernation carrying this marker is retried by resume-watch rather than
 # requiring an operator decision.  The classifier lives here because both the
@@ -1101,8 +1093,13 @@ def attention_summary(ticket: dict) -> str:
     verdict = ticket.get("review_verdict")
 
     if _reason_section_applies(status, verdict):
-        for header in _ATTENTION_SECTION_HEADERS:
-            summary = _summary_line(_body_section(ticket, header))
+        header_map = {
+            "needs_review": "## Needs Review Reason",
+            "failed": "## Failure Reason",
+            "hibernated": "## Hibernation Reason",
+        }
+        if status in header_map:
+            summary = _summary_line(_body_section(ticket, header_map[status]))
             if summary:
                 return _clean_attention_reason(summary)
         summary = _summary_line(latest_review_findings(ticket))
@@ -1780,8 +1777,8 @@ def get_ticket_diff(
             "(ticket not started, or its worktree/branch was already cleaned up after merge)",
         }
 
-    stat_r = _run_git(repo_root, ["diff", f"{base}..{branch}", "--stat"])
-    names_r = _run_git(repo_root, ["diff", f"{base}..{branch}", "--name-status"])
+    stat_r = _run_git(repo_root, ["diff", f"{base}...{branch}", "--stat"])
+    names_r = _run_git(repo_root, ["diff", f"{base}...{branch}", "--name-status"])
 
     if names_r.returncode != 0:
         return {
@@ -1911,11 +1908,15 @@ def get_ticket_summary(ticket_id: str, cfg: dict, repo_root: Path) -> dict:
     verdict = ticket.get("review_verdict")
 
     if _reason_section_applies(status, verdict):
-        for header in _ATTENTION_SECTION_HEADERS:
-            section = _body_section(ticket, header).strip()
+        header_map = {
+            "needs_review": "## Needs Review Reason",
+            "failed": "## Failure Reason",
+            "hibernated": "## Hibernation Reason",
+        }
+        if status in header_map:
+            section = _body_section(ticket, header_map[status]).strip()
             if section:
                 result["reason"] = section
-                break
 
     if verdict:
         result["review_verdict"] = verdict

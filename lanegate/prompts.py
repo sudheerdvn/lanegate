@@ -832,14 +832,21 @@ def load_prompt_template(step: str, project_root: Path) -> str:
 
     override = project_root / "prompts" / f"{step}.md"
     if override.exists():
-        return override.read_text(encoding="utf-8")
-    return (
-        files("lanegate")
-        .joinpath("templates")
-        .joinpath("prompts")
-        .joinpath(f"{step}.md")
-        .read_text(encoding="utf-8")
-    )
+        template = override.read_text(encoding="utf-8")
+    else:
+        template = (
+            files("lanegate")
+            .joinpath("templates")
+            .joinpath("prompts")
+            .joinpath(f"{step}.md")
+            .read_text(encoding="utf-8")
+        )
+    if step in {"implement", "review", "fix"}:
+        template += (
+            "\n\nDo not invoke `lanegate run` or `lanegate orchestrate`; these are "
+            "singleton control-plane commands reserved for the main checkout.\n"
+        )
+    return template
 
 
 def render_prompt(template: str, **kwargs: object) -> str:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 from lanegate.orchestrate.status import get_all_active_statuses, read_batch_status, write_batch_status
 
@@ -41,6 +43,20 @@ def test_batch_status_tolerates_malformed_file(tmp_path):
         "max_parallel": None,
         "total_open": None,
     }
+
+
+def test_orchestrator_lock_status_shows_cwd(tmp_path, monkeypatch, capsys):
+    from lanegate.cli import _cmd_orchestrator_lock
+
+    monkeypatch.setattr(
+        "lanegate.concurrency.orchestrator_lock_status",
+        lambda _root: {"held": True, "pid": 1234, "alive": True},
+    )
+    monkeypatch.setattr("lanegate.pidutil.pid_cwd", lambda _pid: "/main/checkout")
+
+    _cmd_orchestrator_lock(SimpleNamespace(orch_cmd="status"), tmp_path)
+
+    assert "cwd: /main/checkout" in capsys.readouterr().out
 
 
 def test_normalize_session_status(tmp_path, monkeypatch):

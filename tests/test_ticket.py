@@ -231,6 +231,31 @@ def test_get_ticket_diff_returns_structured_files(tmp_path):
     assert result["error"] is None
 
 
+def test_get_ticket_diff_excludes_base_only_changes(tmp_path):
+    _git(tmp_path, "init", "-b", "main")
+    _git(tmp_path, "config", "user.email", "test@example.com")
+    _git(tmp_path, "config", "user.name", "Test User")
+    (tmp_path / "README.md").write_text("base\n")
+    _git(tmp_path, "add", "README.md")
+    _git(tmp_path, "commit", "-m", "base")
+
+    _git(tmp_path, "checkout", "-b", "tick-001")
+    (tmp_path / "ticket-only.txt").write_text("ticket change\n")
+    _git(tmp_path, "add", "ticket-only.txt")
+    _git(tmp_path, "commit", "-m", "ticket change")
+
+    _git(tmp_path, "checkout", "main")
+    (tmp_path / "base-only.txt").write_text("base change\n")
+    _git(tmp_path, "add", "base-only.txt")
+    _git(tmp_path, "commit", "-m", "base change")
+
+    result = get_ticket_diff("TICK-001", tmp_path)
+
+    assert [file["path"] for file in result["files"]] == ["ticket-only.txt"]
+    assert "ticket-only.txt" in result["stat"]
+    assert "base-only.txt" not in result["stat"]
+
+
 def test_get_ticket_diff_missing_branch_returns_friendly_error(tmp_path):
     _git(tmp_path, "init", "-b", "main")
     _git(tmp_path, "config", "user.email", "test@example.com")
@@ -288,7 +313,7 @@ def test_get_ticket_diff_include_patches_false_skips_per_file_diff(tmp_path):
     assert result["files"][0]["patch"] == ""
     assert "notes.txt" in result["stat"]
     # rev-parse + stat + name-status only -- no per-file `git diff -- <path>` call.
-    diff_calls = [c for c in spy.call_args_list if c.args[1][:2] == ["diff", "main..tick-002"] and "--" in c.args[1]]
+    diff_calls = [c for c in spy.call_args_list if c.args[1][:2] == ["diff", "main...tick-002"] and "--" in c.args[1]]
     assert diff_calls == []
 
 
@@ -979,6 +1004,41 @@ def test_needs_attention():
 
 # --- quarantine ---
 
+
+
+def test_attention_summary_ignores_stale_hibernation_reason(tmp_path):
+    """A ticket resumed from hibernation with a stale Hibernation Reason header
+    and a current review_verdict of changes_requested returns the review finding
+    instead of the stale hibernation reason."""
+    from lanegate.ticket import attention_summary, get_ticket_summary, load_all_tickets
+    tickets_dir = tmp_path / "tickets"
+    tickets_dir.mkdir()
+    (tickets_dir / "TICK-006.md").write_text(
+        "---\n"
+        "id: TICK-006\n"
+        "title: Resumed\n"
+        "status: code_complete\n"
+        "review_verdict: changes_requested\n"
+        "review_findings:\n"
+        "  - Fix the chron ordering bug.\n"
+        "---\n"
+        "Body.\n\n"
+        "## Hibernation Reason\n"
+        "(rate_limit) API quota exhausted\n"
+    )
+    cfg = {"ticket_prefix": "TICK", "tickets_dir": "tickets"}
+
+    all_tickets, _ = load_all_tickets(tickets_dir, "TICK", cfg)
+    ticket = all_tickets[0]
+
+    # Check attention_summary
+    assert attention_summary(ticket) == "Fix the chron ordering bug."
+
+    # Check get_ticket_summary - since the status is code_complete, not hibernated,
+    # it won't populate 'reason' with the hibernation text.
+    result = get_ticket_summary("TICK-006", cfg, tmp_path)
+    assert result.get("reason") is None
+    assert result.get("review_findings") == ["Fix the chron ordering bug."]
 
 def _make_bad_ticket(tmp_path: Path, ticket_id: str, raw_frontmatter: str) -> Path:
     """Write a ticket with custom (possibly invalid) frontmatter."""

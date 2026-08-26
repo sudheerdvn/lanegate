@@ -1040,6 +1040,22 @@ def test_valid_executor_ollama(tmp_path):
     assert cfg["executor"] == "ollama"
 
 
+def test_valid_executor_named_instance(tmp_path):
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executors:\n  codex-1:\n    type: codex\nexecutor: codex-1\n",
+    )
+    assert load_config(tmp_path)["executor"] == "codex-1"
+
+
+def test_valid_executor_pool(tmp_path):
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executors:\n  codex-1:\n    type: codex\npools:\n  dev:\n    executors: [codex-1]\nexecutor: dev\n",
+    )
+    assert load_config(tmp_path)["executor"] == "dev"
+
+
 def test_invalid_executor_raises(tmp_path):
     _write_config(tmp_path / CONFIG_FILENAME, "executor: bogus\n")
     with pytest.raises(ValueError, match="invalid executor"):
@@ -2416,6 +2432,25 @@ class TestInteractiveInitLocalOllamaWorkflow:
         assert edit_format == "whole"
         assert note is None
 
+    def test_recommend_aider_edit_format_scans_only_provided_touches(self, tmp_path):
+        from lanegate.config import _recommend_aider_edit_format
+
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        large = tmp_path / "large.py"
+        large.write_text("\n".join(f"line {i}" for i in range(400)))
+        small = tmp_path / "small.py"
+        small.write_text("\n".join(f"line {i}" for i in range(10)))
+        subprocess.run(["git", "add", "large.py", "small.py"], cwd=tmp_path, check=True)
+
+        # Scans all tracked files, large.py crosses threshold -> diff
+        edit_format, note = _recommend_aider_edit_format(tmp_path)
+        assert edit_format == "diff"
+
+        # Limit touches to small.py -> ignores large.py -> whole
+        edit_format, note = _recommend_aider_edit_format(tmp_path, touches={"small.py"})
+        assert edit_format == "whole"
+        assert note is None
+
     # --- review_fallback: independent models on the same tool ---
 
     def test_review_fallback_set_when_same_tool_different_models(self, tmp_path):
@@ -2764,6 +2799,22 @@ def test_valid_reviewer_human(tmp_path):
     _write_config(tmp_path / CONFIG_FILENAME, "reviewer: human\n")
     cfg = load_config(tmp_path)
     assert cfg["reviewer"] == "human"
+
+
+def test_valid_reviewer_named_instance(tmp_path):
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executors:\n  agy-1:\n    type: agy\nreviewer: agy-1\n",
+    )
+    assert load_config(tmp_path)["reviewer"] == "agy-1"
+
+
+def test_valid_reviewer_pool(tmp_path):
+    _write_config(
+        tmp_path / CONFIG_FILENAME,
+        "executors:\n  agy-1:\n    type: agy\npools:\n  review:\n    executors: [agy-1]\nreviewer: review\n",
+    )
+    assert load_config(tmp_path)["reviewer"] == "review"
 
 
 def test_invalid_reviewer_raises(tmp_path):
@@ -3287,6 +3338,34 @@ executors:
         assert ms["ollama_chat/gpt-oss:20b"]["context_window_tokens"] == 131072
         assert ms["ollama_chat/gpt-oss:20b"]["edit_format"] == "whole"
         assert ms["ollama_chat/qwen2.5-coder:14b"]["context_window_tokens"] == 49152
+
+    def test_model_settings_rejects_neutralize_whole(self, tmp_path):
+        """neutralize_touches: true cannot coexist with edit_format: whole, either at flat level or in model_settings."""
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    neutralize_touches: true
+    edit_format: whole
+""",
+        )
+        with pytest.raises(ConfigError, match="cannot combine neutralize_touches: true with edit_format: 'whole'"):
+            load_config(tmp_path)
+
+        _write_config(
+            tmp_path / CONFIG_FILENAME,
+            """
+executors:
+  aider:
+    neutralize_touches: true
+    model_settings:
+      'ollama_chat/qwen2.5-coder:14b':
+        edit_format: whole
+""",
+        )
+        with pytest.raises(ConfigError, match="cannot combine neutralize_touches: true with edit_format: 'whole'"):
+            load_config(tmp_path)
 
     def test_model_settings_invalid_context_window_tokens(self, tmp_path):
         """context_window_tokens=0 under model_settings raises ConfigError

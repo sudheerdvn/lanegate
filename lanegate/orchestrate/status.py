@@ -19,6 +19,7 @@ from pathlib import Path
 
 from lanegate.concurrency import orchestrator_lock_status
 from lanegate.executor import resolved_dispatch_metadata
+from lanegate.pidutil import pid_cwd
 from lanegate.ticket import load_all_tickets
 
 from .audit import _active_status_path, _utc_now_iso, _write_json_atomic
@@ -276,6 +277,8 @@ def _normalize_status_dict(
     status["pid_alive"] = pid_live
 
     lock = orchestrator_lock_status(repo_root)
+    if lock["held"] and isinstance(lock["pid"], int):
+        lock["cwd"] = pid_cwd(lock["pid"])
     status["orchestrator_lock"] = lock
     if lock["held"]:
         status["orchestrator_lock_state"] = "live"

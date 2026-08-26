@@ -37,7 +37,7 @@ class TestRunFixAgent:
             patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py"),
             patch("lanegate.reviewer.build_fix_prompt", return_value="fix prompt") as mock_build,
             patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")) as mock_invoke,
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True) as mock_commit,
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-after"),
         ):
             result = run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -64,7 +64,7 @@ class TestRunFixAgent:
             patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(1, "", "some error")),
             patch("lanegate.orchestrate.loop._is_rate_limit", return_value=False),
             patch("lanegate.orchestrate.loop._is_interrupted_exit", return_value=False),
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         ):
             with pytest.raises(FixFailedError):
                 run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -85,7 +85,7 @@ class TestRunFixAgent:
             patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py"),
             patch("lanegate.reviewer.build_fix_prompt", return_value="fix prompt"),
             patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-before"),
         ):
             with pytest.raises(FixFailedError):
@@ -120,7 +120,7 @@ class TestRunFixAgent:
             patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(1, "", "rate limit exceeded")),
             patch("lanegate.orchestrate.loop._is_rate_limit", return_value=True),
             patch("lanegate.orchestrate.loop._is_interrupted_exit", return_value=False),
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         ):
             with pytest.raises(RateLimitedFixError):
                 run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -142,7 +142,7 @@ class TestRunFixAgent:
             patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(130, "", "")),
             patch("lanegate.orchestrate.loop._is_rate_limit", return_value=False),
             patch("lanegate.orchestrate.loop._is_interrupted_exit", return_value=True),
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         ):
             with pytest.raises(RateLimitedFixError):
                 run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -161,7 +161,7 @@ class TestRunFixAgent:
         with (
             patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/x.py"),
             patch("lanegate.reviewer.build_fix_prompt", return_value="fix prompt"),
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True),
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-after"),
             patch(
                 "lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")
@@ -1094,6 +1094,29 @@ class TestRunAutoFixCycle:
         assert mock_record.call_args.kwargs["escalate"] is True
         assert "attempts exhausted" not in mock_record.call_args.kwargs["note"]
 
+    def test_skips_fix_when_review_verification_was_not_possible(self, tmp_path):
+        ticket = self._ticket(tmp_path)
+        ticket["review_summary"] = "Verification was not actually possible: bwrap failed."
+        from lanegate.ticket import write_ticket
+        write_ticket(ticket)
+        cfg = self._cfg(tmp_path)
+
+        with (
+            patch("lanegate.orchestrate.autofix.run_fix_agent") as mock_fix,
+            patch("lanegate.orchestrate.autofix.run_drift_check") as mock_drift,
+            patch("lanegate.orchestrate.autofix.run_review_agent") as mock_review,
+            patch("lanegate.lifecycle.record_auto_fix_attempt") as mock_record,
+        ):
+            result = run_auto_fix_cycle(ticket, cfg, tmp_path, tmp_path / "worktrees" / "tick-050")
+
+        assert result is False
+        mock_fix.assert_not_called()
+        mock_drift.assert_not_called()
+        mock_review.assert_not_called()
+        assert mock_record.call_args.kwargs["attempt"] == 0
+        assert mock_record.call_args.kwargs["escalate"] is True
+        assert "verification was not actually possible" in mock_record.call_args.kwargs["note"]
+
 
     def test_rate_limit_during_fix_hibernates_without_consuming_attempt(self, tmp_path):
         """When the fix agent is rate-limited, run_auto_fix_cycle hibernates the
@@ -1239,7 +1262,7 @@ class TestSplitModeAutoFix:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=self._fake_complete(tickets_dir)),
@@ -1264,7 +1287,7 @@ class TestSplitModeAutoFix:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=self._fake_complete(tickets_dir)),
@@ -1307,7 +1330,7 @@ class TestSplitModeAutoFix:
         with (
             patch("lanegate.lifecycle.cmd_start"),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=self._fake_complete(tickets_dir)),
@@ -1360,7 +1383,7 @@ class TestSplitModeAutoFix:
         with (
             patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
             patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=False),
             patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
@@ -1405,7 +1428,7 @@ class TestCombinedModeAutoFix:
                 "lanegate.orchestrate.invoke_executor",
                 side_effect=self._fake_invoke_changes_requested(tickets_dir),
             ),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
@@ -1431,7 +1454,7 @@ class TestCombinedModeAutoFix:
                 "lanegate.orchestrate.invoke_executor",
                 side_effect=self._fake_invoke_changes_requested(tickets_dir),
             ),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=False),
+            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
             patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
             patch("lanegate.orchestrate._is_combined_mode", return_value=True),
             patch("lanegate.lifecycle.cmd_complete") as mock_complete,
@@ -1457,7 +1480,7 @@ def test_rebase_conflict_autofix(tmp_path):
     from lanegate.orchestrate.autofix import run_rebase_fix_agent
 
     ticket = {"id": "TICK-322"}
-    cfg = {}
+    cfg = {"tickets_dir": "tickets"}
     worktree = tmp_path / "wt"
     worktree.mkdir()
 
@@ -1466,7 +1489,7 @@ def test_rebase_conflict_autofix(tmp_path):
          patch("lanegate.orchestrate.loop._conflicted_files", return_value=["a.py"]), \
          patch("lanegate.orchestrate.loop._continue_rebase", return_value=(True, "")) as mock_cont, \
          patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record, \
-         patch("lanegate.orchestrate.autofix.commit_worktree_changes"):
+         patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)):
         ok = run_rebase_fix_agent(
             ticket, cfg, tmp_path, worktree, "conflict in a.py", pool_name="codex"
         )
@@ -1480,6 +1503,80 @@ def test_rebase_conflict_autofix(tmp_path):
     assert mock_record.call_args.kwargs["status"] == "success"
     assert ticket["requires_human_merge"] is True
     assert ticket["rebase_conflict_files"] == ["a.py"]
+
+
+def test_rebase_conflict_commit_scopes_to_conflict_files(tmp_path):
+    """Recovery must not commit unrelated untracked worktree files."""
+    from lanegate.orchestrate.autofix import run_rebase_fix_agent
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (repo / "conflict.txt").write_text("base\n")
+    git("add", "conflict.txt")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "topic")
+    (repo / "conflict.txt").write_text("topic\n")
+    git("commit", "-am", "topic")
+    git("checkout", "main")
+    (repo / "conflict.txt").write_text("main\n")
+    git("commit", "-am", "main")
+    git("checkout", "topic")
+    assert subprocess.run(
+        ["git", "rebase", "main"], cwd=repo, capture_output=True, text=True
+    ).returncode != 0
+    (repo / "unrelated.txt").write_text("do not commit\n")
+
+    def resolve_conflict(*_args, **_kwargs):
+        (repo / "conflict.txt").write_text("main\ntopic\n")
+        return 0, "", ""
+
+    with (
+        patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
+        patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=resolve_conflict),
+        patch("lanegate.orchestrate.run_report.record_direct_action_event"),
+    ):
+        assert run_rebase_fix_agent({"id": "TICK-686"}, {}, repo, repo, "conflict")
+
+    committed_files = git("show", "--format=", "--name-only", "HEAD").stdout.splitlines()
+    assert "conflict.txt" in committed_files
+    assert "unrelated.txt" not in committed_files
+    assert (repo / "unrelated.txt").exists()
+    assert "?? unrelated.txt" in git("status", "--porcelain").stdout
+
+
+def test_rebase_fix_prompt_includes_example(tmp_path):
+    """Verify run_rebase_fix_agent prompt contains a worked example of removing conflict markers."""
+    from lanegate.orchestrate.autofix import run_rebase_fix_agent
+
+    ticket = {"id": "TICK-665"}
+    cfg = {"tickets_dir": "tickets"}
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    with patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"), \
+         patch("lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")) as mock_exec, \
+         patch("lanegate.orchestrate.loop._conflicted_files", return_value=["a.py"]), \
+         patch("lanegate.orchestrate.loop._continue_rebase", return_value=(True, "")), \
+         patch("lanegate.orchestrate.run_report.record_direct_action_event"), \
+         patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)):
+        run_rebase_fix_agent(
+            ticket, cfg, tmp_path, worktree, "conflict in a.py", pool_name="codex"
+        )
+
+    mock_exec.assert_called_once()
+    prompt = mock_exec.call_args.kwargs["prompt_override"]
+    assert "Example resolution:" in prompt
+    assert "<<<<<<< HEAD" in prompt
+    assert "After (conflict markers completely removed):" in prompt
 
 
 def test_rebase_conflict_autofix_sequential_metadata_then_code(tmp_path):
@@ -1519,7 +1616,7 @@ def test_rebase_conflict_autofix_sequential_metadata_then_code(tmp_path):
          patch("lanegate.orchestrate.loop._continue_rebase", side_effect=mock_continue), \
          patch("lanegate.reconciliation.resolve_metadata_conflict") as mock_res_meta, \
          patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record, \
-         patch("lanegate.orchestrate.autofix.commit_worktree_changes"):
+         patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)):
         ok = run_rebase_fix_agent(ticket, cfg, tmp_path, worktree, "detail")
 
     assert ok is True
@@ -1546,7 +1643,7 @@ def test_rebase_metadata_conflict_does_not_require_human_merge(tmp_path):
          patch("lanegate.orchestrate.loop._continue_rebase", return_value=(True, "")), \
          patch("lanegate.reconciliation.resolve_metadata_conflict") as mock_resolve, \
          patch("lanegate.orchestrate.autofix.invoke_executor") as mock_executor, \
-         patch("lanegate.orchestrate.autofix.commit_worktree_changes"):
+         patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)):
         ok = run_rebase_fix_agent(ticket, cfg, tmp_path, worktree, "metadata conflict")
 
     assert ok is True
@@ -1560,7 +1657,7 @@ def test_rebase_conflict_autofix_stuck_aborts(tmp_path):
     from lanegate.orchestrate.autofix import run_rebase_fix_agent
 
     ticket = {"id": "TICK-534"}
-    cfg = {}
+    cfg = {"tickets_dir": "tickets"}
     worktree = tmp_path / "wt"
     worktree.mkdir()
     # A no-op agent can leave unresolved content that has no marker triplet.
@@ -1627,7 +1724,7 @@ def test_rebase_conflict_autofix_cannot_stage_remaining_marker_hunk(tmp_path, ag
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=run_agent),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "conflict")
@@ -1709,7 +1806,7 @@ def test_rebase_conflict_autofix_rejects_unmatched_rebase_marker_when_legitimate
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=incomplete_agent_resolution),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "conflict")
@@ -1805,7 +1902,7 @@ def test_rebase_conflict_autofix_rejects_stray_marker_with_dual_unstable_context
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=agent_leaves_stray_marker),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes") as mock_commit,
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)) as mock_commit,
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "conflict")
@@ -1863,7 +1960,7 @@ def test_rebase_metadata_recovery_preserves_historical_marker_text(tmp_path):
 
     with (
         patch("lanegate.orchestrate.autofix.invoke_executor") as mock_executor,
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent(
@@ -1935,7 +2032,7 @@ def test_rebase_mixed_conflict_preserves_historical_ticket_marker_text(tmp_path)
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=resolve_mixed_batch) as mock_exec,
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent(
@@ -1989,7 +2086,7 @@ def test_rebase_source_recovery_allows_new_marker_prefix_content(tmp_path):
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=resolve_with_delimiter),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2038,7 +2135,7 @@ def test_rebase_source_recovery_allows_preexisting_marker_lines(tmp_path):
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=resolve_guide_conflict),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2089,7 +2186,7 @@ def test_rebase_source_recovery_rejects_duplicated_preexisting_marker(tmp_path):
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=incomplete_resolution),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record,
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2142,7 +2239,7 @@ def test_rebase_source_recovery_rejects_replaced_preexisting_marker_with_residua
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=incomplete_resolution),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record,
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2195,7 +2292,7 @@ def test_rebase_source_recovery_rejects_marker_replacement_when_preceding_line_m
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=incomplete_resolution),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record,
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2248,7 +2345,7 @@ def test_rebase_source_recovery_rejects_marker_replacement_when_following_line_m
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=incomplete_resolution),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event") as mock_record,
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2378,7 +2475,7 @@ class TestRunFixAgentExcludesReviewer:
             patch(
                 "lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")
             ) as mock_invoke,
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True),
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-after"),
         ):
             result = run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -2436,7 +2533,7 @@ class TestRunFixAgentExcludesReviewer:
             patch(
                 "lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")
             ) as mock_invoke,
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True),
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
             patch("lanegate.orchestrate.autofix._git_head_sha", return_value="sha-after"),
         ):
             result = run_fix_agent(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
@@ -2712,7 +2809,7 @@ class TestCmdFix:
             patch(
                 "lanegate.orchestrate.autofix.invoke_executor", return_value=(0, "", "")
             ) as mock_invoke,
-            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=True),
+            patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
             patch("lanegate.orchestrate.autofix._git_head_sha", side_effect=["sha-before", "sha-after"]),
             patch(
                 "lanegate.orchestrate.autofix.run_drift_check",
@@ -2862,7 +2959,7 @@ def test_abort_if_markers_remain_detects_unresolved_equals_separator(tmp_path):
     with (
         patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
         patch("lanegate.orchestrate.autofix.invoke_executor", side_effect=resolve_with_residual_equals),
-        patch("lanegate.orchestrate.autofix.commit_worktree_changes"),
+        patch("lanegate.orchestrate.autofix.commit_worktree_changes", return_value=(True, None)),
         patch("lanegate.orchestrate.run_report.record_direct_action_event"),
     ):
         ok = run_rebase_fix_agent({"id": "TICK-534"}, {}, repo, repo, "source conflict")
@@ -2871,3 +2968,90 @@ def test_abort_if_markers_remain_detects_unresolved_equals_separator(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+
+
+from lanegate.orchestrate.autofix import run_auto_fix_cycle
+import json
+
+def test_autofix_model_independence(tmp_path, monkeypatch):
+    ticket = {
+        "id": "TICK-1",
+        "status": "code_complete",
+        "auto_fix_attempts": 0,
+        "fix_session_executor": "fix_exec",
+        "fix_session_model": "fix_model",
+        "review_verdict": "changes_requested",
+        "_body": "## Review Findings\n- finding\n"
+    }
+    
+    cfg = {"tickets_dir": "tickets"}
+    
+    captured_ticket = {}
+    def fake_run_review_agent(ticket_dict, repo_root, worktree_path=None, cfg=None, pool_name=None):
+        captured_ticket.update(ticket_dict)
+        return True # approved
+    
+    monkeypatch.setattr("lanegate.orchestrate.autofix.run_review_agent", fake_run_review_agent)
+    monkeypatch.setattr("lanegate.orchestrate.autofix.run_fix_agent", lambda *a, **k: None)
+    monkeypatch.setattr("lanegate.orchestrate.autofix._git_head_sha", lambda *a, **k: "abc")
+    class FakeDrift:
+        ok = True
+        reason = ""
+    monkeypatch.setattr("lanegate.orchestrate.autofix.run_drift_check", lambda *a, **k: FakeDrift())
+    monkeypatch.setattr("lanegate.lifecycle.record_auto_fix_attempt", lambda *a, **k: None)
+    
+    run_auto_fix_cycle(ticket, cfg, tmp_path, tmp_path, pool_name="pool")
+    
+    assert captured_ticket.get("implement_session_executor") == "fix_exec"
+    assert captured_ticket.get("implement_session_model") == "fix_model"
+def test_rebase_conflict_empty_initial_unmerged_does_not_sweep_untracked(tmp_path):
+    """If rebase is paused/resolved before agent runs, it must not sweep untracked files."""
+    from lanegate.orchestrate.autofix import run_rebase_fix_agent
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (repo / "conflict.txt").write_text("base\n")
+    git("add", "conflict.txt")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "topic")
+    (repo / "conflict.txt").write_text("topic\n")
+    git("commit", "-am", "topic")
+    git("checkout", "main")
+    (repo / "conflict.txt").write_text("main\n")
+    git("commit", "-am", "main")
+    git("checkout", "topic")
+    # Cause a conflict
+    assert subprocess.run(
+        ["git", "rebase", "main"], cwd=repo, capture_output=True, text=True
+    ).returncode != 0
+
+    # Manually resolve the conflict before the agent is called
+    (repo / "conflict.txt").write_text("main\ntopic\n")
+    git("add", "conflict.txt")
+    # We do NOT run git rebase --continue. The worktree now has no unmerged files.
+
+    # Create an unrelated untracked file
+    (repo / "unrelated.txt").write_text("do not commit\n")
+
+    from unittest.mock import patch
+    with (
+        patch("lanegate.orchestrate.loop.resolve_pool_executor", return_value="codex"),
+        patch("lanegate.orchestrate.run_report.record_direct_action_event"),
+    ):
+        assert run_rebase_fix_agent({"id": "TICK-686"}, {}, repo, repo, "conflict")
+
+    committed_files = git("show", "--format=", "--name-only", "HEAD").stdout.splitlines()
+    assert "conflict.txt" in committed_files
+    assert "unrelated.txt" not in committed_files
+    assert (repo / "unrelated.txt").exists()
+    assert "?? unrelated.txt" in git("status", "--porcelain").stdout
