@@ -2158,7 +2158,9 @@ def run_executor_subprocess(
     of bytes already buffered in the pipes; a detached descendant retaining a
     write fd therefore cannot keep LaneGate blocked forever.
     """
-    if executor_type != "kiro":
+    # kiro's non-blocking pipe drain below is POSIX-only (selectors cannot poll
+    # anonymous pipes on Windows; os.set_blocking is not exposed there).
+    if executor_type != "kiro" or sys.platform == "win32":
         return subprocess.run(cmd, **kwargs)
 
     popen_kwargs = dict(kwargs)

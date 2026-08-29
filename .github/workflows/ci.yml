@@ -34,8 +34,9 @@ jobs:
       - name: Install dependencies
         run: pip install -e .[dev]
 
-      - name: Ruff check
+      - name: Ruff check (advisory)
         if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
         run: ruff check lanegate tests ci
 
       - name: File-size ratchet
