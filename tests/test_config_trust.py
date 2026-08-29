@@ -63,6 +63,7 @@ def test_control_checkout_root_uses_platform_git_and_disables_prompts(tmp_path):
     assert "input" not in run.call_args.kwargs
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell-script git fake + PATH/permission trust semantics")
 def test_trusted_git_lookup_accepts_protected_nonstandard_path(tmp_path, monkeypatch):
     """A protected Git installation need not live in a hard-coded prefix."""
     install = tmp_path / "opt" / "company-git" / "bin"
@@ -79,6 +80,7 @@ def test_trusted_git_lookup_accepts_protected_nonstandard_path(tmp_path, monkeyp
         assert _trusted_git_executable() == str(git.resolve())
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX PATH empty-entry / cwd trust semantics")
 def test_trusted_git_lookup_rejects_current_directory_and_unprotected_path(tmp_path, monkeypatch):
     """PATH cannot select an agent binary, including through an empty entry."""
     agent_bin = tmp_path / "agent-bin"
@@ -93,6 +95,7 @@ def test_trusted_git_lookup_rejects_current_directory_and_unprotected_path(tmp_p
         _trusted_git_executable()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="os.geteuid is POSIX-only")
 def test_trusted_git_lookup_accepts_root_owned_path_when_running_as_root(tmp_path, monkeypatch):
     """Root cannot use effective ownership as a meaningful trust boundary."""
     git = tmp_path / "git"
@@ -227,6 +230,7 @@ def test_linked_worktree_uses_control_checkout_config(tmp_path):
     assert load_config(find_repo_root(worktree))["safeguards"]["pre_complete"] == ["trusted-check"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="newline in a filename is rejected by the Windows filesystem")
 def test_newline_named_worktree_uses_control_checkout_config(tmp_path):
     """A newline in a worktree path cannot restore walk-up config discovery."""
     control = tmp_path / "control"

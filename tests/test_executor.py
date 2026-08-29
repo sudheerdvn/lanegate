@@ -221,6 +221,7 @@ def test_bwrap_prefix_uses_namespace_proc_and_isolated_dev(tmp_path):
     assert ["--ro-bind", "/dev", "/dev"] not in triples
 
 
+@pytest.mark.skipif(os.name == "nt", reason="bwrap profile is Linux-only; POSIX path rebinding")
 def test_bwrap_prefix_rebinds_worktree_beneath_hidden_home(tmp_path):
     worktree = Path("/home/sandbox-user/project/worktree")
     config_dir = tmp_path / ".claude-a"
@@ -270,29 +271,35 @@ def test_bwrap_usable_does_not_cache_failure(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.skipif(os.name == "nt", reason="bwrap is Linux-only")
 def test_bwrap_child_cannot_read_home_or_general_etc(tmp_path):
-    if shutil.which("bwrap") is None:
-        pytest.skip("bwrap is not installed")
+    from lanegate.executor import _bwrap_usable
+
+    if shutil.which("bwrap") is None or not _bwrap_usable():
+        pytest.skip("bwrap is not installed or cannot create unprivileged namespaces")
 
     config_dir = tmp_path / ".claude"
     config_dir.mkdir()
-    with tempfile.TemporaryDirectory(dir=Path.home()) as temporary_home:
-        sentinel = Path(temporary_home) / "sentinel"
-        sentinel.write_text("private")
-        worktree = Path(temporary_home) / "worktree"
-        worktree.mkdir()
-        result = subprocess.run(
-            _bwrap_prefix(worktree, config_dir)
-            + [
-                "/bin/sh", "-c",
-                'test -w "$1" && test -w /tmp && test ! -e "$HOME/sentinel" && test ! -e /etc/shadow',
-                "sh", str(worktree),
-            ],
-            capture_output=True,
-            text=True,
-            env=dict(os.environ, HOME=temporary_home),
-            check=False,
-        )
+    try:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary_home:
+            sentinel = Path(temporary_home) / "sentinel"
+            sentinel.write_text("private")
+            worktree = Path(temporary_home) / "worktree"
+            worktree.mkdir()
+            result = subprocess.run(
+                _bwrap_prefix(worktree, config_dir)
+                + [
+                    "/bin/sh", "-c",
+                    'test -w "$1" && test -w /tmp && test ! -e "$HOME/sentinel" && test ! -e /etc/shadow',
+                    "sh", str(worktree),
+                ],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, HOME=temporary_home),
+                check=False,
+            )
+    except FileNotFoundError:
+        pytest.skip("bwrap present on PATH but not executable in this environment")
     if result.returncode and (
         "Operation not permitted" in result.stderr or "setting up uid map: Permission denied" in result.stderr
     ):
@@ -300,6 +307,7 @@ def test_bwrap_child_cannot_read_home_or_general_etc(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Seatbelt profile path escaping differs on Windows (C:\\ backslashes)")
 def test_seatbelt_prefix_uses_read_whitelist_and_allows_worktree_writes(tmp_path):
     config_dir = tmp_path / ".claude-a"
     prefix = _seatbelt_prefix(tmp_path, config_dir)
@@ -2820,6 +2828,7 @@ def test_parse_kiro_json_result_marks_non_success_as_error():
     assert parse_kiro_json_result(json.dumps(event))["is_error"] is True
 
 
+@pytest.mark.skipif(os.name == "nt", reason="kiro non-blocking pipe drain is POSIX-only; win32 falls back to blocking subprocess.run")
 def test_kiro_subprocess_stops_after_direct_child_exits_with_pipe_open():
     script = (
         "import subprocess,sys; "
