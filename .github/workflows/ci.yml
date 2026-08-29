@@ -2,7 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release-staging: run the full matrix on a public-repo branch before a
+    # release lands on main. Public Actions minutes are free; the private
+    # lanegate-dev mirror is billing-blocked and never actually runs, so this
+    # branch is the only pre-release gate for the windows/macos jobs.
+    branches: [main, release-staging]
+  workflow_dispatch:
 
 # Windows' default text encoding (cp1252/mbcs) isn't UTF-8, so any open()/
 # write_text()/read_text() without an explicit encoding= -- including the
