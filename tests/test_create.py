@@ -108,6 +108,24 @@ def test_create_intent_in_body(repo):
     assert "Build a login page" in t["_body"]
 
 
+def test_create_scaffolds_markdown_sections(repo):
+    intent = "Support ## literal markdown\n- [ ] supplied content"
+    cmd_create(intent, _CFG, repo)
+    body = parse_ticket(repo / "tickets" / "TICK-001.md")["_body"]
+
+    assert body.startswith(f"## Background\n{intent}\n\n## Acceptance Criteria\n")
+    assert "\n- [ ] \n" in body
+    headings = [
+        "## Background",
+        "## Acceptance Criteria",
+        "## Non-Goals",
+        "## Technical Notes & Invariants",
+    ]
+    assert [body.index(heading) for heading in headings] == sorted(
+        body.index(heading) for heading in headings
+    )
+
+
 def test_create_title_from_intent(repo):
     cmd_create("Build a login page", _CFG, repo)
     t = parse_ticket(repo / "tickets" / "TICK-001.md")

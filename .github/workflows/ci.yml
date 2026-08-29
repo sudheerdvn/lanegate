@@ -34,6 +34,19 @@ jobs:
       - name: Install dependencies
         run: pip install -e .[dev]
 
+      - name: Ruff check
+        if: matrix.os == 'ubuntu-latest'
+        run: ruff check lanegate tests ci
+
+      - name: File-size ratchet
+        shell: bash
+        run: |
+          if git show-ref --verify --quiet refs/remotes/origin/main; then
+            python scripts/check_file_size.py --against origin/main
+          else
+            python scripts/check_file_size.py --absolute
+          fi
+
       - name: Run tests
         if: runner.os != 'Windows'
         run: python ci/run_pytest.py

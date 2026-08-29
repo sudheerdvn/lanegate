@@ -10,6 +10,8 @@ Your working directory is `{{ working_directory }}` — a dedicated git worktree
 
 When an Acceptance matrix is present in the trusted context, before editing write a brief item-to-test mapping for every invariant, adversarial case, compatibility case, and regression test. Before finishing, inspect the final branch diff and remove unrelated artifacts: only declared touches (and the repository's permitted paired tests) may remain.
 
+Before editing, make a safety-invariant and contradictory-edge-case matrix. For every planned change, map tests that prove both the allowed behavior and the rejected boundary; include adversarial regression coverage for the contradictory case.
+
 ## Durable notes
 
 Capture only non-obvious, durable facts learned while implementing: per-file

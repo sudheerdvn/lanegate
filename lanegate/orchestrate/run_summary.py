@@ -233,21 +233,27 @@ def list_run_summaries(cfg: dict, repo_root: Any) -> list[RunSummary]:
     logs_dir = Path(repo_root) / ".lanegate" / "logs"
     if not logs_dir.exists():
         return []
+    # cmd_orchestrate rotates all but the 10 most-recent orchestrate-*.log
+    # files into logs_dir/archive (see loop.py's log-rotation block) well
+    # before run_history_retention_days purges them -- scan both dirs so a
+    # rotated-but-not-yet-purged run doesn't vanish from history early.
+    search_dirs = [logs_dir, logs_dir / "archive"]
     sessions: set[str] = set()
     action_ids: set[str] = set()
-    for p in logs_dir.glob("orchestrate-*.events.jsonl"):
-        name = p.name
-        prefix = "orchestrate-"
-        suffix = ".events.jsonl"
-        if name.startswith(prefix) and name.endswith(suffix):
-            sessions.add(name[len(prefix) : -len(suffix)])
-    for p in logs_dir.glob("orchestrate-*.log"):
-        name = p.stem
-        prefix = "orchestrate-"
-        if name.startswith(prefix):
-            sessions.add(name[len(prefix) :])
-    for p in logs_dir.glob("action-*.events.jsonl"):
-        action_ids.add(p.name[: -len(".events.jsonl")])
+    for d in search_dirs:
+        for p in d.glob("orchestrate-*.events.jsonl"):
+            name = p.name
+            prefix = "orchestrate-"
+            suffix = ".events.jsonl"
+            if name.startswith(prefix) and name.endswith(suffix):
+                sessions.add(name[len(prefix) : -len(suffix)])
+        for p in d.glob("orchestrate-*.log"):
+            name = p.stem
+            prefix = "orchestrate-"
+            if name.startswith(prefix):
+                sessions.add(name[len(prefix) :])
+        for p in d.glob("action-*.events.jsonl"):
+            action_ids.add(p.name[: -len(".events.jsonl")])
 
     # build_run_summary only ever consults a ticket to enrich a FAILURE,
     # CHANGES_REQUESTED, or AWAITING_MERGE outcome's reason — loading every

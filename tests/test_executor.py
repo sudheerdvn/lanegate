@@ -2,14 +2,23 @@
 
 import datetime
 import json
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import zoneinfo
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from lanegate.config import ConfigError
 from lanegate.executor import (
+    _bwrap_prefix,
+    _sandbox_prefix,
+    _seatbelt_prefix,
     available_instances,
     build_executor_cmd,
     clear_all_cooldowns,
@@ -23,11 +32,15 @@ from lanegate.executor import (
     is_cooling_down,
     _parse_reset_time,
     parse_codex_json_result,
+    parse_cursor_json_result,
+    parse_kiro_json_result,
+    parse_structured_result,
     parse_retry_after,
     read_cooldown,
     record_failure_signature,
     reject_ollama_for_code_step,
     resolve_executor_env,
+    run_executor_subprocess,
     write_cooldown,
 )
 from lanegate.prompts import get_payload_budget
@@ -151,6 +164,235 @@ def test_build_executor_cmd_bare_type_backward_compat():
     assert "-p" in cmd
 
 
+def test_build_executor_cmd_cursor():
+    cmd = build_executor_cmd("cursor", "implement the ticket", {"executors": {}})
+
+    assert cmd == [
+        "cursor-agent", "-p", "implement the ticket", "--output-format", "json", "--force",
+    ]
+
+
+def test_build_executor_cmd_cursor_read_only_uses_ask_mode():
+    """analyze must not get edit/shell capability against the main checkout:
+    --mode ask AND no --force (the write-capability flag)."""
+    cmd = build_executor_cmd(
+        "cursor", "analyze the ticket", {"executors": {}}, read_only=True
+    )
+
+    assert cmd == [
+        "cursor-agent", "--mode", "ask",
+        "-p", "analyze the ticket", "--output-format", "json",
+    ]
+    assert "--force" not in cmd
+
+
+def test_dispatch_executor_cursor_propagates_startup_timeout(tmp_path, monkeypatch):
+    """Cursor startup/timeout failures must not be misreported as JSON results."""
+    monkeypatch.setattr(
+        "lanegate.executor.subprocess.run",
+        mock.Mock(side_effect=subprocess.TimeoutExpired(["cursor-agent"], 30)),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        dispatch_executor("cursor", "implement the ticket", {"executors": {}}, cwd=tmp_path)
+
+
+def test_bwrap_prefix_allows_only_worktree_and_tmp_writes(tmp_path):
+    config_dir = tmp_path / ".claude-a"
+    config_dir.mkdir()
+    prefix = _bwrap_prefix(tmp_path, config_dir)
+
+    assert ["--ro-bind", "/", "/"] not in [prefix[i:i + 3] for i in range(len(prefix) - 2)]
+    assert ["--bind", str(tmp_path), str(tmp_path)] in [prefix[i:i + 3] for i in range(len(prefix) - 2)]
+    assert ["--bind", "/tmp", "/tmp"] in [prefix[i:i + 3] for i in range(len(prefix) - 2)]
+    assert ["--ro-bind", str(config_dir), str(config_dir)] in [prefix[i:i + 3] for i in range(len(prefix) - 2)]
+    assert ["--tmpfs", "/home"] in [prefix[i:i + 2] for i in range(len(prefix) - 1)]
+    assert ["--tmpfs", "/root"] in [prefix[i:i + 2] for i in range(len(prefix) - 1)]
+    assert prefix[-3:] == ["--dir", "/var", "--"]
+
+
+def test_bwrap_prefix_uses_namespace_proc_and_isolated_dev(tmp_path):
+    prefix = _bwrap_prefix(tmp_path)
+    triples = [prefix[i:i + 3] for i in range(len(prefix) - 2)]
+
+    assert ["--proc", "/proc"] in [prefix[i:i + 2] for i in range(len(prefix) - 1)]
+    assert ["--dev", "/dev"] in [prefix[i:i + 2] for i in range(len(prefix) - 1)]
+    assert ["--ro-bind", "/proc", "/proc"] not in triples
+    assert ["--ro-bind", "/dev", "/dev"] not in triples
+
+
+def test_bwrap_prefix_rebinds_worktree_beneath_hidden_home(tmp_path):
+    worktree = Path("/home/sandbox-user/project/worktree")
+    config_dir = tmp_path / ".claude-a"
+    config_dir.mkdir()
+    prefix = _bwrap_prefix(worktree, config_dir)
+
+    home_tmpfs = prefix.index("/home")
+    worktree_parent = prefix.index("/home/sandbox-user")
+    worktree_bind = prefix.index("--bind", worktree_parent)
+    assert home_tmpfs < worktree_parent < worktree_bind
+    assert prefix[worktree_bind:worktree_bind + 3] == ["--bind", str(worktree), str(worktree)]
+
+
+def test_bwrap_prefix_warns_for_linked_worktree(tmp_path, capsys):
+    """sandbox: worktree cannot yet safely rebind a linked worktree's real
+    .git dir (TICK-725) — it must at least warn instead of silently producing
+    a sandbox where git does not work."""
+    main = tmp_path / "repo"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "--allow-empty", "-m", "base"],
+                   check=True, env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True)
+    assert (wt / ".git").is_file()
+
+    _bwrap_prefix(wt)
+    assert "linked worktree" in capsys.readouterr().err
+
+
+def test_bwrap_usable_does_not_cache_failure(monkeypatch):
+    """A transient probe failure must not permanently disable the sandbox."""
+    import lanegate.executor as ex
+    monkeypatch.setattr(ex, "_bwrap_usable_ok", None)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        rc = 1 if len(calls) == 1 else 0
+        return subprocess.CompletedProcess(cmd, rc)
+
+    monkeypatch.setattr(ex.subprocess, "run", fake_run)
+    assert ex._bwrap_usable() is False   # transient failure
+    assert ex._bwrap_usable() is True    # re-probed, now succeeds
+    assert ex._bwrap_usable() is True    # success cached, no 3rd probe
+    assert len(calls) == 2
+
+
+def test_bwrap_child_cannot_read_home_or_general_etc(tmp_path):
+    if shutil.which("bwrap") is None:
+        pytest.skip("bwrap is not installed")
+
+    config_dir = tmp_path / ".claude"
+    config_dir.mkdir()
+    with tempfile.TemporaryDirectory(dir=Path.home()) as temporary_home:
+        sentinel = Path(temporary_home) / "sentinel"
+        sentinel.write_text("private")
+        worktree = Path(temporary_home) / "worktree"
+        worktree.mkdir()
+        result = subprocess.run(
+            _bwrap_prefix(worktree, config_dir)
+            + [
+                "/bin/sh", "-c",
+                'test -w "$1" && test -w /tmp && test ! -e "$HOME/sentinel" && test ! -e /etc/shadow',
+                "sh", str(worktree),
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, HOME=temporary_home),
+            check=False,
+        )
+    if result.returncode and (
+        "Operation not permitted" in result.stderr or "setting up uid map: Permission denied" in result.stderr
+    ):
+        pytest.skip("kernel does not permit unprivileged bwrap namespaces")
+    assert result.returncode == 0, result.stderr
+
+
+def test_seatbelt_prefix_uses_read_whitelist_and_allows_worktree_writes(tmp_path):
+    config_dir = tmp_path / ".claude-a"
+    prefix = _seatbelt_prefix(tmp_path, config_dir)
+    assert prefix[:2] == ["sandbox-exec", "-p"]
+    assert prefix[-1] == "--"
+    profile = prefix[2]
+    assert "(deny default)" in profile
+    assert f'(subpath "{tmp_path}")' in profile
+    assert f'(subpath "{config_dir}")' in profile
+    assert str(Path.home()) not in profile
+    assert '(subpath "/private/tmp")' in profile
+
+
+@pytest.mark.parametrize(
+    ("system", "tool", "expected_binary"),
+    [("Linux", "bwrap", "bwrap"), ("Darwin", "sandbox-exec", "sandbox-exec")],
+)
+def test_sandbox_prefix_selects_platform_tool(tmp_path, monkeypatch, system, tool, expected_binary):
+    monkeypatch.setattr("lanegate.executor.platform.system", lambda: system)
+    monkeypatch.setattr("lanegate.executor.shutil.which", lambda name: name if name == tool else None)
+    monkeypatch.setattr("lanegate.executor._bwrap_usable", lambda: True)
+    assert _sandbox_prefix(tmp_path)[0] == expected_binary
+
+
+def test_sandbox_prefix_falls_back_when_bwrap_cannot_make_namespaces(tmp_path, monkeypatch, capsys):
+    """bwrap present but unprivileged user namespaces disabled -> no silent
+    broken sandbox: warn and run without isolation."""
+    monkeypatch.setattr("lanegate.executor.platform.system", lambda: "Linux")
+    monkeypatch.setattr("lanegate.executor.shutil.which", lambda name: "bwrap" if name == "bwrap" else None)
+    monkeypatch.setattr("lanegate.executor._bwrap_usable", lambda: False)
+    assert _sandbox_prefix(tmp_path) == []
+    assert "unprivileged namespaces unavailable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("system", "available_tool", "warning"),
+    [
+        ("Linux", None, "'bwrap' not found"),
+        ("Darwin", None, "'sandbox-exec' not found"),
+        ("Windows", None, "unsupported platform: Windows"),
+    ],
+)
+def test_sandbox_prefix_unavailable_or_unsupported_warns_and_falls_back(
+    tmp_path, monkeypatch, capsys, system, available_tool, warning
+):
+    monkeypatch.setattr("lanegate.executor.platform.system", lambda: system)
+    monkeypatch.setattr("lanegate.executor.shutil.which", lambda name: available_tool)
+    assert _sandbox_prefix(tmp_path) == []
+    assert warning in capsys.readouterr().err
+
+
+def test_build_executor_cmd_sandbox_worktree_prepends_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr("lanegate.executor.platform.system", lambda: "Linux")
+    monkeypatch.setattr("lanegate.executor.shutil.which", lambda name: name)
+    monkeypatch.setattr("lanegate.executor._bwrap_usable", lambda: True)
+    cfg = {"executors": {"claude": {"sandbox": "worktree"}}}
+    cmd = build_executor_cmd("claude", "do the thing", cfg, worktree_path=tmp_path)
+    assert cmd[:3] == ["bwrap", "--unshare-user", "--unshare-pid"]
+    assert ["--ro-bind", "/", "/"] not in [cmd[i:i + 3] for i in range(len(cmd) - 2)]
+    assert cmd[cmd.index("--") + 1] == "claude"
+
+
+def test_build_executor_cmd_without_sandbox_keeps_claude_binary_first(tmp_path):
+    cmd = build_executor_cmd("claude", "do the thing", {"executors": {"claude": {}}}, worktree_path=tmp_path)
+    assert cmd[0] == "claude"
+
+
+def test_build_executor_cmd_openhands_uses_v1_headless_task_invocation():
+    cfg = {
+        "executors": {
+            "openhands": {
+                "bin": "custom-openhands",
+                "flags": ["--override-with-envs", "false"],
+            }
+        }
+    }
+
+    cmd = build_executor_cmd("openhands", "fix the task", cfg, model="ignored-model")
+
+    assert cmd == [
+        "custom-openhands",
+        "--override-with-envs",
+        "false",
+        "--headless",
+        "--json",
+        "-t",
+        "fix the task",
+        "--always-approve",
+    ]
+    assert "run" not in cmd
+    assert "--model" not in cmd
+
+
 @pytest.mark.parametrize("executor_type", ["claude", "claude-process", "claude-subagent"])
 def test_build_executor_cmd_stdin_omits_claude_prompt(executor_type):
     cmd = build_executor_cmd(executor_type, "very secret prompt", {}, use_stdin=True)
@@ -163,14 +405,19 @@ def test_build_executor_cmd_stdin_uses_codex_sentinel():
 
 
 def test_build_executor_cmd_stdin_omits_ollama_prompt():
-    assert build_executor_cmd("ollama", "prompt", {}, use_stdin=True) == ["ollama", "run", "llama3"]
+    assert build_executor_cmd("ollama", "prompt", {}, use_stdin=True) == [
+        "ollama",
+        "run",
+        "llama3",
+        "--nowordwrap",
+    ]
 
 
 def test_build_executor_cmd_ollama_flags_land_after_run():
     """ollama's `run` subcommand flags (e.g. --think=false) are only parsed
     correctly after `run <model>` -- before it, ollama misparses the model
     name and tries a registry pull instead."""
-    cfg = {"executors": {"ollama": {"flags": ["--nowordwrap", "--think=false"]}}}
+    cfg = {"executors": {"ollama": {"flags": ["--think=false"]}}}
     cmd = build_executor_cmd("ollama", "prompt", cfg, model="qwen3:27b", use_stdin=True)
     assert cmd == ["ollama", "run", "qwen3:27b", "--nowordwrap", "--think=false"]
 
@@ -370,6 +617,22 @@ def test_build_executor_cmd_agy_print_timeout(monkeypatch):
     assert configured_cmd[configured_cmd.index("--print-timeout") + 1] == "120s"
 
 
+def test_build_executor_cmd_kiro_uses_headless_trusted_json_stream(monkeypatch):
+    monkeypatch.setattr(
+        "lanegate.executor.shutil.which",
+        lambda bin_name: "/usr/local/bin/kiro-cli" if bin_name == "kiro-cli" else None,
+    )
+
+    cmd = build_executor_cmd("kiro", "do the thing", {"executors": {}}, model="ignored")
+
+    assert cmd == [
+        "/usr/local/bin/kiro-cli", "chat", "--agent-engine", "v3",
+        "--no-interactive", "--trust-all-tools", "--output-format", "stream-json",
+        "do the thing",
+    ]
+    assert "--model" not in cmd
+
+
 def test_aider_missing_no_gitignore_warns_on_real_dispatch(tmp_path, monkeypatch, capsys):
     """Aider silently modifies .gitignore unless told not to, which
     LaneGate's own scope-drift check then flags as an unexpected committed
@@ -523,29 +786,51 @@ def test_build_executor_cmd_aider_repo_map_invalid_map_tokens_raises_config_erro
         )
 
 
-def test_build_executor_cmd_aider_repo_map_large_touch_file_still_budgeted(tmp_path, monkeypatch):
-    # Even in repo_map mode, large.py is never passed positionally (asserted
-    # elsewhere), but Aider's own --yes-always-confirmed filename-mention scan
-    # of the prompt still injects its full content at runtime, so the preflight
-    # budget must still reject it rather than treating it as "not injected".
+def test_aider_context_preflight_skips_when_repo_map_enabled(tmp_path, monkeypatch):
+    # Repo-map mode lets Aider read ticket files on demand, so a touch larger
+    # than the configured eager-preload budget must still reach the subprocess.
     (tmp_path / "large.py").write_text("x" * 90_000)
     cfg = {
         "executors": {
-            # This is deliberately far below the ~30k tokens the selected
-            # file would consume, while remaining above Aider's fixed 8,192
-            # token overhead reserve.
             "aider": {"repo_map": True, "context_window_tokens": 9_000},
         }
     }
+    calls = []
 
-    with pytest.raises(ConfigError, match="exceeded executors.aider.context_window_tokens"):
-        build_executor_cmd(
-            "aider",
-            "implement this",
-            cfg,
-            touches=["large.py"],
-            worktree_path=tmp_path,
-        )
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout="Commit abc", stderr="")
+
+    monkeypatch.setattr("lanegate.executor.subprocess.run", fake_run)
+
+    result = dispatch_executor(
+        "aider", "implement this", cfg, cwd=tmp_path, touches=["large.py"]
+    )
+
+    assert result.returncode == 0
+    aider_calls = [cmd for cmd, _ in calls if cmd[0] == "aider"]
+    assert len(aider_calls) == 1
+    assert "--map-tokens" in aider_calls[0]
+
+
+def test_aider_context_preflight_skips_for_legacy_lazy_context_alias(tmp_path, monkeypatch):
+    """`lazy_context: true` is the documented legacy alias for `repo_map: true`
+    and must skip the eager-preload preflight the same way (TICK-720)."""
+    (tmp_path / "large.py").write_text("x" * 90_000)
+    cfg = {"executors": {"aider": {"lazy_context": True, "context_window_tokens": 9_000}}}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Commit abc", stderr="")
+
+    monkeypatch.setattr("lanegate.executor.subprocess.run", fake_run)
+    result = dispatch_executor("aider", "implement this", cfg, cwd=tmp_path, touches=["large.py"])
+
+    assert result.returncode == 0
+    aider_calls = [cmd for cmd in calls if cmd[0] == "aider"]
+    assert len(aider_calls) == 1
+    assert "--map-tokens" in aider_calls[0]
 
 
 def test_aider_context_budget_is_opt_in(tmp_path, monkeypatch):
@@ -728,21 +1013,44 @@ def test_build_executor_cmd_aider_dynamic_format_neutralize_override(tmp_path, m
 
 
 @pytest.mark.parametrize(
-    "executor_type,flag,flag_value",
+    "executor_type,flag,flag_value,should_be_present",
     [
-        ("aider", "--dry-run", None),
-        ("codex", "--sandbox", "read-only"),
-        ("agy", "--mode", "plan"),
+        ("aider", "--dry-run", None, True),
+        ("codex", "--sandbox", "read-only", True),
+        ("agy", "--mode", "plan", True),
+        ("cursor", "--mode", "ask", True),
+        ("kiro", "--trust-tools=fs_read,file_search,grep", None, True),
     ],
 )
-def test_build_executor_cmd_readonly_injects_flag(tmp_path, monkeypatch, executor_type, flag, flag_value):
+def test_build_executor_cmd_readonly_injects_flag(
+    tmp_path, monkeypatch, executor_type, flag, flag_value, should_be_present
+):
     monkeypatch.chdir(tmp_path)
 
     cmd = build_executor_cmd(executor_type, "analyze this", {}, read_only=True)
 
-    assert flag in cmd
-    if flag_value is not None:
+    assert (flag in cmd) is should_be_present
+    if should_be_present and flag_value is not None:
         assert cmd[cmd.index(flag) + 1] == flag_value
+    if executor_type == "kiro":
+        assert "--trust-all-tools" not in cmd
+
+
+@pytest.mark.parametrize(
+    "executor_type,write_flag",
+    [
+        ("cursor", "--force"),
+        ("openhands", "--always-approve"),
+    ],
+)
+def test_build_executor_cmd_readonly_drops_write_flag(tmp_path, monkeypatch, executor_type, write_flag):
+    """read_only (analyze) must not carry the executor's act-without-approval
+    flag — otherwise an analyze pass can edit/shell against the main checkout."""
+    monkeypatch.chdir(tmp_path)
+    ro = build_executor_cmd(executor_type, "analyze this", {}, read_only=True)
+    rw = build_executor_cmd(executor_type, "implement this", {}, read_only=False)
+    assert write_flag not in ro
+    assert write_flag in rw
 
 
 def test_build_executor_cmd_aider_readonly_forces_ask_edit_format(tmp_path, monkeypatch):
@@ -1445,6 +1753,19 @@ def test_read_cooldown_auto_clears_non_retryable_error_without_until(tmp_path):
     assert not path.exists()
 
 
+def test_read_cooldown_keeps_structured_429_despite_earlier_hard_error(tmp_path):
+    reason = (
+        "rate limit or quota interruption (executor exited 1)\n\n"
+        "Raw executor output:\n"
+        "ERROR: invalid_request_error: unknown model\n"
+        '{"error":"rate_limit","api_error_status":429}'
+    )
+    path = write_cooldown(tmp_path, "codex", reason)
+
+    assert read_cooldown(tmp_path, "codex") is not None
+    assert path.exists()
+
+
 def test_clear_cooldown_removes_file_and_reports_existence(tmp_path):
     write_cooldown(tmp_path, "claude-1", "session_limit")
     assert clear_cooldown(tmp_path, "claude-1") is True
@@ -1581,6 +1902,30 @@ def test_implement_fallback_on_expired_session():
     assert len(calls) == 2, f"expected 2 subprocess calls (with-resume + fallback), got {len(calls)}"
     assert "--resume" in calls[0], "first call should include --resume"
     assert "--resume" not in calls[1], "fallback call should NOT include --resume"
+
+
+def test_dispatch_resume_and_fresh_paths_pass_worktree_path():
+    """Both dispatch branches retain the execution worktree for command building."""
+    with (
+        mock.patch("lanegate.executor.build_executor_cmd", return_value=["claude"]) as build_cmd,
+        mock.patch(
+            "lanegate.executor.subprocess.run",
+            side_effect=[
+                mock.Mock(returncode=1, stdout="expired", stderr=""),
+                mock.Mock(returncode=0, stdout="", stderr=""),
+            ],
+        ),
+    ):
+        dispatch_executor(
+            "claude-process",
+            "implement the ticket",
+            {"executors": {}},
+            cwd="/tmp/worktree",
+            analyze_session_id="expired-session-id",
+        )
+
+    assert build_cmd.call_count == 2
+    assert all(call.kwargs["worktree_path"] == Path("/tmp/worktree") for call in build_cmd.call_args_list)
 
 
 def test_non_claude_executor_ignores_session_id():
@@ -2216,6 +2561,25 @@ def test_build_executor_cmd_agy_session_resumption():
     assert "gemini-3.6-flash-medium" in cmd
 
 
+def test_build_executor_cmd_cursor_session_resumption():
+    from lanegate.executor import build_executor_cmd, _SESSION_RESUME_TYPES
+
+    assert "cursor" in _SESSION_RESUME_TYPES
+    cmd = build_executor_cmd(
+        "cursor",
+        "do work",
+        {"executors": {}},
+        analyze_session_id="sess-789",
+    )
+    assert cmd == [
+        "cursor-agent", "--resume", "sess-789",
+        "-p", "do work", "--output-format", "json", "--force",
+    ]
+    # analyze (read-only) is the first call -- no session id yet, no --resume
+    fresh = build_executor_cmd("cursor", "analyze", {"executors": {}}, read_only=True)
+    assert "--resume" not in fresh
+
+
 def test_build_executor_cmd_codex_session_resumption():
     from lanegate.executor import build_executor_cmd
 
@@ -2389,6 +2753,91 @@ def test_parse_codex_json_result_populates_cost_usd_from_normalized_tokens():
     assert cheap_parsed["cost_usd"] < parsed["cost_usd"]
 
 
+def test_parse_cursor_json_result():
+    success = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "duration_ms": 1234, "result": "completed", "session_id": "cursor-session",
+    })
+
+    parsed = parse_cursor_json_result(success)
+
+    assert parsed == {
+        "result_text": "completed", "cost_usd": None, "duration_ms": 1234,
+        "num_turns": None, "input_tokens": None, "output_tokens": None,
+        "cache_creation_tokens": None, "cache_read_tokens": None,
+        "is_error": False, "session_id": "cursor-session",
+    }
+    assert parse_structured_result("cursor", success) == parsed
+    assert parse_cursor_json_result("") is None
+    assert parse_cursor_json_result("not json") is None
+    assert parse_cursor_json_result(json.dumps({"type": "result", "result": "missing fields"})) is None
+
+    with_usage = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "duration_ms": 1234, "result": "completed", "session_id": "cursor-session",
+        "usage": {
+            "inputTokens": 9979, "outputTokens": 1969,
+            "cacheReadTokens": 128957, "cacheWriteTokens": 0,
+        },
+    })
+
+    parsed_usage = parse_cursor_json_result(with_usage)
+
+    assert parsed_usage["input_tokens"] == 9979
+    assert parsed_usage["output_tokens"] == 1969
+    assert parsed_usage["cache_read_tokens"] == 128957
+    assert parsed_usage["cache_creation_tokens"] == 0
+    assert parsed_usage["cost_usd"] is None
+
+
+def test_parse_kiro_json_result_extracts_terminal_reply_and_session():
+    jsonl = "\n".join([
+        "not-json",
+        json.dumps({"type": "runStarted", "data": {"engine": "v3"}}),
+        json.dumps({"type": "sessionUpdate", "data": {"sessionId": "sess_123", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hi"}}}}),
+        json.dumps({"type": "sessionUpdate", "data": {"sessionId": "sess_123", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "!"}}}}),
+        json.dumps({"type": "runFinished", "data": {"sessionId": "sess_123", "status": "success", "finalText": "Hi!"}}),
+    ])
+
+    parsed = parse_kiro_json_result(jsonl)
+
+    assert parsed == {
+        "result_text": "Hi!", "cost_usd": None, "duration_ms": None,
+        "num_turns": None, "input_tokens": None, "output_tokens": None,
+        "cache_creation_tokens": None, "cache_read_tokens": None,
+        "is_error": False, "session_id": "sess_123",
+    }
+    assert parse_structured_result("kiro", jsonl) == parsed
+
+
+def test_parse_kiro_json_result_requires_run_finished():
+    event = {"type": "sessionUpdate", "data": {"sessionId": "sess_123"}}
+    assert parse_kiro_json_result(json.dumps(event)) is None
+
+
+def test_parse_kiro_json_result_marks_non_success_as_error():
+    event = {"type": "runFinished", "data": {"status": "failed", "finalText": "no"}}
+    assert parse_kiro_json_result(json.dumps(event))["is_error"] is True
+
+
+def test_kiro_subprocess_stops_after_direct_child_exits_with_pipe_open():
+    script = (
+        "import subprocess,sys; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'], "
+        "stdout=sys.stdout, stderr=sys.stderr, start_new_session=True); "
+        "print('direct-child-output', flush=True)"
+    )
+    started = time.monotonic()
+
+    result = run_executor_subprocess(
+        "kiro", [sys.executable, "-c", script], capture_output=True, text=True
+    )
+
+    assert time.monotonic() - started < 2
+    assert result.returncode == 0
+    assert result.stdout.strip() == "direct-child-output"
+
+
 def test_implement_prompt_preserves_matrix_and_preflight(tmp_path):
     from lanegate.executor import build_implement_prompt
 
@@ -2442,9 +2891,11 @@ class TestExecutorCapabilityRegistry:
         "claude-process":  {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
         "claude-subagent": {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
         "codex":           {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": False},
+        "cursor":          {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
         "aider":           {"tool_dispatch_loop": False, "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
         "ollama":          {"tool_dispatch_loop": False, "stdin_capable": True,  "streaming_capable": False, "streaming_capable_without_heartbeat": False},
         "agy":             {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+        "kiro":            {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
         "openhands":       {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
         "gemini":          {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
         "continue":        {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
@@ -2539,6 +2990,12 @@ class TestExecutorCapabilityRegistry:
         assert caps["streaming_capable"] is False
         assert caps["streaming_capable_without_heartbeat"] is False
 
+    def test_capability_flags_cursor(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["cursor"]
+        assert caps == self.EXPECTED["cursor"]
+
     def test_capability_flags_ollama(self):
         from lanegate.executor import EXECUTOR_CAPABILITIES
 
@@ -2556,6 +3013,15 @@ class TestExecutorCapabilityRegistry:
         assert caps["stdin_capable"] is False
         assert caps["streaming_capable"] is False
         assert caps["streaming_capable_without_heartbeat"] is False
+
+    def test_capability_flags_kiro(self):
+        from lanegate.executor import EXECUTOR_CAPABILITIES
+
+        caps = EXECUTOR_CAPABILITIES["kiro"]
+        assert caps["tool_dispatch_loop"] is True
+        assert caps["stdin_capable"] is False
+        assert caps["streaming_capable"] is True
+        assert caps["streaming_capable_without_heartbeat"] is True
 
     def test_capability_flags_openhands(self):
         from lanegate.executor import EXECUTOR_CAPABILITIES

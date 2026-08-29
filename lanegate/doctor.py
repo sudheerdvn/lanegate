@@ -214,7 +214,7 @@ _TOOLS: list[_Tool] = [
         binary="bwrap",
         required=False,
         category="sandbox",
-        description="Linux sandbox engine availability — current V1 executors are not wrapped",
+        description="Linux sandbox engine — opt-in worktree sandboxing for Claude subprocess executors",
         install={
             "Linux": "apt install bubblewrap",
             "Darwin": "n/a — macOS uses sandbox-exec (built-in)",
@@ -225,7 +225,7 @@ _TOOLS: list[_Tool] = [
         binary="sandbox-exec",
         required=False,
         category="sandbox",
-        description="macOS sandbox engine availability — current V1 executors are not wrapped",
+        description="macOS sandbox engine — opt-in worktree sandboxing for Claude subprocess executors",
         install={
             "Darwin": "built-in on macOS — no install needed",
             "Linux": "n/a — Linux uses bwrap",
@@ -452,7 +452,7 @@ def cmd_doctor(cfg: dict | None = None) -> int:
             print(f"         {note}")
 
     print("\n[doctor] NOTE: sandbox tool detection is availability only.")
-    print("         Current V1 executors still run as host processes; no OS sandbox is applied.")
+    print("         Claude subprocess executors use OS filesystem isolation only with sandbox: worktree.")
 
     detections = detect_test_runner_safeguards(Path(repo_root))
     if detections and not cfg.get("safeguards"):
@@ -560,6 +560,17 @@ def cmd_doctor(cfg: dict | None = None) -> int:
             print(f"         reviewer: {review_driver!r} == executor: {implement_driver!r}")
             print("         Review will silently run in combined (self-review) mode, not the")
             print("         independent review pipeline — update reviewer or executor in .lanegate.yml.")
+
+    step_routes = cfg.get("steps") or {}
+    for step, route in step_routes.items():
+        if not isinstance(route, dict) or not route.get("driver"):
+            continue
+        bare_field = "reviewer" if step == "review" else "executor"
+        bare_driver = cfg.get(bare_field)
+        if bare_driver:
+            print(f"\n[doctor] WARNING: steps.{step}.driver overrides the bare {bare_field}: field.")
+            print(f"         steps.{step}.driver: {route['driver']!r} wins; {bare_field}: {bare_driver!r} is inert for this step.")
+            print("         Remove the unused setting to make the routing intent unambiguous.")
 
     if cfg.get("pools"):
         executors_cfg = cfg.get("executors") or {}
@@ -683,5 +694,20 @@ def cmd_doctor(cfg: dict | None = None) -> int:
                     print(f"\n[doctor] WARNING: aider executor '{ex_name}' uses custom model {m!r}")
                     print("         but lacks an explicit 'edit_format' override in model_settings.")
                     print("         Aider may fall back to 'whole' format and silently drop diff-shaped edits.")
+
+    size_check = Path(repo_root) / "scripts" / "check_file_size.py"
+    if size_check.exists():
+        result = subprocess.run(
+            ["python", str(size_check), "--absolute"], cwd=repo_root, text=True, capture_output=True
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith(("WARNING:", "BLOCK:")):
+                print(f"\n[doctor] WARNING: file-size ratchet: {line}")
+        hooks = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"], cwd=repo_root, text=True, capture_output=True
+        ).stdout.strip()
+        if hooks != ".githooks":
+            print("\n[doctor] WARNING: repository Git hooks are not enabled.")
+            print("         Fix: git config core.hooksPath .githooks")
 
     return 1 if (any_required_missing or quarantined or invalid_executor_config) else 0

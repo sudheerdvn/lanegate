@@ -236,7 +236,7 @@ def _render_board_tickets(
 ) -> tuple[list, dict, list]:
     """Load and filter tickets; return (all_tickets, grouped, quarantined) for rendering."""
 
-    all_tickets, quarantined = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    all_tickets, quarantined = _load_board_tickets(cfg, tickets_dir)
     hidden_by_default = TERMINAL_STATUSES - {"failed"}
     visible = (
         all_tickets
@@ -247,6 +247,15 @@ def _render_board_tickets(
         visible = [t for t in visible if t.get("milestone") == milestone]
     grouped = group_by_status(visible)
     return all_tickets, grouped, quarantined
+
+
+def _load_board_tickets(cfg: dict, tickets_dir: Path):
+    """Load tickets after confirming this is a usable LaneGate project."""
+    if not tickets_dir.is_dir():
+        raise ConfigError(
+            "not a lanegate project — run from inside a project or `lanegate init`"
+        )
+    return load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
 
 
 def _ticket_flags(t: dict) -> str:
@@ -851,7 +860,7 @@ def cmd_next(
     tickets_dir = repo_root / cfg["tickets_dir"]
     lock_statuses = cfg["lock_statuses"]
 
-    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    tickets, _ = _load_board_tickets(cfg, tickets_dir)
     status_map = {t["id"]: t.get("status") for t in tickets}
     locked = locked_touches(tickets, lock_statuses)
 
@@ -985,7 +994,7 @@ def cmd_route(
 ) -> None:
     """Show or update which pool `ticket_id` would be routed to, and why."""
     tickets_dir = repo_root / cfg["tickets_dir"]
-    all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    all_tickets, _ = _load_board_tickets(cfg, tickets_dir)
     tid = canonical_id(ticket_id)
     ticket = None
     for t in all_tickets:
@@ -1287,7 +1296,7 @@ def _needs_attention_tickets(tickets: list[dict], cfg: dict) -> list[dict]:
 def get_blocked_queue(cfg: dict, repo_root: Path) -> dict:
     """Return the needs-human-decision queue as JSON-serializable data."""
     tickets_dir = repo_root / cfg["tickets_dir"]
-    all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    all_tickets, _ = _load_board_tickets(cfg, tickets_dir)
 
     trunk_branch = resolve_trunk_branch(cfg, repo_root)
     return {"blocked": [_needs_attention_entry(t, trunk_branch) for t in _needs_attention_tickets(all_tickets, cfg)]}
@@ -1296,7 +1305,7 @@ def get_blocked_queue(cfg: dict, repo_root: Path) -> dict:
 def cmd_blocked(cfg: dict, repo_root: Path, json_output: bool = False) -> None:
     """List tickets awaiting a human decision or intervention."""
     tickets_dir = repo_root / cfg["tickets_dir"]
-    all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    all_tickets, _ = _load_board_tickets(cfg, tickets_dir)
 
     blocked = _needs_attention_tickets(all_tickets, cfg)
 

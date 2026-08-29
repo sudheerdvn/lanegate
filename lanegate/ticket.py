@@ -136,24 +136,84 @@ _NON_RATE_LIMIT_HARD_ERROR_PATTERNS = (
 )
 
 
+def _has_structured_rate_limit(text: str) -> bool:
+    """Return whether *text* includes an executor ``api_error_status`` 429."""
+    for line in text.splitlines():
+        line = line.strip()
+        if "api_error_status" not in line:
+            continue
+        try:
+            data = json.loads(line)
+            if isinstance(data, dict) and data.get("api_error_status") in (429, "429"):
+                return True
+        except Exception:
+            if re.search(r'"api_error_status"\s*:\s*429\b', line):
+                return True
+    return False
+
+
 def _has_non_rate_limit_hard_error(text: str) -> bool:
-    """Return whether a rate-limit-looking hibernation is actually fatal."""
+    """Return whether a rate-limit-looking result is fatal rather than a 429.
+
+    An executor's structured HTTP status is authoritative even if its
+    transcript also includes stale setup-error output from an earlier attempt.
+    """
+    if _has_structured_rate_limit(text):
+        return False
     lowered = text.lower()
     return any(re.search(pattern, lowered) for pattern in _NON_RATE_LIMIT_HARD_ERROR_PATTERNS)
+
+
+def _is_resumable_rate_limit(
+    text: str, *, rate_limit_detected: bool, structured_short_circuit: bool = True
+) -> bool:
+    """Whether a detected rate-limit result should enter the retry path.
+
+    ``structured_short_circuit`` (default True, for live executor transcripts):
+    a structured provider 429 alone is sufficient, taking precedence over
+    textual hard-error fragments. The persisted-ticket classifier passes False
+    — there the caller's marker signal is authoritative, so a stray 429 line
+    embedded in a multi-line error snippet (which lanegate writes into the
+    reason section without the marker) does not on its own make a hibernation
+    look rate-limited.
+    """
+    if structured_short_circuit and _has_structured_rate_limit(text):
+        return True
+    return rate_limit_detected and not _has_non_rate_limit_hard_error(text)
 
 
 def _active_rate_limit_hibernation(ticket: dict) -> bool:
     """Whether resume-watch, rather than a human, should resume this hibernation.
 
-    The rate-limit marker can land in the ticket body (## Hibernation Reason)
+    The rate-limit marker can land in the ticket body's current reason section
     or, for a hibernated review_pending ticket, in the review_pending_reason
     frontmatter field instead — both must be checked or such tickets get
-    misclassified as needing a human.
+    misclassified as needing a human. A current Needs Review Reason takes
+    precedence over an older Hibernation Reason retained in the body history.
     """
-    text = "\n".join(
-        part for part in (ticket.get("_body") or "", ticket.get("review_pending_reason") or "") if part
+    body = ticket.get("_body") or ""
+    status = ticket.get("status")
+    needs_review_reason = _body_section(ticket, "## Needs Review Reason")
+    hibernation_reason = _body_section(ticket, "## Hibernation Reason")
+
+    if status == "needs_review" and needs_review_reason:
+        body_reason = needs_review_reason
+    elif hibernation_reason:
+        body_reason = hibernation_reason
+    else:
+        # Preserve compatibility with pre-section tickets and executor
+        # transcripts passed directly to this helper.
+        body_reason = body
+
+    parts = [body_reason]
+    if status == "hibernated" and ticket.get("review_pending_reason"):
+        parts.append(ticket["review_pending_reason"])
+    text = "\n".join(parts)
+    return _is_resumable_rate_limit(
+        text,
+        rate_limit_detected=_RATE_LIMIT_MARKER in text,
+        structured_short_circuit=False,
     )
-    return _RATE_LIMIT_MARKER in text and not _has_non_rate_limit_hard_error(text)
 
 
 def _active_reviewer_cooldown_hibernation(ticket: dict) -> bool:
@@ -745,12 +805,10 @@ def collect_cross_ticket_change_notes(
     merged/done tickets recorded (via change_notes) about files *ticket* also
     touches.
 
-    This is the git-tracked replacement for the old per-file
-    ``.lanegate/notes/<flat_path>.md`` mechanism (dead: written only in the
-    ticket's own worktree, never at the repo_root the reader used, and
-    gitignored besides). change_notes lives in ticket frontmatter, which is
-    git-tracked and survives worktree merges, so cross-ticket lookup over it
-    works from any repo_root without extra plumbing.
+    This is a supplemental git-tracked source alongside the shared durable
+    notes store. change_notes lives in ticket frontmatter and survives
+    worktree merges, so cross-ticket lookup over it works from any repo_root
+    without extra plumbing.
 
     Returns "" when there is nothing relevant to surface.
     """

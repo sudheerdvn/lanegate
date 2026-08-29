@@ -1227,6 +1227,57 @@ class TestRunReviewAgentDriverDispatch:
         cooldown = json.loads((tmp_path / ".lanegate" / "executors" / "claude-a.cooldown").read_text())
         assert cooldown["until"].startswith("2026-08-07T13:00:00")
 
+    def test_rate_limited_review_persists_only_clean_summary_and_audits_raw_output(self, tmp_path):
+        """Verbose CLI envelopes remain audit evidence, not ticket transcript text."""
+        from lanegate.ticket import parse_ticket
+
+        tickets = tmp_path / "tickets"
+        tickets.mkdir()
+        path = tickets / "TICK-430.md"
+        path.write_text(
+            "---\nid: TICK-430\ntitle: Verbose rate limit\nstatus: code_complete\ntouches: [foo.py]\n---\nBody.\n"
+        )
+        ticket = parse_ticket(path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        cfg = {
+            "ticket_prefix": "TICK", "tickets_dir": "tickets", "worktrees_dir": "worktrees",
+            "executor": "claude-a", "commit_status_changes": False,
+            "executors": {"claude-a": {"type": "claude-process"}},
+            "pools": {"default": {"executors": ["claude-a"]}}, "default_pool": "default",
+        }
+        envelope = json.dumps(
+            {
+                "type": "error",
+                "session_id": "session-should-only-appear-in-audit",
+                "api_error_status": 429,
+                "usage": {"input_tokens": 98765, "output_tokens": 4321, "cost_usd": 12.34},
+                "content": [{"type": "text", "text": "x" * 4096}],
+                "error": {"type": "rate_limit_error", "message": "Weekly usage limit reached."},
+            }
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "log"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 1, stdout=envelope, stderr="")
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", return_value="diff --git a/foo.py"),
+            patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run),
+        ):
+            assert run_review_agent(ticket, tmp_path, worktree_path=worktree, cfg=cfg) is False
+
+        persisted = path.read_text()
+        assert "## Review Pending" in persisted
+        assert "rate_limit_error: Weekly usage limit reached." in persisted
+        assert envelope not in persisted
+        assert "session-should-only-appear-in-audit" not in persisted
+        assert '"usage"' not in persisted
+        assert '"content"' not in persisted
+        captured = next((tmp_path / ".lanegate" / "executor-runs" / "TICK-430").glob("*/captured-output.txt"))
+        assert envelope in captured.read_text()
+
     def test_review_unwraps_json_envelope_for_named_claude_instance(self, tmp_path):
         """A named executor instance (e.g. "claude-a") of type claude-process
         must still have its --output-format json envelope unwrapped before the

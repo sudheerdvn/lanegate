@@ -197,10 +197,7 @@ def _underfilled_batch_reason(
     candidates.sort(
         key=lambda x: (x.get("priority", 99), 0 if x.get("status") == "hibernated" else 1)
     )
-    if len(candidates) <= len(batch):
-        return f"only {len(batch)} eligible ticket(s) available for cap {max_parallel}"
-
-    top = candidates[0]
+    top = candidates[0] if candidates else None
     selected_ids = {t["id"] for t in batch}
     skipped_reasons: list[str] = []
     for candidate in open_tickets:
@@ -247,20 +244,23 @@ def _underfilled_batch_reason(
             )
             continue
 
-        if not top.get("parallel_safe"):
+        if top is not None and not top.get("parallel_safe"):
             skipped_reasons.append(f"{candidate_id} held because {top['id']} is serial")
             continue
 
     if skipped_reasons:
         prefix = (
             f"selected {top['id']} has parallel_safe=false"
-            if not top.get("parallel_safe")
+            if top is not None and not top.get("parallel_safe")
             else f"only {len(batch)} compatible ticket(s) available for cap {max_parallel}"
         )
         return f"{prefix}; skipped peers: {'; '.join(skipped_reasons[:3])}"
 
-    if not top.get("parallel_safe"):
+    if top is not None and not top.get("parallel_safe"):
         return f"selected {top['id']} has parallel_safe=false"
+
+    if len(candidates) <= len(batch):
+        return f"only {len(batch)} eligible ticket(s) available for cap {max_parallel}"
 
     return f"only {len(batch)} compatible ticket(s) available for cap {max_parallel}"
 

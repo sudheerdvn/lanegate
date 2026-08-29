@@ -139,6 +139,8 @@ def cmd_create(
     milestone: str | None = None,
     title: str | None = None,
     autonomy: str | None = None,
+    touches: list[str] | None = None,
+    depends_on: list[str] | None = None,
 ) -> str:
     """Write a draft ticket for the given intent. Returns the new ticket id.
 
@@ -151,7 +153,9 @@ def cmd_create(
         title: explicit board title. When None, derive a concise title from
                the intent for backwards compatibility.
         autonomy: per-ticket autonomy override. When None, use the project
-                  default (or ``supervised`` when it is not configured).
+                   default (or ``supervised`` when it is not configured).
+        touches: files this draft ticket is allowed to modify.
+        depends_on: ticket IDs which must complete before this ticket starts.
     """
     prefix = cfg["ticket_prefix"]
     tickets_dir = repo_root / cfg["tickets_dir"]
@@ -222,15 +226,23 @@ def cmd_create(
                 "title": title.strip() if title is not None else _derive_title(intent),
                 "status": "draft",
                 "priority": 5,
-                "touches": [],
+                "touches": list(touches or []),
                 "parallel_safe": True,
                 # Keep the per-ticket field explicit, but seed it from the
                 # project policy so a configured `autonomy: full` also applies to
                 # tickets created later.  Existing configs retain supervised mode.
                 "autonomy": autonomy if autonomy is not None else cfg.get("autonomy", "supervised"),
                 "_path": path,
-                "_body": f"## Background\n{intent}",
+                "_body": (
+                    f"## Background\n{intent}\n\n"
+                    "## Acceptance Criteria\n"
+                    "- [ ] \n\n"
+                    "## Non-Goals\n\n"
+                    "## Technical Notes & Invariants\n"
+                ),
             }
+            if depends_on:
+                ticket["depends_on"] = list(depends_on)
             if resolved_milestone:
                 ticket["milestone"] = resolved_milestone
 

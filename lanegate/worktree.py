@@ -82,6 +82,26 @@ def _worktree_is_detached(path: Path) -> bool:
     return head.returncode == 0 and head.stdout.strip() == "HEAD"
 
 
+def _assert_worktree_branch(path: Path, expected_branch: str) -> None:
+    """Assert that *path* is checked out on *expected_branch* (refs/heads/<expected_branch>)."""
+    res = _run(["git", "symbolic-ref", "HEAD"], path)
+    expected_ref = (
+        expected_branch
+        if expected_branch.startswith("refs/heads/")
+        else f"refs/heads/{expected_branch}"
+    )
+    if res.returncode != 0:
+        actual = f"detached HEAD ({res.stderr.strip()})" if res.stderr else "detached HEAD"
+        raise RuntimeError(
+            f"ERROR: Worktree at '{path}' is checked out on {actual}, expected '{expected_ref}'."
+        )
+    actual_ref = res.stdout.strip()
+    if actual_ref != expected_ref:
+        raise RuntimeError(
+            f"ERROR: Worktree at '{path}' is checked out on '{actual_ref}', expected '{expected_ref}'."
+        )
+
+
 def _ensure_graphify_symlink(repo_root: Path, path: Path) -> None:
     graphify_out = repo_root / "graphify-out"
     if not graphify_out.is_dir():
@@ -221,6 +241,7 @@ def create_worktree(
         ancestry_ok = ancestry_check is not None and ancestry_check.returncode == 0
         valid = worktree_registered and attached_expected and branch_exists and ancestry_ok
         if valid:
+            _assert_worktree_branch(path, branch)
             _ensure_graphify_symlink(repo_root, path)
             _ensure_notes_symlink(repo_root, path)
             return path
@@ -303,9 +324,13 @@ def create_worktree(
             r = _run(["git", "worktree", "add", str(path), f"refs/heads/{branch}"], repo_root)
             if r.returncode != 0:
                 raise RuntimeError(f"ERROR restoring worktree:\n{r.stderr}")
+            co = _run(["git", "checkout", branch], path)
+            if co.returncode != 0:
+                raise RuntimeError(f"ERROR checking out branch '{branch}' in worktree:\n{co.stderr}")
             signoff = _run(["git", "config", "format.signoff", "true"], path)
             if signoff.returncode != 0:
                 raise RuntimeError(f"ERROR configuring DCO sign-off in worktree:\n{signoff.stderr}")
+            _assert_worktree_branch(path, branch)
             _ensure_graphify_symlink(repo_root, path)
             _ensure_notes_symlink(repo_root, path)
             return path
@@ -334,6 +359,7 @@ def create_worktree(
     signoff = _run(["git", "config", "format.signoff", "true"], path)
     if signoff.returncode != 0:
         raise RuntimeError(f"ERROR configuring DCO sign-off in worktree:\n{signoff.stderr}")
+    _assert_worktree_branch(path, branch)
     _ensure_graphify_symlink(repo_root, path)
     _ensure_notes_symlink(repo_root, path)
     return path

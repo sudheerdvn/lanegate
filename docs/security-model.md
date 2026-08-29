@@ -33,7 +33,7 @@ LaneGate is a local coordinator for coding agents: it reads ticket files, dispat
 
 ### Threats out of scope
 
-- **Kernel-level isolation.** Agents run as the invoking user with no bwrap, seccomp, or namespace confinement.
+- **Kernel-level isolation.** By default, agents run as the invoking user with no bwrap, seccomp, or namespace confinement. An experimental `executors.<name>.sandbox: worktree` opt-in (`claude` types only) adds a Bubblewrap/Seatbelt filesystem profile, but it is not yet usable with LaneGate's linked worktrees and adds no network or syscall policy — see [Executor capabilities](executor-capabilities.md#sandbox-status-reference).
 - **Network egress control.** Agents can make outbound network connections. LaneGate does not filter or proxy them.
 - **Agent process inspection.** LaneGate checks what the agent committed to git, not what the agent's process did at the syscall level.
 - **Multi-machine ticket races.** The file-based lock is local. Two machines cloning the same repo and running orchestrate at the same time can both claim the same ticket. `check_local_not_behind_remote` reduces this window but does not close it.
@@ -100,9 +100,9 @@ Users who want per-action approval for every step, rather than either a scoped a
 
 ## Sandbox limitations
 
-LaneGate does not sandbox agents at the OS level. The following limitations are documented here so you can make an informed decision:
+By default, LaneGate does not sandbox agents at the OS level. (An experimental `sandbox: worktree` opt-in for `claude` executors adds a bwrap/Seatbelt filesystem profile — see the note at the end of this section — but it is in-development and not yet usable with linked worktrees.) The following limitations describe the default and are documented here so you can make an informed decision:
 
-**No process isolation.** Agents run as child processes of the orchestrator with full user permissions. There is no bwrap, no unshare namespace, no Docker wrapping. A misbehaving or compromised agent can read any file the user can read, write to any path the user can write, and make arbitrary network connections.
+**No process isolation by default.** Agents run as child processes of the orchestrator with full user permissions. There is no bwrap, no unshare namespace, no Docker wrapping. A misbehaving or compromised agent can read any file the user can read, write to any path the user can write, and make arbitrary network connections.
 
 **No syscall filtering.** LaneGate does not apply seccomp or AppArmor/SELinux profiles to agent subprocesses.
 
@@ -117,6 +117,8 @@ The runner/sandbox contract described in [V1.5 Interface Boundaries](v2-interfac
 Any future runner is a process-supervision boundary, not the owner of ticket lifecycle. If the runner cannot launch an executor, cannot apply a requested enforce-mode sandbox, crashes, loses logs, or reports an internal error, Python core must treat that as a runner failure. Runner failure must not mark a ticket complete, approve review, merge work, or otherwise advance or corrupt lifecycle state. The safe outcome is to preserve or pause the ticket with enough log references for recovery.
 
 Bubblewrap (bwrap) sandboxing on Linux and container-based isolation on other platforms are being explored through that optional runner boundary. No timeline is committed. This is a personal project, and the schedule depends on how stable that integration turns out to be.
+
+**Experimental in-process sandbox.** Ahead of that runner, `executors.<name>.sandbox: worktree` (for `claude` executor types only) prepends a Bubblewrap (Linux) / Seatbelt (macOS) filesystem profile that hides `$HOME` and exposes only the ticket worktree, `/tmp`, system libraries and `~/.claude`. It is **off by default and not production-ready**: it requires unprivileged user namespaces (common distros such as Ubuntu 24.04 disable them by default; LaneGate probes and falls back to no sandbox with a warning), it does not yet work with the linked `git worktree` checkouts LaneGate creates (git commands fail inside it), it only covers the filesystem (no network egress or syscall policy), and it has not been validated end-to-end. Do not rely on it as an isolation boundary yet.
 
 ---
 

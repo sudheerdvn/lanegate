@@ -383,6 +383,7 @@ class TestMaxParallel:
             verbose=False,
             pool_name=None,
             ticket_ids=None,
+            milestone_excluded_ticket_scope=False,
             _orig_out=None,
             _log_f=None,
             session_ts=None,
@@ -1201,6 +1202,25 @@ def test_underfilled_batch_reports_wildcard_selected_holder(tmp_path):
     assert reason is not None
     assert "TICK-002 conflicts on *" in reason
     assert "selected ticket(s) TICK-001" in reason
+
+
+def test_underfilled_batch_reports_pre_candidate_locked_ticket(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "in_progress", touches=["locked.py"])
+    _write_ticket(tickets_dir, "TICK-002", "open", touches=["selected.py"])
+    _write_ticket(tickets_dir, "TICK-003", "open", touches=["locked.py"])
+
+    reason = _underfilled_batch_reason(
+        cfg,
+        tmp_path,
+        [{"id": "TICK-002", "touches": ["selected.py"], "parallel_safe": True}],
+        max_parallel=2,
+    )
+
+    assert reason is not None
+    assert "TICK-003 blocked by locked touch locked.py" in reason
+    assert "only 1 eligible ticket(s)" not in reason
 
 
 def test_orchestrate_underfilled_batch_explains_serial_ticket_and_skipped_peers(

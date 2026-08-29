@@ -19,6 +19,7 @@ from lanegate.config import (
     resolve_human_escalation,
     resolve_model,
     resolve_trunk_branch,
+    validate_model_for_executor,
 )
 from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.executor import (
@@ -920,7 +921,8 @@ def run_drift_check(
         # configured as a named instance (`executors: {local-ollama: {type:
         # ollama}}`, TICK-088) is still an instance name here. Guard on the
         # resolved type or that config dispatches a raw ollama drift check.
-        resolved_drift_type = get_executor_config(drift_executor, cfg).get(
+        resolved_drift_executor_cfg = get_executor_config(drift_executor, cfg)
+        resolved_drift_type = resolved_drift_executor_cfg.get(
             "type", drift_executor
         )
         reject_ollama_for_code_step("drift_check", resolved_drift_type)
@@ -934,6 +936,16 @@ def run_drift_check(
         drift_model = drift_driver_cfg.get("model") or resolve_model(
             drift_effective_cfg, "drift_check"
         )
+        if drift_model is not None:
+            validate_model_for_executor(
+                drift_model,
+                resolved_drift_type,
+                "models.drift_check",
+                provider=(
+                    resolved_drift_executor_cfg.get("provider")
+                    or drift_driver_cfg.get("provider")
+                ),
+            )
         drift_command_cfg = _cfg_with_driver_command_overrides(
             cfg, drift_executor, drift_driver_cfg
         )

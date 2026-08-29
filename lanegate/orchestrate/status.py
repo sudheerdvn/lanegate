@@ -170,10 +170,20 @@ def format_executor_event_status(tid: str, ev: Any) -> str:
     elif ev.path:
         details.append(ev.path)
 
+    if getattr(ev, "intent", None):
+        details.append(f"intent: {ev.intent}")
+
     if ev.test_summary:
-        ts_status = ev.test_summary.get("status") or ev.test_summary.get("category")
-        if ts_status:
-            details.append(f"tests:{ts_status}")
+        summary = ev.test_summary
+        counts = []
+        if summary.get("passed") is not None:
+            counts.append(f"{summary['passed']} passed")
+        if summary.get("failed") is not None:
+            counts.append(f"{summary['failed']} failed")
+        if summary.get("errors") is not None:
+            counts.append(f"{summary['errors']} errors")
+        result = ", ".join(counts) or str(summary.get("status") or summary.get("category"))
+        details.append(f"{summary.get('category', 'tests')}: {result}")
 
     if ev.tool_category:
         details.append(ev.tool_category)

@@ -10,7 +10,9 @@ gate results) into .lanegate/executor-runs/<tid>/<session>/.
 
 from __future__ import annotations
 
+import ast
 import datetime
+import fnmatch
 import json
 import re
 import subprocess
@@ -23,6 +25,155 @@ from lanegate.timeutil import utc_now_iso as _utc_now_iso
 _ACTIVE_STATUS_FILE = "active-orchestrate.json"
 _MAX_AUDIT_FILE_BYTES = 2 * 1024 * 1024
 _MAX_AUDIT_TEXT_BYTES = 512 * 1024
+
+
+def _is_ignored_refactor_path(path: Path, repo_root: Path) -> bool:
+    """Return whether a candidate is excluded by LaneGate or Git ignores."""
+    from lanegate.analyze import _is_ignored_analysis_path
+
+    if _is_ignored_analysis_path(path, repo_root):
+        return True
+    try:
+        rel = path.relative_to(repo_root)
+    except ValueError:
+        return True
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", str(rel)],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode != 128:
+        return False
+    # Unit callers and freshly initialized project directories can have a
+    # .gitignore before they have a Git repository.  Honor its uncomplicated
+    # local patterns rather than silently scanning generated files there.
+    ignore_file = repo_root / ".gitignore"
+    try:
+        patterns = ignore_file.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    rel_text = rel.as_posix()
+    for raw in patterns:
+        pattern = raw.strip()
+        if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+            continue
+        if fnmatch.fnmatch(rel_text, pattern.rstrip("/")):
+            return True
+    return False
+
+
+def scan_oversized_python_files(
+    repo_root: Path, *, threshold: int = 500, path: Path | None = None
+) -> list[Path]:
+    """Find non-ignored Python files exceeding *threshold* physical lines."""
+    if threshold < 1:
+        raise ValueError("threshold must be a positive number of lines")
+    scan_root = (path or repo_root).resolve()
+    try:
+        scan_root.relative_to(repo_root.resolve())
+    except ValueError as exc:
+        raise ValueError("path must be inside the repository") from exc
+    candidates = [scan_root] if scan_root.is_file() else scan_root.rglob("*.py")
+    oversized: list[Path] = []
+    for candidate in sorted(candidates):
+        if candidate.suffix != ".py" or _is_ignored_refactor_path(candidate, repo_root):
+            continue
+        try:
+            if sum(1 for _ in candidate.open(encoding="utf-8")) > threshold:
+                oversized.append(candidate)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return oversized
+
+
+def cluster_top_level_definitions(path: Path) -> list[str]:
+    """Return extractable top-level class/function names in source order.
+
+    A single cluster is emitted per source file so its extraction ticket can
+    create one coherent destination module while the dependent ticket owns all
+    edits to the original module.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _destination_module(source: Path) -> Path:
+    """Choose a deterministic, non-existing sibling for extracted symbols."""
+    candidate = source.with_name(f"{source.stem}_extracted.py")
+    serial = 2
+    while candidate.exists():
+        candidate = source.with_name(f"{source.stem}_extracted_{serial}.py")
+        serial += 1
+    return candidate
+
+
+def cmd_audit_refactor(
+    cfg: dict,
+    repo_root: Path,
+    *,
+    threshold: int = 500,
+    milestone: str | None = None,
+    path: Path | None = None,
+    target: Path | None = None,
+) -> list[tuple[str, str]]:
+    """Emit draft extraction/wiring ticket pairs for oversized Python files."""
+    from lanegate.create import cmd_create
+
+    if target is not None:
+        target = target.resolve()
+        try:
+            target.relative_to(repo_root.resolve())
+        except ValueError as exc:
+            raise ValueError("file must be inside the repository") from exc
+        sources = [target]
+    else:
+        sources = scan_oversized_python_files(repo_root, threshold=threshold, path=path)
+
+    emitted: list[tuple[str, str]] = []
+    for source in sources:
+        if not source.is_file() or source.suffix != ".py":
+            raise ValueError(f"decompose target must be an existing Python file: {source}")
+        symbols = cluster_top_level_definitions(source)
+        if not symbols:
+            continue
+        source_rel = source.relative_to(repo_root).as_posix()
+        destination_rel = _destination_module(source).relative_to(repo_root).as_posix()
+        symbol_list = ", ".join(symbols)
+        extraction_id = cmd_create(
+            f"Create `{destination_rel}` and move these top-level declarations from "
+            f"`{source_rel}` into it in isolation: {symbol_list}. Do not modify "
+            f"`{source_rel}` in this ticket.",
+            cfg,
+            repo_root,
+            milestone=milestone,
+            title=f"Extract {source.name} declarations into {Path(destination_rel).name}",
+            touches=[destination_rel],
+        )
+        wiring_id = cmd_create(
+            f"After {extraction_id} is complete, remove the extracted declarations "
+            f"from `{source_rel}` and import or delegate to `{destination_rel}`. "
+            "Preserve the original module's public API.",
+            cfg,
+            repo_root,
+            milestone=milestone,
+            title=f"Wire {source.name} to {Path(destination_rel).name}",
+            touches=[source_rel],
+            depends_on=[extraction_id],
+        )
+        emitted.append((extraction_id, wiring_id))
+
+    print(f"Generated {len(emitted)} refactor ticket pair(s).")
+    return emitted
 
 # ---------------------------------------------------------------------------
 # Tee logging

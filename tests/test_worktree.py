@@ -726,3 +726,34 @@ def test_create_worktree_refuses_to_replace_protected_stale_worktree(tmp_path):
         capture_output=True,
         text=True,
     ).stdout.strip() == "production"
+
+
+def test_checkout_correct_branch_passes(tmp_path):
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    worktrees_dir = repo_root / ".lanegate" / "worktrees"
+
+    wt_path = create_worktree(repo_root, worktrees_dir, "TICK-704", "tick-704", base="main")
+    assert wt_path.exists()
+    head_ref = subprocess.run(
+        ["git", "symbolic-ref", "HEAD"], cwd=wt_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert head_ref == "refs/heads/tick-704"
+
+
+def test_checkout_asserts_branch_match(tmp_path):
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    worktrees_dir = repo_root / ".lanegate" / "worktrees"
+
+    real_run = _run
+
+    def mock_run(args, cwd):
+        if args == ["git", "symbolic-ref", "HEAD"]:
+            return subprocess.CompletedProcess(args, 0, stdout="refs/heads/test-branch-123\n", stderr="")
+        return real_run(args, cwd)
+
+    with patch("lanegate.worktree._run", side_effect=mock_run):
+        with pytest.raises(RuntimeError, match="refs/heads/test-branch-123"):
+            create_worktree(repo_root, worktrees_dir, "TICK-704", "tick-704", base="main")
+

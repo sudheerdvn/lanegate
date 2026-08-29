@@ -14,6 +14,7 @@ from lanegate.executor_events import (
     redact_text,
     redact_transcript_text,
 )
+from lanegate.orchestrate.status import format_executor_event_status
 
 
 def test_redaction_secrets_and_size_limits():
@@ -104,13 +105,14 @@ def test_claude_normalization():
     # Bash test tool
     claude_bash = {
         "type": "content_block_start",
-        "content_block": {"type": "tool_use", "name": "Bash", "input": {"command": "pytest tests/"}},
+        "content_block": {"type": "tool_use", "name": "Bash", "input": {"command": "pytest tests/", "description": "Run focused regression tests"}},
     }
     ev = normalize_claude_event(claude_bash, executor="claude")
     assert ev is not None
     assert ev.phase == "testing"
     assert ev.activity == "testing"
     assert ev.tool_category == "pytest"
+    assert ev.intent == "Run focused regression tests"
     assert ev.test_summary == {"category": "pytest", "status": "running"}
 
     # Result
@@ -133,6 +135,62 @@ def test_claude_normalization():
     assert ev is not None
     assert ev.phase == "reviewing"
     assert ev.activity == "writing_file"
+
+    # Claude emits each command's return value as a user tool_result event.
+    claude_tool_result = {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "content": "Success: no issues found in 59 source files"}]},
+    }
+    ev = normalize_claude_event(claude_tool_result, executor="claude")
+    assert ev is not None
+    assert ev.phase == "testing"
+    assert ev.activity == "testing"
+    assert ev.test_summary == {"category": "test", "status": "pass"}
+    assert ev.intent == "Success: no issues found in 59 source files"
+
+
+def test_semantic_intent_and_test_results_across_executor_streams():
+    claude = normalize_claude_event(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Inspect the failed contract before editing."}]}},
+        executor="claude",
+    )
+    assert claude is not None
+    assert claude.intent == "Inspect the failed contract before editing."
+
+    agy = normalize_executor_event(
+        '{"toolAction":"Rerun mypy after reverting contract","toolSummary":"mypy: 0 errors"}',
+        executor="agy",
+    )
+    assert agy is not None
+    assert agy.intent == "Rerun mypy after reverting contract"
+    assert agy.test_summary == {"category": "mypy", "errors": 0, "status": "pass"}
+    assert "mypy: 0 errors" in format_executor_event_status("TICK-622", agy)
+
+    codex = normalize_codex_event(
+        {"type": "item.completed", "item": {"type": "command_execution", "command": "pytest -q", "description": "Verify the live ticker", "exit_code": 0}},
+        executor="codex",
+    )
+    assert codex is not None
+    assert codex.intent == "Verify the live ticker"
+    assert codex.test_summary == {"category": "pytest", "status": "pass"}
+
+    aider = normalize_executor_event("pytest: 59 passed", executor="aider")
+    assert aider is not None
+    assert aider.intent == "pytest: 59 passed"
+    assert aider.test_summary == {"category": "pytest", "passed": 59, "status": "pass"}
+
+    ticker = format_executor_event_status("TICK-622", aider)
+    assert "intent: pytest: 59 passed" in ticker
+    assert "pytest: 59 passed" in ticker
+
+
+def test_semantic_intent_is_redacted_and_bounded():
+    ev = normalize_claude_event(
+        {"type": "tool_use", "name": "Bash", "input": {"command": "pytest", "description": "token=supersecret " + "x" * 200}},
+    )
+    assert ev is not None
+    assert "supersecret" not in ev.intent
+    assert len(ev.intent) <= 160
 
 
 def test_codex_normalization():
@@ -171,6 +229,7 @@ def test_malformed_events():
     assert normalize_executor_event("12345") is None
     assert normalize_executor_event("{}") is None
     assert normalize_executor_event('{"type": "unknown_type_xyz"}') is not None
+    assert normalize_claude_event({"type": "user", "message": {"content": [{"type": "tool_result", "content": None}]}}) is None
 
 
 def test_fallback_behavior_and_stall_detection():

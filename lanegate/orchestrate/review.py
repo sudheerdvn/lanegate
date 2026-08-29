@@ -61,6 +61,55 @@ from .run_report import (
 
 
 _JSON_KEY_PATTERN = re.compile(r'^"(?:\\.|[^\"])*"\s*:')
+_MAX_PERSISTED_FAILURE_SUMMARY = 480
+
+
+def _executor_failure_summary(reason: str) -> str:
+    """Return a bounded, ticket-safe summary of an executor failure.
+
+    Executor CLIs can put a full structured response (including session and
+    usage metadata) in stdout/stderr.  That response belongs in the captured
+    audit bundle, never in ticket markdown.  Prefer its error type/message;
+    retain a short plain-text failure when no structured error is available.
+    """
+    raw = str(reason or "").strip()
+    decoder = json.JSONDecoder()
+    parsed_error: tuple[str | None, str | None] | None = None
+
+    for start in (index for index, char in enumerate(raw) if char == "{"):
+        try:
+            value, _ = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        detail = value.get("error")
+        if isinstance(detail, str):
+            parsed_error = (str(value.get("type") or "error"), detail)
+        elif isinstance(detail, dict):
+            parsed_error = (
+                str(detail.get("type") or detail.get("code") or value.get("type") or "error"),
+                str(detail.get("message") or detail.get("detail") or "") or None,
+            )
+        elif value.get("message") is not None:
+            parsed_error = (
+                str(value.get("type") or value.get("code") or "error"),
+                str(value["message"]),
+            )
+        if parsed_error is not None:
+            break
+
+    if parsed_error is not None:
+        error_type, message = parsed_error
+        summary = ": ".join(part for part in (error_type, message) if part)
+    elif any(key in raw for key in ('"session_id"', '"usage"', '"content"', '"type"')):
+        summary = "Executor failed with a structured error response"
+    else:
+        summary = " ".join(raw.split()) or "Executor failed without an error message"
+
+    if len(summary) > _MAX_PERSISTED_FAILURE_SUMMARY:
+        summary = summary[: _MAX_PERSISTED_FAILURE_SUMMARY - 3].rstrip() + "..."
+    return summary
 
 
 def _escape_interior_quotes(text: str) -> str:
@@ -556,6 +605,7 @@ def _hibernate_rate_limited_review(
     independence: str,
 ) -> bool:
     """Persist a non-verdict review failure as resumable review-pending work."""
+    summary = _executor_failure_summary(reason)
     _write_review_verdict(
         bundle_path,
         {
@@ -577,7 +627,7 @@ def _hibernate_rate_limited_review(
             ticket,
             cfg,
             repo_root,
-            reason=f"Review was not performed: reviewer {driver!r} rate limited. {reason}",
+            reason=f"Review was not performed: reviewer {driver!r} rate limited. {summary}",
         )
     return False
 
@@ -929,23 +979,48 @@ def run_review_agent(
             )
         else:
             review_independence = "independent"
-    elif manual_unknown_implementer:
-        review_driver_name = resolve_pool_executor(
-            "review", ticket, cfg, repo_root, healthy_only=True, pool_name=pool_name
-        )
-        review_independence = "undetermined"
-        print(
-            f"WARNING: {tid}: implemented manually with no recorded implementer identity -- "
-            "review independence cannot be verified, proceeding as undetermined rather "
-            "than assuming independent.",
-            file=sys.stderr,
-        )
     else:
-        review_driver_name, review_independence = resolve_independent_review_driver(
-            ticket, cfg, repo_root, implementer=implementer, pool_name=pool_name
+        # Rotation is a review-dispatch route, not merely a config helper:
+        # select and persist the next reviewer before the normal pool/default
+        # route is considered.  The helper also returns a prior assignment for
+        # an in_review ticket, so a retry never advances the state mid-review.
+        from lanegate.reviewer import resolve_reviewer_rotation
+
+        # resolve_reviewer_rotation excludes the implementer from its
+        # candidates, so a returned reviewer is always independent of the
+        # code's author (or None, and we fall through to the normal ladder).
+        rotated_reviewer = resolve_reviewer_rotation(
+            ticket, cfg, repo_root / ".lanegate", implementer=implementer
         )
-        if review_independence == "reviewer_cooling_down":
-            review_retry_at = _earliest_reviewer_retry(repo_root, cfg, ticket, pool_name)
+        if rotated_reviewer:
+            review_driver_name = rotated_reviewer
+            if manual_unknown_implementer:
+                review_independence = "undetermined"
+                print(
+                    f"WARNING: {tid}: implemented manually with no recorded implementer identity -- "
+                    f"cannot verify rotated reviewer {rotated_reviewer!r} is independent of "
+                    "whoever wrote the code.",
+                    file=sys.stderr,
+                )
+            else:
+                review_independence = "independent"
+        elif manual_unknown_implementer:
+            review_driver_name = resolve_pool_executor(
+                "review", ticket, cfg, repo_root, healthy_only=True, pool_name=pool_name
+            )
+            review_independence = "undetermined"
+            print(
+                f"WARNING: {tid}: implemented manually with no recorded implementer identity -- "
+                "review independence cannot be verified, proceeding as undetermined rather "
+                "than assuming independent.",
+                file=sys.stderr,
+            )
+        else:
+            review_driver_name, review_independence = resolve_independent_review_driver(
+                ticket, cfg, repo_root, implementer=implementer, pool_name=pool_name
+            )
+            if review_independence == "reviewer_cooling_down":
+                review_retry_at = _earliest_reviewer_retry(repo_root, cfg, ticket, pool_name)
 
     if any(is_control_plane_file(f, cfg) for f in (ticket.get("touches") or [])) and review_independence in ("self", "undetermined"):
         reason = (
@@ -1010,6 +1085,8 @@ def run_review_agent(
             verdict=None,
             summary="awaiting human review",
             findings=None,
+            review_driver=review_driver_name,
+            review_independence=review_independence,
         )
         print(
             f"[orchestrate] {tid}: awaiting human review — run "
@@ -1714,7 +1791,7 @@ def _make_error_review(reason: str):
 
     from lanegate.reviewer import ReviewResult
 
-    clean_reason = reason
+    clean_reason = _executor_failure_summary(reason)
     if "Command '['" in reason or 'Command "["' in reason:
         match = re.search(r"timed out after (\d+\s*\w*)", reason)
         if match:
@@ -1745,6 +1822,7 @@ def _escalate_harness_error(
     work to do. A subprocess/configuration failure does not establish that,
     so it must release the ticket's file locks and skip the auto-fix path.
     """
+    review.notes = _executor_failure_summary(review.notes)
     if bundle_path is not None:
         _write_review_verdict(
             bundle_path,

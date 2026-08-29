@@ -412,7 +412,7 @@ class TestPlatformNA:
             cmd_doctor()
         out = capsys.readouterr().out
         assert "sandbox tool detection is availability only" in out
-        assert "no OS sandbox is applied" in out
+        assert "only with sandbox: worktree" in out
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +577,51 @@ class TestReviewerCombinedModeCollapse:
             cmd_doctor(cfg=cfg)
         out = capsys.readouterr().out
         assert "reviewer resolves identically" not in out
+
+
+@pytest.mark.parametrize(
+    ("step_driver", "bare_reviewer"),
+    [("winning-reviewer", "dead-reviewer"), ("same-driver", "same-driver")],
+)
+def test_doctor_driver_conflict_warning(capsys, step_driver, bare_reviewer):
+    all_binaries = [t.binary for t in _TOOLS]
+    cfg = {
+        "reviewer": bare_reviewer,
+        "drivers": {step_driver: {"type": "claude"}},
+        "steps": {"review": {"driver": step_driver}},
+        "executors": {},
+        "safeguards": {},
+    }
+    with (
+        patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+        patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+        patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+    ):
+        assert cmd_doctor(cfg=cfg) == 0
+    out = capsys.readouterr().out
+    assert "steps.review.driver overrides the bare reviewer: field" in out
+    assert f"{step_driver!r} wins" in out
+    assert f"{bare_reviewer!r} is inert" in out
+
+
+def test_doctor_no_driver_conflict_when_single(capsys):
+    all_binaries = [t.binary for t in _TOOLS]
+    cfgs = [
+        {"reviewer": "claude", "executors": {}, "safeguards": {}},
+        {
+            "steps": {"review": {"driver": "claude"}},
+            "executors": {},
+            "safeguards": {},
+        },
+    ]
+    with (
+        patch("shutil.which", side_effect=_which_factory(*all_binaries)),
+        patch("lanegate.doctor._get_version", return_value="(v1.0)"),
+        patch("lanegate.doctor.detect_test_runner_safeguards", return_value=[]),
+    ):
+        for cfg in cfgs:
+            assert cmd_doctor(cfg=cfg) == 0
+    assert "overrides the bare" not in capsys.readouterr().out
 
 
 class TestTopLevelExecutorPoolMismatch:
@@ -1188,3 +1233,15 @@ def test_doctor_warns_custom_aider_model_drift_check_step_resolved(tmp_path, cap
     captured = capsys.readouterr()
     assert "WARNING: aider executor 'aider' uses custom model 'ollama_chat/qwen30b'" in captured.out
     assert "lacks an explicit 'edit_format' override" in captured.out
+
+
+def test_doctor_warns_about_file_size_and_missing_hooks(tmp_path, capsys, monkeypatch):
+    script = tmp_path / "scripts" / "check_file_size.py"
+    script.parent.mkdir()
+    script.write_text("import sys; print('WARNING: lanegate/big.py: 1001 lines'); sys.exit(0)\n")
+    monkeypatch.setattr("lanegate.doctor._get_version", lambda *args, **kwargs: "(v1.0)")
+    monkeypatch.setattr("lanegate.doctor.detect_test_runner_safeguards", lambda *args: [])
+    cmd_doctor(cfg={"tickets_dir": ".lanegate/tickets"})
+    output = capsys.readouterr().out
+    assert "file-size ratchet" in output
+    assert "git config core.hooksPath .githooks" in output

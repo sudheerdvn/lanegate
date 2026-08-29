@@ -159,7 +159,7 @@ def test_ticket_lifecycle_uses_real_git_worktree_and_merge(real_lanegate_repo):
     assert (repo.root / "src" / "app.py").read_text() == 'VALUE = "implemented"\n'
     assert not worktree.exists()
     assert str(worktree) not in _worktree_paths(repo)
-    assert repo.git("merge-base", "--is-ancestor", branch, "main").returncode == 0
+    assert repo.git("rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode != 0
 
     cmd_validate(TICKET_ID, repo.cfg, repo.root)
     _assert_status(ticket_path, "validated")
@@ -206,7 +206,7 @@ def test_ticket_lifecycle_uses_configured_master_for_worktree_diff_and_merge(rea
     cmd_review("TICK-143", cfg, repo.root, verdict="approved", summary="approved")
     cmd_merge("TICK-143", cfg, repo.root)
 
-    assert repo.git("merge-base", "--is-ancestor", branch, "master").returncode == 0
+    assert repo.git("rev-parse", "--verify", f"refs/heads/{branch}", check=False).returncode != 0
     assert repo.git("rev-parse", "--verify", "main", check=False).returncode != 0
 
 

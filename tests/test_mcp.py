@@ -254,13 +254,13 @@ def test_mcp_start_does_not_record_killable_executor_pid(tmp_path, monkeypatch):
 
     cfg = _cfg()
     monkeypatch.setattr(mcp, "_cfg_and_root", lambda: (cfg, tmp_path))
-    monkeypatch.setattr(lifecycle, "check_local_not_behind_remote", lambda *_: None)
+    monkeypatch.setattr(lifecycle.core_cmds, "check_local_not_behind_remote", lambda *_: None)
     monkeypatch.setattr(
-        lifecycle,
+        lifecycle.core_cmds,
         "create_worktree",
         lambda _root, worktrees_dir, _tid, _branch, _trunk, **_kwargs: worktrees_dir / "tick-001",
     )
-    monkeypatch.setattr(lifecycle, "_commit_generated_ticket_write", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(lifecycle.core_cmds, "_commit_generated_ticket_write", lambda *_args, **_kwargs: True)
 
     kill_calls = []
     monkeypatch.setattr("lanegate.orchestrate.loop._kill_pid", lambda pid: kill_calls.append(pid) or True)

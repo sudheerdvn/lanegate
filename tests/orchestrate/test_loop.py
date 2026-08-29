@@ -10,20 +10,9 @@ import datetime
 
 from lanegate.git import GitText
 from tests.orchestrate.conftest import *  # noqa: F401,F403
+from tests._helpers.orchestrate import _write_draft_ticket
 
 
-def test_structured_429_overrides_earlier_setup_error_text():
-    """A real provider 429 must start the resume path even when the executor
-    transcript also contains an earlier setup/configuration error."""
-    from lanegate.orchestrate.loop import _is_rate_limit
-
-    assert _is_rate_limit(
-        1,
-        captured_stderr=(
-            "executor setup/configuration error: stale tool configuration\n"
-            '{"error":"rate_limit","api_error_status":429}'
-        ),
-    )
 
 
 def test_flat_note_name_injective():
@@ -36,475 +25,6 @@ def test_flat_note_name_injective():
     assert canonical_note_filename("a_/b.py") != canonical_note_filename("a/_b.py")
 
 
-class TestConflictAwareResume:
-    def test_review_pending_resume_skips_implementation(self, tmp_path):
-        """A hibernated completed ticket resumes at review, not invoke_executor."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def start_review_pending(tid, cfg_, root, **kwargs):
-            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
-
-        def approve(tid, cfg_, root, **kwargs):
-            # resume_review_pending has already restored code_complete by the
-            # time cmd_review runs -- see the regression test below for that
-            # transition in isolation.
-            text = path.read_text().replace("status: code_complete", "status: in_review")
-            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
-            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
-            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
-            patch("lanegate.orchestrate.invoke_executor") as invoke,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        invoke.assert_not_called()
-        assert parse_ticket(path)["status"] == "in_review"
-
-    def test_review_pending_conflict_recovery_reverifies_before_review(self, tmp_path):
-        """Agent-resolved rebase conflicts invalidate pre-hibernation checks."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def start_review_pending(tid, cfg_, root, **kwargs):
-            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
-
-        def approve(tid, cfg_, root, **kwargs):
-            text = path.read_text().replace("status: code_complete", "status: in_review")
-            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
-            patch("lanegate.orchestrate._run_rebase", return_value=("conflict", "### a.py")),
-            patch("lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True),
-            patch("lanegate.orchestrate.loop._git_head_sha", side_effect=["before", "after"]),
-            patch("lanegate.safeguards.run_safeguards", return_value=(True, "")) as safeguards,
-            patch("lanegate.lifecycle.cmd_review", side_effect=approve) as review,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        safeguards.assert_called_once()
-        assert safeguards.call_args.args[0] == "pre_complete"
-        assert safeguards.call_args.args[2:] == (cfg, tmp_path / "worktrees" / "tick-001")
-        review.assert_called_once()
-        assert parse_ticket(path)["pre_complete_verified_sha"] == "after"
-
-    def test_review_pending_conflict_recovery_blocks_review_when_verification_fails(self, tmp_path):
-        """A failed post-rebase safeguard must not dispatch a reviewer."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def start_review_pending(tid, cfg_, root, **kwargs):
-            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
-            patch("lanegate.orchestrate._run_rebase", return_value=("conflict", "### a.py")),
-            patch("lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True),
-            patch("lanegate.orchestrate.loop._git_head_sha", return_value="after"),
-            patch("lanegate.safeguards.run_safeguards", return_value=(False, "tests failed")) as safeguards,
-            patch("lanegate.lifecycle.cmd_review") as review,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        safeguards.assert_called_once()
-        review.assert_not_called()
-        assert parse_ticket(path)["status"] == "needs_review"
-
-    def test_review_pending_resume_full_autonomy_auto_merges_without_crash(self, tmp_path, capsys):
-        """Regression test: resuming a hibernated review-pending ticket under
-        full autonomy must reach auto_merge_approved_local_tickets and log the
-        merged outcome without an UnboundLocalError on final_ticket."""
-        cfg = _default_cfg(tmp_path)
-        cfg["autonomy"] = "full"
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def start_review_pending(tid, cfg_, root, **kwargs):
-            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
-
-        def approve(tid, cfg_, root, **kwargs):
-            text = path.read_text().replace("status: code_complete", "status: in_review")
-            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
-
-        def fake_merge(tid, cfg_, root):
-            path.write_text(path.read_text().replace("status: in_review", "status: merged"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
-            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
-            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
-            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge),
-            patch("lanegate.orchestrate.invoke_executor") as invoke,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        captured = capsys.readouterr()
-        assert "worker thread crashed" not in captured.err
-        assert "UnboundLocalError" not in captured.err
-        invoke.assert_not_called()
-        assert parse_ticket(path)["status"] == "merged"
-
-    def test_review_pending_resume_red_lane_does_not_auto_merge(self, tmp_path):
-        """A resumed review must re-scan its diff before the shared merge path."""
-        from types import SimpleNamespace
-
-        cfg = _default_cfg(tmp_path)
-        cfg["autonomy"] = "full"
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        path.write_text(path.read_text().replace("status: hibernated", "status: hibernated\nreview_pending: true"))
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def start_review_pending(tid, cfg_, root, **kwargs):
-            path.write_text(path.read_text().replace("status: hibernated", "status: in_progress"))
-
-        def approve(tid, cfg_, root, **kwargs):
-            text = path.read_text().replace("status: code_complete", "status: in_review")
-            path.write_text(text.replace("review_pending: true\n", "review_verdict: approved\n"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start", side_effect=start_review_pending),
-            patch("lanegate.orchestrate._run_rebase", return_value=("clean", "")),
-            patch("lanegate.lifecycle.cmd_review", side_effect=approve),
-            patch(
-                "lanegate.orchestrate.loop._git_text",
-                return_value=SimpleNamespace(ok=True, text="+ token = 'sk-red-lane'"),
-            ),
-            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red") as mock_scan,
-            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_scan.assert_called_once()
-        mock_merge.assert_not_called()
-        ticket = parse_ticket(path)
-        assert ticket["status"] == "needs_review"
-        assert ticket["review_verdict"] == "changes_requested"
-
-    def test_ready_to_merge_ticket_drains_before_dispatching_new_open_work(self, tmp_path):
-        """Approved in_review work must merge before the loop dispatches a new
-        open ticket -- otherwise WIP (and the touch-locks it holds) keeps
-        growing while already-finished tickets sit waiting, which is exactly
-        what produces avoidable lock contention on the rest of the board."""
-        cfg = _default_cfg(tmp_path)
-        cfg["autonomy"] = "full"
-        cfg["max_parallel"] = 1
-        tickets_dir = tmp_path / "tickets"
-        p1 = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
-        p1.write_text(p1.read_text().replace("close_criteria:", "review_verdict: approved\nclose_criteria:"))
-        _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"])
-
-        call_order = []
-
-        def fake_merge(tid, cfg_, root):
-            call_order.append(f"merge:{tid}")
-            p1.write_text(p1.read_text().replace("status: in_review", "status: merged"))
-
-        def fake_start(tid, cfg_, root, **kwargs):
-            call_order.append(f"start:{tid}")
-            # Stop right here -- this test only cares about dispatch order,
-            # not a full implement/review/merge pipeline for TICK-002. The
-            # worker exception handler downgrades this one ticket to
-            # needs_review without crashing the rest of the run.
-            raise RuntimeError("stop-here: ordering test only cares about start order")
-
-        with (
-            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge),
-            patch("lanegate.lifecycle.cmd_start", side_effect=fake_start),
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-            patch("lanegate.orchestrate.spawn_watch_daemon"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        assert call_order == ["merge:TICK-001", "start:TICK-002"]
-        assert parse_ticket(p1)["status"] == "merged"
-
-    def test_full_autonomy_holds_agent_resolved_rebase_for_human_merge(self, tmp_path, capsys):
-        """A passed review cannot auto-merge a branch whose rebase needed an agent."""
-        cfg = _default_cfg(tmp_path)
-        cfg["autonomy"] = "full"
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
-        path.write_text(
-            path.read_text().replace(
-                "close_criteria:",
-                "review_verdict: approved\nrequires_human_merge: true\n"
-                "rebase_conflict_files: [a.py]\nclose_criteria:",
-            )
-        )
-
-        with (
-            patch("lanegate.lifecycle.cmd_merge") as mock_merge,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-            patch("lanegate.orchestrate.spawn_watch_daemon"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_merge.assert_not_called()
-        assert parse_ticket(path)["status"] == "in_review"
-        assert "requires human merge approval (a.py)" in capsys.readouterr().err
-
-    def test_run_rebase_uses_real_git_rebase_main(self, tmp_path):
-        with patch(
-            "lanegate.orchestrate.subprocess.run",
-            return_value=subprocess.CompletedProcess(["git"], 0, stdout="", stderr=""),
-        ) as mock_run:
-            state, detail = _run_rebase(tmp_path, base="main")
-
-        assert state == "clean"
-        assert detail == ""
-        assert mock_run.call_args.args[0] == ["git", "rebase", "main"]
-
-    def test_format_conflict_detail_includes_only_conflict_hunks(self, tmp_path):
-        conflicted = tmp_path / "app.py"
-        conflicted.write_text(
-            "before\n"
-            "<<<<<<< HEAD\n"
-            "ours\n"
-            "=======\n"
-            "theirs\n"
-            ">>>>>>> main\n"
-            "after\n"
-        )
-
-        detail = _format_conflict_detail(tmp_path, ["app.py"])
-
-        assert "## Conflict resolution required" in detail
-        assert "### app.py" in detail
-        assert "<<<<<<< HEAD" in detail
-        assert "=======" in detail
-        assert ">>>>>>> main" in detail
-        assert "before" not in detail
-        assert "after" not in detail
-
-    def test_run_rebase_conflict_reports_hunks_not_full_diff(self, tmp_path):
-        (tmp_path / "app.py").write_text(
-            "before\n"
-            "<<<<<<< HEAD\n"
-            "ours\n"
-            "=======\n"
-            "theirs\n"
-            ">>>>>>> main\n"
-            "after\n"
-        )
-
-        def fake_run(args, **kwargs):
-            if args == ["git", "rebase", "main"]:
-                return subprocess.CompletedProcess(args, 1, stdout="", stderr="conflict")
-            if args == ["git", "diff", "--name-only", "--diff-filter=U"]:
-                return subprocess.CompletedProcess(args, 0, stdout="app.py\n", stderr="")
-            raise AssertionError(args)
-
-        with patch("lanegate.orchestrate.subprocess.run", side_effect=fake_run):
-            state, detail = _run_rebase(tmp_path, base="main")
-
-        assert state == "conflict"
-        assert "app.py" in detail
-        assert "<<<<<<< HEAD" in detail
-        assert "before" not in detail
-        assert "after" not in detail
-
-    def test_conflicted_files_returns_unmerged_paths(self, tmp_path):
-        with patch(
-            "lanegate.orchestrate.subprocess.run",
-            return_value=subprocess.CompletedProcess(
-                ["git"], 0, stdout="app.py\npkg/mod.py\n", stderr=""
-            ),
-        ):
-            assert _conflicted_files(tmp_path) == ["app.py", "pkg/mod.py"]
-
-    def test_hibernated_conflict_success_continues_rebase(self, tmp_path):
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        def fake_complete(tid, cfg_, repo_root):
-            p = tickets_dir / f"{tid}.md"
-            p.write_text(p.read_text().replace("status: hibernated", "status: code_complete"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start"),
-            patch(
-                "lanegate.orchestrate._run_rebase",
-                return_value=("conflict", "## Conflict resolution required\n\n### a.py"),
-            ),
-            patch("lanegate.orchestrate._conflicted_files", return_value=["a.py"]),
-            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch(
-                "lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=True
-            ) as mock_rebase_fix,
-            patch("lanegate.orchestrate._continue_rebase", return_value=(True, "")) as mock_continue,
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
-            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
-            patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
-            patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
-            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
-            patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
-            patch("lanegate.lifecycle.cmd_review"),
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_rebase_fix.assert_called_once()
-        assert mock_rebase_fix.call_args.args[4] == "## Conflict resolution required\n\n### a.py"
-        assert mock_rebase_fix.call_args.kwargs["pool_name"] is None
-        mock_continue.assert_not_called()
-
-    def test_hibernated_conflict_executor_failure_aborts_rebase(self, tmp_path):
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-
-        with (
-            patch("lanegate.lifecycle.cmd_start"),
-            patch(
-                "lanegate.orchestrate._run_rebase",
-                return_value=("conflict", "## Conflict resolution required\n\n### a.py"),
-            ),
-            patch("lanegate.orchestrate._conflicted_files", return_value=["a.py"]),
-            patch("lanegate.orchestrate.invoke_executor", return_value=(7, "", "")),
-            patch("lanegate.orchestrate.autofix.run_rebase_fix_agent", return_value=False),
-            patch("lanegate.orchestrate._abort_rebase") as mock_abort,
-            patch("lanegate.lifecycle.cmd_needs_review") as mock_needs_review,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_abort.assert_called_once()
-        mock_needs_review.assert_called_once()
-
-    def test_worktree_is_dirty_true_for_tracked_changes(self, tmp_path):
-        with patch(
-            "lanegate.orchestrate.subprocess.run",
-            return_value=subprocess.CompletedProcess(["git"], 0, stdout=" M foo.py\n", stderr=""),
-        ):
-            assert _worktree_is_dirty(tmp_path) is True
-
-    def test_worktree_is_dirty_false_for_untracked_only(self, tmp_path):
-        with patch(
-            "lanegate.orchestrate.subprocess.run",
-            return_value=subprocess.CompletedProcess(["git"], 0, stdout="?? new.py\n", stderr=""),
-        ):
-            assert _worktree_is_dirty(tmp_path) is False
-
-    def test_worktree_is_dirty_false_when_clean(self, tmp_path):
-        with patch(
-            "lanegate.orchestrate.subprocess.run",
-            return_value=subprocess.CompletedProcess(["git"], 0, stdout="", stderr=""),
-        ):
-            assert _worktree_is_dirty(tmp_path) is False
-
-    def test_orchestrate_hibernated_dirty_worktree(self, tmp_path):
-        """A dirty worktree from an interrupted prior run must skip the rebase
-        check and resume the executor, not force-fail into needs_review."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        captured_bodies = []
-
-        def fake_invoke(ticket, cfg_, worktree_path, **kwargs):
-            captured_bodies.append(ticket["_body"])
-            return (0, "", "")
-
-        def fake_complete(tid, cfg_, repo_root):
-            p = tickets_dir / f"{tid}.md"
-            p.write_text(p.read_text().replace("status: hibernated", "status: code_complete"))
-
-        with (
-            patch("lanegate.lifecycle.cmd_start"),
-            patch("lanegate.orchestrate._worktree_is_dirty", return_value=True) as mock_dirty,
-            patch("lanegate.orchestrate._run_rebase") as mock_rebase,
-            patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
-            patch("lanegate.orchestrate.commit_worktree_changes", return_value=(False, None)),
-            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
-            patch("lanegate.orchestrate._committed_files", return_value={"a.py"}),
-            patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
-            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
-            patch("lanegate.lifecycle.cmd_complete", side_effect=fake_complete),
-            patch("lanegate.lifecycle.cmd_review"),
-            patch("lanegate.lifecycle.cmd_needs_review") as mock_needs_review,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_dirty.assert_called_once()
-        mock_rebase.assert_not_called()
-        mock_needs_review.assert_not_called()
-        assert captured_bodies
-        assert "Resuming with pending uncommitted changes" in captured_bodies[0]
-
-    def test_ready_to_merge_red_lane_ticket_with_matching_approval_sha_skips_escalation(self, tmp_path):
-        """A red-lane ticket already approved by a human at the current HEAD sha
-        must not be re-escalated by the pre-merge risk-lane re-scan."""
-        from types import SimpleNamespace
-
-        cfg = _default_cfg(tmp_path)
-        cfg["autonomy"] = "full"
-        tickets_dir = tmp_path / "tickets"
-        path = _write_ticket(tickets_dir, "TICK-001", "in_review", touches=["a.py"])
-        path.write_text(
-            path.read_text().replace(
-                "close_criteria:",
-                "review_verdict: approved\nred_lane_approved_at_sha: deadbeef1234\nclose_criteria:",
-            )
-        )
-        (tmp_path / "worktrees" / "tick-001").mkdir()
-
-        def fake_git_text(argv, *_args, **_kwargs):
-            if argv[:2] == ["git", "diff"]:
-                return SimpleNamespace(ok=True, text="+ token = 'sk-red-lane'")
-            if argv[:3] == ["git", "rev-parse", "HEAD"]:
-                return SimpleNamespace(ok=True, text="deadbeef1234")
-            return SimpleNamespace(ok=True, text="")
-
-        def fake_merge(tid, cfg_, repo_root):
-            p = tickets_dir / f"{tid}.md"
-            p.write_text(p.read_text().replace("status: in_review", "status: merged"))
-
-        with (
-            patch(
-                "lanegate.orchestrate.loop._git_text",
-                side_effect=fake_git_text,
-            ),
-            patch("lanegate.orchestrate.loop.scan_risk_lane", return_value="red"),
-            patch("lanegate.lifecycle.cmd_merge", side_effect=fake_merge) as mock_merge,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-            patch("lanegate.orchestrate.spawn_watch_daemon"),
-        ):
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True)
-
-        mock_merge.assert_called_once()
-        ticket = parse_ticket(path)
-        assert ticket["status"] == "merged"
 
 
 # ---------------------------------------------------------------------------
@@ -1568,52 +1088,102 @@ def _pool_failure_signature_scenario(tmp_path, num_tickets):
     return cfg, tickets_dir
 
 
-class TestPoolInstanceHealthy:
-    def test_pool_instance_healthy_live_cooldown_and_recent_marker_block_instance(self, tmp_path):
-        from lanegate.executor import write_cooldown
-        from lanegate.orchestrate.loop import _pool_instance_healthy, resolve_pool_executor
-        from lanegate.ticket import _RATE_LIMIT_MARKER
 
-        cfg = _default_cfg(tmp_path)
-        cfg["pools"] = {"default": {"executors": ["codex", "claude"], "strategy": "round-robin"}}
-        tickets_dir = Path(cfg["tickets_dir"])
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        recent = datetime.datetime.now(datetime.UTC).isoformat()
-        path.write_text(
-            path.read_text()
-            .replace("status: hibernated", f"status: hibernated\nstatus_changed_at: {recent}")
-            .replace("Body.", f"## Hibernation Reason\n{_RATE_LIMIT_MARKER}\npool instance: codex")
-        )
 
-        assert _pool_instance_healthy(tmp_path, cfg, "codex") is False
-        assert resolve_pool_executor("implement", {}, cfg, tmp_path, pool_name="default") == "claude"
+def test_suspend_gap_routes_to_hibernate(tmp_path):
+    """The LaneGate-generated suspend-gap diagnostic preserves the ticket for retry."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
 
-        write_cooldown(tmp_path, "claude", "rate limit or quota interruption")
-        assert _pool_instance_healthy(tmp_path, cfg, "claude") is False
+    def fake_hibernate(tid, cfg_, repo_root, *, reason="", **kwargs):
+        path = tickets_dir / f"{tid}.md"
+        path.write_text(path.read_text().replace("status: in_progress", "status: hibernated", 1))
 
-    @pytest.mark.parametrize("status_changed_at", [None, "not-a-timestamp", "2000-01-01T00:00:00Z"])
-    def test_pool_instance_healthy_stale_or_invalid_marker_fails_open(self, tmp_path, status_changed_at):
-        from lanegate.orchestrate.loop import _pool_instance_healthy
-        from lanegate.ticket import _RATE_LIMIT_MARKER
+    # The string invoke_executor appends after a suspend_gap kill — not raw
+    # executor output. A plain executor cannot forge this by printing text.
+    suspend_gap_diag = (
+        "[orchestrate] TICK-001: dispatch terminated due to 'suspend_gap' "
+        "after 14400s (0 heartbeats received)"
+    )
+    with (
+        patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+        patch(
+            "lanegate.orchestrate.invoke_executor",
+            return_value=(124, "", suspend_gap_diag),
+        ),
+        patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+        patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate) as mock_hibernate,
+        patch("lanegate.lifecycle.cmd_fail") as mock_fail,
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, max_parallel=1, human_review="none", all_milestones=True, auto_analyze=False)
 
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = Path(cfg["tickets_dir"])
-        path = _write_ticket(tickets_dir, "TICK-001", "hibernated", touches=["a.py"])
-        timestamp = "" if status_changed_at is None else f"status_changed_at: {status_changed_at}\n"
-        path.write_text(
-            path.read_text()
-            .replace("status: hibernated", f"status: hibernated\n{timestamp}")
-            .replace("Body.", f"## Hibernation Reason\n{_RATE_LIMIT_MARKER}\npool instance: codex")
-        )
+    mock_hibernate.assert_called_once()
+    mock_fail.assert_not_called()
+    assert "status: hibernated" in (tickets_dir / "TICK-001.md").read_text()
 
-        assert _pool_instance_healthy(tmp_path, cfg, "codex") is True
 
-    def test_pool_instance_healthy_malformed_ticket_directory_fails_open(self, tmp_path):
-        from lanegate.orchestrate.loop import _pool_instance_healthy
+def test_genuine_timeout_still_fails(tmp_path):
+    """An ordinary timeout marker-free exit keeps the hard-failure behavior."""
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
 
-        cfg = _default_cfg(tmp_path)
-        with patch("lanegate.orchestrate.loop.load_all_tickets", side_effect=ValueError):
-            assert _pool_instance_healthy(tmp_path, cfg, "codex") is True
+    def fake_fail(tid, cfg_, repo_root, *, reason=""):
+        path = tickets_dir / f"{tid}.md"
+        path.write_text(path.read_text().replace("status: in_progress", "status: failed", 1))
+
+    with (
+        patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress),
+        patch("lanegate.orchestrate.invoke_executor", return_value=(124, "", "timed out after 30s")),
+        patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+        patch("lanegate.lifecycle.cmd_hibernate") as mock_hibernate,
+        patch("lanegate.lifecycle.cmd_fail", side_effect=fake_fail) as mock_fail,
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, max_parallel=1, human_review="none", all_milestones=True, auto_analyze=False)
+
+    mock_fail.assert_called_once()
+    mock_hibernate.assert_not_called()
+    assert "status: failed" in (tickets_dir / "TICK-001.md").read_text()
+
+
+def test_watchdog_timeout_hibernates_without_halting_run(tmp_path):
+    """A watchdog kill (idle/stall/ceiling/timeout) hibernates the one ticket for
+    retry but must NOT halt the run — independent queued tickets still dispatch."""
+    cfg = _default_cfg(tmp_path)
+    cfg["max_parallel"] = 1
+    tickets_dir = tmp_path / "tickets"
+    _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"], priority=1)
+    _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"], priority=2)
+
+    def fake_hibernate(tid, cfg_, repo_root, *, reason="", **kwargs):
+        path = tickets_dir / f"{tid}.md"
+        path.write_text(path.read_text().replace("status: in_progress", "status: hibernated", 1))
+
+    def fake_invoke(ticket, cfg_, wt, **kwargs):
+        if ticket["id"] == "TICK-001":
+            return (1, "", "[orchestrate] TICK-001: dispatch terminated due to 'timeout' after 1500s (0 heartbeats received)")
+        return (1, "", "some other failure")
+
+    with (
+        patch("lanegate.lifecycle.cmd_start", side_effect=_fake_start_writes_in_progress) as mock_start,
+        patch("lanegate.orchestrate.invoke_executor", side_effect=fake_invoke),
+        patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+        patch("lanegate.lifecycle.cmd_hibernate", side_effect=fake_hibernate) as mock_hibernate,
+        patch("lanegate.lifecycle.cmd_fail") as mock_fail,
+        patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+        patch("lanegate.orchestrate.release_orchestrator_lock"),
+    ):
+        cmd_orchestrate(cfg, tmp_path, max_parallel=1, human_review="none", all_milestones=True, auto_analyze=False)
+
+    started = {c.args[0] for c in mock_start.call_args_list}
+    assert started == {"TICK-001", "TICK-002"}, f"run halted after watchdog kill: only started {started}"
+    assert "status: hibernated" in (tickets_dir / "TICK-001.md").read_text()
+    mock_hibernate.assert_any_call("TICK-001", cfg, tmp_path, reason="watchdog termination: timeout")
 
 
 class TestConsecutiveFailureSignatureFallback:
@@ -2170,6 +1740,25 @@ class TestOrchestrateTicketsFlag:
 
         assert started_ids == ["TICK-001"]
 
+    def test_tickets_scope_warns_when_active_milestone_excludes_ticket(self, tmp_path, capsys):
+        """A scoped ticket outside the active milestone is not reported as board-clear."""
+        cfg = _default_cfg(tmp_path)
+        tickets_dir = tmp_path / "tickets"
+        _write_milestone_ticket(tickets_dir, "TICK-001", "open", milestone="v2", touches=["a.py"])
+
+        with (
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, milestone="v1", tickets=["TICK-001"])
+
+        captured = capsys.readouterr()
+        assert "TICK-001" in captured.err
+        assert "v2" in captured.err
+        assert "--milestone v2" in captured.err
+        assert "--all" in captured.err
+        assert "board clear" not in captured.out.lower()
+
     def test_ticket_scope_logged_at_startup(self, tmp_path, capsys):
         """dry-run/log output makes clear a run is ticket-scoped."""
         cfg = _default_cfg(tmp_path)
@@ -2225,77 +1814,13 @@ class TestOrchestrateTicketsFlag:
 # ---------------------------------------------------------------------------
 
 
-def _write_draft_ticket(
-    tickets_dir: Path,
-    ticket_id: str,
-    milestone: str | None = None,
-) -> Path:
-    ms_str = f"milestone: {milestone}\n" if milestone else ""
-    content = (
-        f"---\n"
-        f"id: {ticket_id}\n"
-        f"title: Draft {ticket_id}\n"
-        f"status: draft\n"
-        f"priority: 1\n"
-        f"parallel_safe: true\n"
-        f"{ms_str}"
-        f"close_criteria: TBD.\n"
-        f"---\nBody.\n"
-    )
-    path = tickets_dir / f"{ticket_id}.md"
-    path.write_text(content)
-    return path
-
-
 from lanegate.orchestrate import (  # noqa: E402
-    _analyze_drafts,
-    _print_draft_analysis_plan,
     _queue_code_complete_reviews,
     _scan_injection_signals,
 )
 from lanegate.orchestrate.loop import recover_scope_only_needs_review_tickets  # noqa: E402
 
 
-class TestRecoverScopeOnlyNeedsReviewNotesExemption:
-    """TICK-651: .lanegate/notes/ writes are exempt from scope-drift, including
-    in the auto_claim_touches recovery path (recover_scope_only_needs_review_tickets)."""
-
-    def test_notes_only_drift_is_not_auto_claimed(self, tmp_path, capsys):
-        """A ticket hibernated only over an (exempt) notes file is skipped for
-        recovery rather than having the notes file auto-claimed into touches —
-        the live diff no longer matches the recorded scope-drift reason once
-        the notes file is filtered out, so auto-claim correctly defers instead
-        of re-declaring a file the exemption says shouldn't need declaring."""
-        cfg = _default_cfg(tmp_path)
-        cfg["auto_claim_touches"] = True
-        tickets_dir = Path(cfg["tickets_dir"])
-        wt = tmp_path / "worktrees" / "tick-900"
-        wt.mkdir(parents=True)
-        (tickets_dir / "TICK-900.md").write_text(
-            "---\n"
-            "id: TICK-900\n"
-            "title: Test TICK-900\n"
-            "status: needs_review\n"
-            "priority: 1\n"
-            "parallel_safe: true\n"
-            "touches:\n  - a.py\n"
-            f"worktree: {wt}\n"
-            "close_criteria: All tests pass.\n"
-            "---\n"
-            "Body.\n\n"
-            "## Needs Review Reason\n"
-            "committed files outside touches list: .lanegate/notes/global.md\n"
-        )
-
-        with patch(
-            "lanegate.orchestrate.loop._committed_files",
-            return_value={"a.py", ".lanegate/notes/global.md"},
-        ):
-            recovered = recover_scope_only_needs_review_tickets(cfg, tmp_path)
-
-        assert recovered == []
-        err = capsys.readouterr().err
-        assert "scope recovery skipped" in err
 
 
 class TestPreCompleteGuardNotesExemption:
@@ -2361,365 +1886,72 @@ class TestPreCompleteGuardNotesExemption:
 
 
 
-class TestAnalyzeDrafts:
-    """Unit tests for _analyze_drafts and _print_draft_analysis_plan."""
-
-    def test_draft_analyzed_before_dispatch(self, tmp_path, capsys):
-        """_analyze_drafts calls cmd_analyze for each draft ticket."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-
-        with patch("lanegate.analyze.cmd_analyze") as mock_analyze:
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        mock_analyze.assert_called_once_with("TICK-001", cfg, tmp_path, pool_name=None)
-
-    def test_analyze_drafts_includes_open_empty_touches(self, tmp_path, capsys):
-        """_analyze_drafts calls cmd_analyze for status:open tickets with empty touches."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_ticket(tickets_dir, "TICK-001", "open", touches=[])
-
-        with patch("lanegate.analyze.cmd_analyze") as mock_analyze:
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        mock_analyze.assert_called_once_with("TICK-001", cfg, tmp_path, pool_name=None)
-
-    def test_milestone_filter_respected(self, tmp_path):
-        """_analyze_drafts skips drafts that do not match the active milestone."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001", milestone="v1")
-        _write_draft_ticket(tickets_dir, "TICK-002", milestone="v2")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            analyzed.append(tid)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, milestone="v1", tickets_dir=tickets_dir)
-
-        assert "TICK-001" in analyzed
-        assert "TICK-002" not in analyzed
-
-    def test_ticket_scope_respected(self, tmp_path):
-        """_analyze_drafts must not analyze drafts outside an explicit
-        --tickets scope (TICK-262) -- a run scoped to one ticket must not go
-        analyze an unrelated draft elsewhere in the same milestone just
-        because the requested ticket wasn't itself a draft ready to analyze.
-        """
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            analyzed.append(tid)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir, ticket_ids={"TICK-002"})
-
-        assert analyzed == ["TICK-002"]
-
-    def test_failed_analyze_skipped_gracefully(self, tmp_path, capsys):
-        """_analyze_drafts logs a warning and continues when cmd_analyze raises."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            if tid == "TICK-001":
-                raise RuntimeError("analyze failed")
-            analyzed.append(tid)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            # Should not raise
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        # TICK-002 should still have been analyzed despite TICK-001 failing
-        assert "TICK-002" in analyzed
-        captured = capsys.readouterr()
-        assert "WARNING" in captured.err
-
-    def test_failed_analyze_records_ticket_outcome_and_run_reports_failure(self, tmp_path):
-        """A swallowed analyze failure must still be a durable ticket_outcome
-        event so the run summary calls the run FAILURE instead of SUCCESS
-        (TICK-642) — otherwise a run that aborted on a real, unresolved
-        analyze error looks like a clean success everywhere but the raw log.
-        """
-        from lanegate.orchestrate.run_report import _append_run_event, build_run_summary
-        from lanegate.orchestrate.run_summary import RunReason
-
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        session_ts = "2026-08-22T00-00-00"
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            import sys as _sys
-
-            print("ERROR: model returned empty or non-list touches; ticket left as draft", file=_sys.stderr)
-            _sys.exit(1)
-
-        _append_run_event(tmp_path, session_ts, "run_start", pid=os.getpid())
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir, session_ts=session_ts)
-        _append_run_event(tmp_path, session_ts, "run_end", status="completed")
-
-        summary = build_run_summary(cfg, tmp_path, session_ts=session_ts)
-        assert summary.reason == RunReason.FAILURE
-        assert len(summary.batch_tickets) == 1
-        failed = summary.batch_tickets[0]
-        assert failed.ticket_id == "TICK-001"
-        assert "empty or non-list touches" in (failed.failure_reason or "")
-
-    def test_analyze_drafts_skips_already_resolved_drafts(self, tmp_path):
-        """_analyze_drafts must skip draft tickets that already have 'already resolved' in their body."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        path = _write_draft_ticket(tickets_dir, "TICK-001")
-        path.write_text(path.read_text() + "\n## Needs Review Reason\nanalyze: ticket premise appears already resolved\n")
-
-        analyzed = []
-        with patch("lanegate.analyze.cmd_analyze", side_effect=lambda tid, *a, **k: analyzed.append(tid)):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        assert analyzed == []
-
-    def test_interrupt_stops_draft_analysis_without_touching_next_draft(self, tmp_path, capsys):
-        """Ctrl-C is a run-level stop, not a failure to skip past."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-        analyzed = []
-
-        def interrupted_analyze(tid, cfg_, repo_root, pool_name=None):
-            analyzed.append(tid)
-            raise SystemExit(130)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=interrupted_analyze):
-            assert _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir) is True
-
-        assert analyzed == ["TICK-001"]
-        assert parse_ticket(tickets_dir / "TICK-001.md")["status"] == "draft"
-        assert parse_ticket(tickets_dir / "TICK-002.md")["status"] == "draft"
-        assert "stopping further dispatch" in capsys.readouterr().err
-
-    def test_repeated_identical_failure_stops_the_pass(self, tmp_path, capsys):
-        """A systemic failure (identical stderr on consecutive drafts) must stop
-        the whole draft-analysis pass instead of repeating the same doomed
-        model call — and cost — across every remaining draft.
-        """
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-        _write_draft_ticket(tickets_dir, "TICK-003")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            import sys as _sys
-
-            analyzed.append(tid)
-            print("ERROR: model returned empty or non-list touches; ticket left as draft", file=_sys.stderr)
-            _sys.exit(1)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        # Stops after the 2nd identical failure — TICK-003 never attempted.
-        assert analyzed == ["TICK-001", "TICK-002"]
-        captured = capsys.readouterr()
-        assert "systemic" in captured.err
-
-    def test_failures_with_different_claude_session_metadata_stop_the_pass(self, tmp_path, capsys):
-        """Volatile Claude metadata does not hide a repeated systemic failure."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-        _write_draft_ticket(tickets_dir, "TICK-003")
-
-        metadata = {
-            "TICK-001": {
-                "session_id": "11111111-1111-4111-8111-111111111111",
-                "message": '{"id":"22222222-2222-4222-8222-222222222222"}',
-                "uuid": "33333333-3333-4333-8333-333333333333",
-                "timestamp": "2026-08-04T12:00:01.123Z",
-                "total_cost_usd": "0.12",
-                "input_tokens": "123",
-                "output_tokens": "45",
-            },
-            "TICK-002": {
-                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "message": '{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}',
-                "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-                "timestamp": "2026-08-04T12:01:02.456Z",
-                "total_cost_usd": "0.34",
-                "input_tokens": "678",
-                "output_tokens": "90",
-            },
-        }
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            import sys as _sys
-
-            analyzed.append(tid)
-            print(
-                "ERROR: Claude CLI unavailable "
-                + " ".join(f"{key}={value}" for key, value in metadata[tid].items()),
-                file=_sys.stderr,
-            )
-            _sys.exit(1)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        assert analyzed == ["TICK-001", "TICK-002"]
-        assert "systemic" in capsys.readouterr().err
-
-    def test_stops_early_once_a_draft_becomes_dispatchable(self, tmp_path):
-        """Once an analyzed draft is dispatchable, the pass returns immediately
-        instead of draining the rest of the draft backlog first — ready work
-        must not sit idle behind unrelated drafts still waiting their turn.
-        """
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            analyzed.append(tid)
-            # Mirror what real cmd_analyze does: flip the ticket open with
-            # real (empty, unblocked) touches once analysis succeeds.
-            path = tickets_dir / f"{tid}.md"
-            path.write_text(
-                path.read_text()
-                .replace("status: draft", "status: open")
-                .replace("close_criteria: TBD.\n", "close_criteria: TBD.\ntouches: [\"a.py\"]\n")
-            )
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        # TICK-002 is left for the next pass, once TICK-001 has been dispatched.
-        assert analyzed == ["TICK-001"]
-
-    def test_different_failures_do_not_stop_the_pass(self, tmp_path, capsys):
-        """Distinct per-ticket failure reasons are treated as ticket-specific
-        content issues, not a systemic problem — the pass keeps going.
-        """
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-        _write_draft_ticket(tickets_dir, "TICK-003")
-
-        analyzed = []
-
-        def fake_analyze(tid, cfg_, repo_root, pool_name=None):
-            import sys as _sys
-
-            analyzed.append(tid)
-            print(f"ERROR: distinct failure for {tid}", file=_sys.stderr)
-            _sys.exit(1)
-
-        with patch("lanegate.analyze.cmd_analyze", side_effect=fake_analyze):
-            _analyze_drafts(cfg, tmp_path, tickets_dir=tickets_dir)
-
-        assert analyzed == ["TICK-001", "TICK-002", "TICK-003"]
-        captured = capsys.readouterr()
-        assert "systemic" not in captured.err
-
-    def test_print_draft_analysis_plan(self, tmp_path, capsys):
-        """_print_draft_analysis_plan prints which drafts would be analyzed."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002", milestone="v2")
-
-        _print_draft_analysis_plan(cfg, tmp_path, milestone=None, tickets_dir=tickets_dir)
-
-        captured = capsys.readouterr()
-        assert "TICK-001" in captured.out
-        assert "TICK-002" in captured.out
-        assert "dry-run" in captured.out
-
-    def test_print_draft_analysis_plan_respects_ticket_ids(self, tmp_path, capsys):
-        """TICK-262: --dry-run must reflect the restricted --tickets candidate
-        set, not just show every draft in the milestone."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        _write_draft_ticket(tickets_dir, "TICK-002")
-
-        _print_draft_analysis_plan(
-            cfg, tmp_path, milestone=None, tickets_dir=tickets_dir, ticket_ids={"TICK-002"}
-        )
-
-        captured = capsys.readouterr()
-        assert "TICK-001" not in captured.out
-        assert "TICK-002" in captured.out
-
-    def test_print_draft_analysis_plan_includes_open_empty_touches(self, tmp_path, capsys):
-        """_print_draft_analysis_plan includes status:open tickets with empty touches in dry-run mode."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_ticket(tickets_dir, "TICK-001", "open", touches=[])
-
-        _print_draft_analysis_plan(cfg, tmp_path, milestone=None, tickets_dir=tickets_dir)
-
-        captured = capsys.readouterr()
-        assert "TICK-001" in captured.out
-        assert "dry-run" in captured.out
-
-    def test_no_auto_analyze_flag_bypasses_analyze(self, tmp_path, capsys):
-        """--no-auto-analyze (auto_analyze=False) skips _analyze_drafts entirely."""
-        cfg = _default_cfg(tmp_path)
-        tickets_dir = tmp_path / "tickets"
-        _write_draft_ticket(tickets_dir, "TICK-001")
-        # Also write an open ticket so the loop runs at least once
-        _write_ticket(tickets_dir, "TICK-002", "open", touches=["a.py"])
-
-        with (
-            patch("lanegate.orchestrate._analyze_drafts") as mock_analyze_drafts,
-            patch("lanegate.orchestrate._print_draft_analysis_plan") as mock_plan,
-            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
-            patch("lanegate.orchestrate.release_orchestrator_lock"),
-            patch("lanegate.lifecycle.cmd_start"),
-            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
-            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
-            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
-            patch("lanegate.lifecycle.cmd_complete") as mock_complete,
-            patch("lanegate.lifecycle.cmd_review"),
-        ):
-
-            def fake_complete(tid, cfg_, repo_root):
-                p = tickets_dir / f"{tid}.md"
-                text = p.read_text().replace("status: open", "status: code_complete")
-                p.write_text(text)
-
-            mock_complete.side_effect = fake_complete
-            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=False)
-
-        mock_analyze_drafts.assert_not_called()
-        mock_plan.assert_not_called()
 
 
 class TestBoardClearingLoopAutoAnalyze:
     """Integration-level tests: auto-analyze wired into the board-clearing loop."""
+
+    def test_auto_reset_elapsed_cooldown(self, tmp_path):
+        """Elapsed timed cooldowns reset independently before batch selection."""
+        from lanegate.orchestrate import _drain_loop
+
+        cfg = _default_cfg(tmp_path)
+        cfg["executors"] = {
+            "elapsed": {"type": "claude"},
+            "future": {"type": "claude"},
+        }
+        cooldowns = {
+            "elapsed": {"until": "2020-01-01T00:00:00+00:00", "reason": "rate limit"},
+            "future": {"until": "2999-01-01T00:00:00+00:00", "reason": "rate limit"},
+        }
+        events: list[str] = []
+
+        def is_cooling_down(_root, name):
+            return name in cooldowns
+
+        def clear_cooldown(_root, name):
+            events.append(f"reset:{name}")
+            cooldowns.pop(name)
+            return True
+
+        def next_batch(*_args, **_kwargs):
+            assert events == ["reset:elapsed"]
+            return []
+
+        with (
+            patch("lanegate.orchestrate.loop._executor_is_cooling_down", side_effect=is_cooling_down),
+            patch("lanegate.orchestrate.loop._read_executor_cooldown", side_effect=lambda _root, name: cooldowns.get(name)),
+            patch("lanegate.orchestrate.loop._clear_executor_cooldown", side_effect=clear_cooldown),
+            patch("lanegate.orchestrate.loop.next_batch", side_effect=next_batch),
+        ):
+            _drain_loop(cfg, tmp_path, max_parallel=2, dry_run=False, human_review="none", auto_analyze=False)
+
+        assert cooldowns == {"future": {"until": "2999-01-01T00:00:00+00:00", "reason": "rate limit"}}
+
+    def test_no_reset_unelapsed_cooldown(self, tmp_path):
+        """Future and manual cooldowns survive repeated batch-loop iterations."""
+        from lanegate.orchestrate.loop import _auto_reset_elapsed_executor_cooldowns
+
+        cfg = _default_cfg(tmp_path)
+        cfg["executors"] = {
+            "future": {"type": "claude"},
+            "manual": {"type": "claude"},
+        }
+        cooldowns = {
+            "future": {"until": "2999-01-01T00:00:00+00:00", "reason": "rate limit"},
+            "manual": {"until": None, "reason": "manual flag"},
+        }
+        with (
+            patch("lanegate.orchestrate.loop._executor_is_cooling_down", side_effect=lambda _root, name: name in cooldowns),
+            patch("lanegate.orchestrate.loop._read_executor_cooldown", side_effect=lambda _root, name: cooldowns.get(name)),
+            patch("lanegate.orchestrate.loop._clear_executor_cooldown") as clear_cooldown,
+        ):
+            assert _auto_reset_elapsed_executor_cooldowns(cfg, tmp_path) == []
+            assert _auto_reset_elapsed_executor_cooldowns(cfg, tmp_path) == []
+
+        assert cooldowns["future"]["until"] == "2999-01-01T00:00:00+00:00"
+        assert cooldowns["manual"]["until"] is None
+        clear_cooldown.assert_not_called()
 
     def test_next_batch_skips_open_tickets_without_touches(self, tmp_path):
         """next_batch skips status:open tickets lacking touches so they are not dispatch candidates prior to auto-analysis."""
@@ -2768,6 +2000,61 @@ class TestBoardClearingLoopAutoAnalyze:
         # after the (no-op) draft analysis.
         assert call_order == ["next_batch", "analyze_drafts", "next_batch"]
 
+    def test_underfilled_batch_analyzes_draft_before_dispatch(self, tmp_path):
+        """A spare-capacity draft cannot displace selected ready work."""
+        cfg = _default_cfg(tmp_path)
+        cfg["max_parallel"] = 3
+        tickets_dir = tmp_path / "tickets"
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+        _write_ticket(tickets_dir, "TICK-002", "open", touches=["b.py"])
+        _write_draft_ticket(tickets_dir, "TICK-000")
+
+        events: list[str] = []
+
+        from lanegate.orchestrate import next_batch as real_next_batch
+
+        def recording_next_batch(*args, **kwargs):
+            events.append("next_batch")
+            return real_next_batch(*args, **kwargs)
+
+        def fake_analyze_drafts(*args, **kwargs):
+            events.append("analyze_drafts")
+            draft_path = tickets_dir / "TICK-000.md"
+            draft_path.write_text(
+                draft_path.read_text()
+                .replace("status: draft", "status: open")
+                .replace(
+                    "parallel_safe: true\n",
+                    "parallel_safe: false\ntouches:\n  - draft.py\n",
+                )
+            )
+            return False
+
+        def fake_cmd_start(tid, cfg_, repo_root, **kwargs):
+            events.append(f"start:{tid}")
+            ticket_path = tickets_dir / f"{tid}.md"
+            ticket_path.write_text(ticket_path.read_text().replace("status: open", "status: in_progress"))
+
+        with (
+            patch("lanegate.orchestrate.loop.next_batch", side_effect=recording_next_batch),
+            patch("lanegate.orchestrate.loop._analyze_drafts", side_effect=fake_analyze_drafts),
+            patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
+            patch("lanegate.orchestrate.release_orchestrator_lock"),
+            patch("lanegate.lifecycle.cmd_start", side_effect=fake_cmd_start),
+            patch("lanegate.orchestrate.invoke_executor", return_value=(0, "", "")),
+            patch("lanegate.orchestrate.check_worktree_has_commits", return_value=True),
+            patch("lanegate.orchestrate._is_combined_mode", return_value=False),
+            patch("lanegate.lifecycle.cmd_complete"),
+            patch("lanegate.lifecycle.cmd_review"),
+        ):
+            cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=True)
+
+        assert events[:3] == ["next_batch", "analyze_drafts", "next_batch"]
+        assert events.index("analyze_drafts") < events.index("start:TICK-001")
+        assert events.index("analyze_drafts") < events.index("start:TICK-002")
+        assert events.index("start:TICK-001") < events.index("start:TICK-000")
+        assert events.index("start:TICK-002") < events.index("start:TICK-000")
+
     def test_code_complete_reviews_are_queued_before_draft_analysis(self, tmp_path):
         """Completed work gets a review-resume attempt before draft capacity."""
         cfg = _default_cfg(tmp_path)
@@ -2799,15 +2086,19 @@ class TestBoardClearingLoopAutoAnalyze:
         assert events[:4] == ["next_batch", "queue_review", "next_batch", "analyze_drafts"]
 
     def test_open_ticket_dispatched_before_draft_analyzed(self, tmp_path):
-        """Regression for TICK-261: with both an open and a draft ticket in
-        scope, the open ticket is claimed/dispatched before the draft is
-        analyzed — not after."""
+        """Ready open work is selected before a draft consumes spare capacity."""
         cfg = _default_cfg(tmp_path)
         tickets_dir = tmp_path / "tickets"
         _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
         _write_draft_ticket(tickets_dir, "TICK-DRAFT")
 
         events: list[str] = []
+
+        from lanegate.orchestrate import next_batch as real_next_batch
+
+        def recording_next_batch(*args, **kwargs):
+            events.append("next_batch")
+            return real_next_batch(*args, **kwargs)
 
         def fake_analyze_drafts(
             cfg_, repo_root, milestone=None, tickets_dir=None, ticket_ids=None, pool_name=None,
@@ -2822,6 +2113,7 @@ class TestBoardClearingLoopAutoAnalyze:
             p.write_text(text)
 
         with (
+            patch("lanegate.orchestrate.loop.next_batch", side_effect=recording_next_batch),
             patch("lanegate.orchestrate._analyze_drafts", side_effect=fake_analyze_drafts),
             patch("lanegate.orchestrate.acquire_orchestrator_lock", return_value=9999),
             patch("lanegate.orchestrate.release_orchestrator_lock"),
@@ -2834,9 +2126,9 @@ class TestBoardClearingLoopAutoAnalyze:
         ):
             cmd_orchestrate(cfg, tmp_path, all_milestones=True, auto_analyze=True)
 
-        assert events, "expected TICK-001 to be started"
-        assert events[0] == "start:TICK-001"
-        assert "analyze_drafts" not in events[: events.index("start:TICK-001")]
+        assert events[:2] == ["next_batch", "analyze_drafts"]
+        assert events.index("next_batch") < events.index("analyze_drafts")
+        assert events.index("analyze_drafts") < events.index("start:TICK-001")
 
     def test_worker_pool_refill_analyze_drafts_respects_ticket_ids(self, tmp_path):
         """Worker pool refill call to _analyze_drafts must pass ticket_ids so
@@ -2900,6 +2192,7 @@ class TestBoardClearingLoopAutoAnalyze:
         batch and does not print the draft-analysis plan in the same pass
         (TICK-261 — ready work is never gated behind draft handling)."""
         cfg = _default_cfg(tmp_path)
+        cfg["max_parallel"] = 1
         tickets_dir = tmp_path / "tickets"
         _write_draft_ticket(tickets_dir, "TICK-DRAFT")
         _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
@@ -2914,6 +2207,19 @@ class TestBoardClearingLoopAutoAnalyze:
         mock_plan.assert_not_called()
         captured = capsys.readouterr()
         assert "would start TICK-001" in captured.out
+
+    def test_dry_run_underfilled_batch_prints_draft_plan(self, tmp_path):
+        """Dry-run previews the draft analysis that a spare live slot would use."""
+        cfg = _default_cfg(tmp_path)
+        cfg["max_parallel"] = 2
+        tickets_dir = tmp_path / "tickets"
+        _write_draft_ticket(tickets_dir, "TICK-DRAFT")
+        _write_ticket(tickets_dir, "TICK-001", "open", touches=["a.py"])
+
+        with patch("lanegate.orchestrate._print_draft_analysis_plan") as mock_plan:
+            cmd_orchestrate(cfg, tmp_path, dry_run=True, all_milestones=True, auto_analyze=True)
+
+        mock_plan.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -3983,3 +3289,266 @@ def test_loop_surfaces_commit_worktree_changes_stderr(tmp_path):
     t = parse_ticket(tickets_dir / "TICK-001.md")
     assert t["status"] == "failed"
     assert "auto-commit rejected: hook error: file too large" in t["_body"]
+
+def test_watchdog_reap_orphaned_commits_dirty_worktree(tmp_path):
+    from lanegate.orchestrate.loop_dispatch import _reap_orphaned_executor_processes
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "in_progress", worktree=str(wt_path), branch="tick-001")
+
+    with (
+        patch("lanegate.orchestrate.loop_dispatch._collect_live_lanegate_processes", return_value=[{"kind": "ticket-executor", "orphaned": True, "pid": 99999, "ticket_id": "TICK-001", "detail": "orphan"}]),
+        patch("lanegate.orchestrate.loop_dispatch._kill_pid", return_value=True),
+    ):
+        _reap_orphaned_executor_processes(cfg, tmp_path)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+
+    log = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=wt_path, capture_output=True, text=True).stdout
+    assert "wip: uncommitted edits preserved before hibernation" in log
+    assert "Signed-off-by:" in log
+
+def test_watchdog_sigint_commits_dirty_worktree(tmp_path, capsys):
+    from lanegate.orchestrate.loop import _drain_loop
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "open", touches=["foo.py"])
+
+    with (
+        patch("lanegate.orchestrate.loop.invoke_executor", return_value=(130, "", "")),
+        patch("lanegate.safeguards.run_safeguards", return_value=[]),
+    ):
+        _drain_loop(cfg, tmp_path, max_parallel=1, dry_run=False, human_review="none", auto_analyze=False)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+
+    log = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=wt_path, capture_output=True, text=True).stdout
+    assert "wip: uncommitted edits preserved before hibernation" in log
+    assert "Signed-off-by:" in log
+
+def test_watchdog_timeout_commits_dirty_worktree(tmp_path, capsys):
+    from lanegate.orchestrate.loop import _drain_loop
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "open", touches=["foo.py"])
+
+    with (
+        patch("lanegate.orchestrate.loop.invoke_executor", return_value=(1, "", "dispatch terminated due to 'timeout' after 1500s")),
+        patch("lanegate.safeguards.run_safeguards", return_value=[]),
+    ):
+        _drain_loop(cfg, tmp_path, max_parallel=1, dry_run=False, human_review="none", auto_analyze=False)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+
+    log = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=wt_path, capture_output=True, text=True).stdout
+    assert "wip: uncommitted edits preserved before hibernation" in log
+    assert "Signed-off-by:" in log
+
+def test_watchdog_git_failure_recovery(tmp_path):
+    from lanegate.orchestrate.loop_dispatch import _reap_orphaned_executor_processes
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+
+    (tmp_path / ".git" / "worktrees" / "tick-001" / "index.lock").write_text("")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "in_progress", worktree=str(wt_path), branch="tick-001")
+
+    with (
+        patch("lanegate.orchestrate.loop_dispatch._collect_live_lanegate_processes", return_value=[{"kind": "ticket-executor", "orphaned": True, "pid": 99999, "ticket_id": "TICK-001", "detail": "orphan"}]),
+        patch("lanegate.orchestrate.loop_dispatch._kill_pid", return_value=True),
+    ):
+        _reap_orphaned_executor_processes(cfg, tmp_path)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+
+def test_watchdog_sigint_git_failure_recovery(tmp_path, capsys):
+    from lanegate.orchestrate.loop import _drain_loop
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+    (tmp_path / ".git" / "worktrees" / "tick-001" / "index.lock").write_text("")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "open", touches=["foo.py"])
+
+    with (
+        patch("lanegate.orchestrate.loop.invoke_executor", return_value=(130, "", "")),
+        patch("lanegate.safeguards.run_safeguards", return_value=[]),
+    ):
+        _drain_loop(cfg, tmp_path, max_parallel=1, dry_run=False, human_review="none", auto_analyze=False)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+    err = capsys.readouterr().err
+    assert "failed to checkpoint worktree before hibernation" in err
+
+def test_watchdog_timeout_git_failure_recovery(tmp_path, capsys):
+    from lanegate.orchestrate.loop import _drain_loop
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty")
+    (tmp_path / ".git" / "worktrees" / "tick-001" / "index.lock").write_text("")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "open", touches=["foo.py"])
+
+    with (
+        patch("lanegate.orchestrate.loop.invoke_executor", return_value=(1, "", "dispatch terminated due to 'timeout' after 1500s")),
+        patch("lanegate.safeguards.run_safeguards", return_value=[]),
+    ):
+        _drain_loop(cfg, tmp_path, max_parallel=1, dry_run=False, human_review="none", auto_analyze=False)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+    err = capsys.readouterr().err
+    assert "failed to checkpoint worktree before hibernation" in err
+
+def test_hibernate_orphaned_commits_dirty_worktree(tmp_path):
+    from lanegate.orchestrate.loop_dispatch import _hibernate_orphaned
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty orphaned work")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "in_progress", worktree=str(wt_path), branch="tick-001")
+
+    with patch("lanegate.orchestrate.loop_dispatch._executor_alive", return_value=False):
+        _hibernate_orphaned(cfg, tmp_path)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+
+    log = subprocess.run(["git", "log", "-1", "--format=%B"], cwd=wt_path, capture_output=True, text=True).stdout
+    assert "wip: uncommitted edits preserved before hibernation" in log
+    assert "Signed-off-by:" in log
+
+def test_hibernate_orphaned_git_failure_recovery(tmp_path, capsys):
+    from lanegate.orchestrate.loop_dispatch import _hibernate_orphaned
+    from lanegate.ticket import parse_ticket
+    from tests._helpers.lifecycle import init_git_repo as _init_git_repo, commit_all as _commit_all, write_ticket as _write_ticket, default_cfg as _default_cfg
+    import subprocess
+    from unittest.mock import patch
+    
+    cfg = _default_cfg(tmp_path / "tickets", tmp_path / "worktrees")
+    (tmp_path / "tickets").mkdir(exist_ok=True)
+    _init_git_repo(tmp_path)
+    subprocess.run(["git", "branch", "-m", "main"], cwd=tmp_path, check=True)
+    (tmp_path / "base.txt").write_text("hello")
+    _commit_all(tmp_path, "base")
+
+    wt_path = tmp_path / "worktrees" / "tick-001"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", "-b", "tick-001", str(wt_path)], cwd=tmp_path, check=True)
+    (wt_path / "foo.py").write_text("dirty orphaned work")
+    (tmp_path / ".git" / "worktrees" / "tick-001" / "index.lock").write_text("")
+
+    _write_ticket(tmp_path / "tickets", "TICK-001", "in_progress", worktree=str(wt_path), branch="tick-001")
+
+    with patch("lanegate.orchestrate.loop_dispatch._executor_alive", return_value=False):
+        _hibernate_orphaned(cfg, tmp_path)
+
+    ticket = parse_ticket(tmp_path / "tickets" / "TICK-001.md")
+    assert ticket["status"] == "hibernated"
+    out = capsys.readouterr().out
+    assert "failed to checkpoint worktree before hibernation" in out
+
+

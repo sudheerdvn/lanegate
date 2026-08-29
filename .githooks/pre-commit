@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+files=$(git diff --cached --name-only -z -- 'lanegate/*.py' 'tests/*.py')
+[[ -z "$files" ]] || printf '%s' "$files" | xargs -0 python scripts/check_file_size.py --staged

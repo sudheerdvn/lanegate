@@ -631,16 +631,31 @@ def get_bounded_shared_notes(
     encoding; older flattened names remain readable during migration.
     """
     notes_root = project_root / ".lanegate" / "notes"
+    # No shared-notes store → nothing to inject. Return before touching git
+    # (``_legacy_note_owners`` shells out to ``git ls-files``): the store is
+    # optional and absent for most projects and every temp/test root.
+    if not notes_root.is_dir():
+        return ""
     budget = budget_bytes if budget_bytes is not None else min(get_payload_budget(step, cfg), 4000)
     sections: list[str] = []
     global_note = notes_root / "global.md"
-    if global_note.is_file():
+    has_global = global_note.is_file()
+    if has_global:
         text = global_note.read_text(encoding="utf-8", errors="replace").strip()
         if text:
             sections.append("### Global notes\n" + text)
 
     seen: set[str] = set()
-    legacy_owners = _legacy_note_owners(project_root, relevant_paths)
+    # Resolve legacy-filename ownership lazily: only the first relevant path
+    # that actually has a legacy note file on disk needs the git-backed owner
+    # map, and a store with only canonical (v2) notes never needs it at all.
+    _legacy_owners_cache: list[dict[str, set[str]] | None] = []
+
+    def legacy_owners_map() -> dict[str, set[str]] | None:
+        if not _legacy_owners_cache:
+            _legacy_owners_cache.append(_legacy_note_owners(project_root, relevant_paths))
+        return _legacy_owners_cache[0]
+
     ambiguous_legacy: dict[str, set[str] | None] = {}
     for raw_path in relevant_paths or []:
         rel = Path(str(raw_path))
@@ -661,6 +676,7 @@ def get_bounded_shared_notes(
             legacy_path = notes_root / name
             if not legacy_path.is_file():
                 continue
+            legacy_owners = legacy_owners_map()
             owners = legacy_owners.get(name, {key}) if legacy_owners is not None else None
             if owners is None or len(owners) > 1:
                 ambiguous_legacy[name] = owners
@@ -690,6 +706,11 @@ def get_bounded_shared_notes(
 
     if not sections:
         return ""
+    if not has_global:
+        sections.append(
+            "NOTE: No global.md exists. If any facts here are project-wide invariants, "
+            "consider consolidating them into .lanegate/notes/global.md."
+        )
     result, _ = truncate_to_budget("## Shared Project Notes\n\n" + "\n\n".join(sections), budget)
     return result
 

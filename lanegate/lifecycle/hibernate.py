@@ -13,11 +13,12 @@ from pathlib import Path
 
 from lanegate import APP_NAME
 from lanegate.companion import companion_worktree_cleanup
-from lanegate.config import load_config, resolve_trunk_branch
+from lanegate.config import load_config, protected_branches, resolve_trunk_branch
 from lanegate.git import GitText
 from lanegate.git import git_text as _git_text
 from lanegate.pidutil import pid_alive, terminate_pid
 from lanegate.ticket import (
+    TERMINAL_STATUSES,
     append_lifecycle_event,
     branch_name,
     canonical_id,
@@ -70,18 +71,6 @@ def _remove_recovery_file(repo_root: Path, tid: str) -> None:
         _recovery_path(repo_root, tid).unlink()
     except FileNotFoundError:
         pass
-
-
-def _cleanup_ticket_notes(ticket: dict, repo_root: Path) -> None:
-    notes_dir = repo_root / f".{APP_NAME}" / "notes"
-    if not notes_dir.is_dir():
-        return
-    tid_note = notes_dir / f"{ticket['id']}.md"
-    try:
-        tid_note.unlink()
-    except (FileNotFoundError, OSError):
-        pass
-
 
 
 def _render_git_text(capture: GitText) -> str:
@@ -143,7 +132,6 @@ def _hibernation_note(
     *,
     include_diff: bool = False,
     trunk_branch: str | None = None,
-    escalation: bool = False,
 ) -> tuple[str, bool, bool]:
     """Generate hibernation note.
 
@@ -152,10 +140,6 @@ def _hibernation_note(
     ``capture_failed`` is distinct from truncation so reset callers do not
     mistake an unavailable Git capture for an empty successful diff.
 
-    ``escalation=True`` (TICK-467: red-lane risk trigger or exhausted
-    auto-fix retry budget) renders an explicit resume command in addition
-    to the usual git-log/diff pointers, since a human — not the next
-    orchestrate run — is expected to act on this ticket.
     """
     tid = ticket["id"]
     wt = Path(ticket["worktree"]) if ticket.get("worktree") else None
@@ -247,20 +231,6 @@ One or more Git captures failed. The failure diagnostics above are preserved her
 the branch and its metadata must remain available for recovery.
 """
 
-    if escalation:
-        escalation_reason = reason.strip() or "risk-based autonomy lane requires human review"
-        note += f"""
-### Human escalation ({escalation_reason})
-This ticket was escalated for human review rather than continuing the
-automatic fix/re-review loop. The branch `{branch}` is preserved — it was
-not deleted or reset.
-
-To resume after review:
-- Inspect the change: `git log {trunk_branch}..{branch} --oneline` and `git diff {trunk_branch}...{branch}`
-- Make any needed edits directly on `{branch}`, or address the escalation reason
-- Resume orchestration: `lanegate start {tid}` (or `lanegate run` to pick it up with the rest of the board)
-"""
-
     note += f"""
 Implement only what is missing.
 
@@ -279,7 +249,6 @@ def _write_hibernation_notes(
     *,
     include_diff: bool = False,
     trunk_branch: str | None = None,
-    escalation: bool = False,
 ) -> tuple[bool, bool]:
     """Write hibernation notes to recovery file.
 
@@ -293,7 +262,6 @@ def _write_hibernation_notes(
         reason=reason,
         include_diff=include_diff,
         trunk_branch=trunk_branch,
-        escalation=escalation,
     )
     recovery_path.write_text(note.rstrip() + "\n")
     return was_truncated, capture_failed
@@ -400,7 +368,6 @@ def cmd_hibernate(
     *,
     reset: bool = False,
     reason: str = "",
-    escalation: bool = False,
 ) -> None:
     """Transition in_progress|code_complete -> hibernated and write resumable
     context notes.
@@ -415,10 +382,6 @@ def cmd_hibernate(
     Preserves the worktree if the ticket has review_verdict=changes_requested,
     even if reset=True, to allow human inspection and fixes.
 
-    ``escalation=True`` (TICK-467: a red-lane risk trigger or an exhausted
-    auto-fix retry budget) always preserves the branch — even under
-    ``reset=True`` — and renders an explicit resume command in the
-    hibernation note, since a human is expected to act on it directly.
     """
     from . import _commit_generated_ticket_write
 
@@ -456,7 +419,6 @@ def cmd_hibernate(
         reason=reason,
         include_diff=reset and not skip_reset,
         trunk_branch=resolve_trunk_branch(cfg, repo_root),
-        escalation=escalation,
     )
     if reason:
         _append_ticket_section(ticket, "## Hibernation Reason", reason)
@@ -472,10 +434,8 @@ def cmd_hibernate(
                     remove_worktree(repo_root, wt_path, protected)
                 except PermissionError as e:
                     print(f"WARNING: {e}", file=sys.stderr)
-        # Failed or truncated captures leave recovery evidence only in the
-        # branch; an escalation (red-lane trigger / exhausted retry budget)
-        # always preserves the branch for human review, same as those.
-        preserve_branch = was_diff_truncated or capture_failed or escalation
+        # Failed or truncated captures leave recovery evidence only in the branch.
+        preserve_branch = was_diff_truncated or capture_failed
         if branch and not preserve_branch:
             subprocess.run(
                 ["git", "branch", "-D", branch],
@@ -493,12 +453,6 @@ def cmd_hibernate(
         elif branch and capture_failed:
             print(
                 f"[lifecycle] preserving branch {branch} for {tid} (Git capture failed) — recovery diagnostics are in the hibernation note",
-                file=sys.stderr,
-            )
-        elif branch and escalation:
-            print(
-                f"[lifecycle] preserving branch {branch} for {tid} (escalated for human review) — "
-                f"resume with `lanegate start {tid}`",
                 file=sys.stderr,
             )
         if not preserve_branch:
@@ -521,6 +475,89 @@ def cmd_hibernate(
     print(f"{tid}: {current} -> hibernated")
     if reset and not skip_reset:
         print("  worktree and branch reset")
+
+
+def cmd_reset(ticket_id: str, cfg: dict, repo_root: Path) -> None:
+    """Discard a non-terminal ticket's canonical worktree and branch.
+
+    Unlike ``hibernate --reset``, this deliberately overrides a
+    ``changes_requested`` verdict after an operator has determined the work
+    cannot be salvaged.  The canonical path and expected ticket branch are
+    both required before removing a worktree so ticket metadata cannot cause
+    an unrelated checkout to be deleted.
+    """
+    from . import _commit_generated_ticket_write
+
+    repo_root = _control_repo_root(repo_root)
+    tid = canonical_id(ticket_id)
+    tickets_dir = repo_root / cfg["tickets_dir"]
+    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
+    ticket = next((t for t in tickets if t["id"] == tid), None)
+    if not ticket:
+        print(f"ERROR: {tid} not found", file=sys.stderr)
+        sys.exit(1)
+
+    current = ticket.get("status")
+    if current in TERMINAL_STATUSES:
+        print(f"ERROR: {tid} is already '{current}'", file=sys.stderr)
+        sys.exit(1)
+
+    branch = branch_name(tid)
+    worktrees_dir = Path(cfg["worktrees_dir"])
+    if not worktrees_dir.is_absolute():
+        worktrees_dir = repo_root / worktrees_dir
+    canonical_wt = worktrees_dir / tid.lower()
+    wt_removed = False
+    if canonical_wt.exists():
+        try:
+            remove_worktree(
+                repo_root,
+                canonical_wt,
+                protected_branches(cfg),
+                expected_branch=branch,
+            )
+            wt_removed = not canonical_wt.exists()
+        except PermissionError as e:
+            print(f"WARNING: {e}", file=sys.stderr)
+
+    if branch and wt_removed:
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    for key in (
+        "reviewed_at",
+        "review_verdict",
+        "review_summary",
+        "review_findings",
+        "review_retry_after",
+        "review_retry_attempt",
+        "verification",
+        "auto_fix_attempts",
+        "requires_human_merge",
+        "human_merge_reason",
+        "rebase_conflict_files",
+    ):
+        ticket.pop(key, None)
+    ticket["status"] = "open"
+    ticket["worktree"] = None
+    ticket["branch"] = None
+    _stamp_status_changed(ticket)
+    append_lifecycle_event(
+        ticket,
+        event="reset",
+        from_status=current,
+        to_status="open",
+        summary="worktree and branch forcibly reset",
+    )
+    write_ticket(ticket)
+    _remove_executor_markers(repo_root, tid)
+    _commit_generated_ticket_write(repo_root, ticket["_path"], tid, "open", cfg)
+    print(f"{tid}: {current} -> open (worktree and branch reset)")
 
 
 def cmd_stop(

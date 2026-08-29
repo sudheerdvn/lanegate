@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 from pathlib import Path
@@ -170,6 +171,43 @@ def test_test_flag_with_topic_sends_push(tmp_path):
     assert exc_info.value.code == 0
     mock_send.assert_called_once()
     assert mock_send.call_args[0][0] == "test-topic"
+
+
+def test_notify_watch_once_json_clean(tmp_path, capsys):
+    with (
+        patch("lanegate.notify_watch.orchestrator_lock_status", return_value={"held": False, "alive": False}),
+        patch("lanegate.orchestrate._read_active_status", return_value=None),
+        patch("lanegate.notify_watch._run_loop") as mock_loop,
+        patch("lanegate.notify_watch.send_ntfy") as mock_push,
+    ):
+        cmd_notify_watch(_default_cfg(tmp_path), tmp_path, once=True, json_output=True)
+
+    assert json.loads(capsys.readouterr().out) == []
+    mock_loop.assert_not_called()
+    mock_push.assert_not_called()
+    assert not _notify_watch_pid_file(tmp_path).exists()
+
+
+def test_notify_watch_once_json_stuck(tmp_path, capsys):
+    cfg = _default_cfg(tmp_path)
+    _write_ticket(Path(cfg["tickets_dir"]), "TICK-001", "failed")
+
+    with (
+        patch("lanegate.notify_watch.orchestrator_lock_status", return_value={"held": False, "alive": False}),
+        patch("lanegate.orchestrate._read_active_status", return_value=None),
+    ):
+        cmd_notify_watch(cfg, tmp_path, once=True, json_output=True)
+
+    findings = json.loads(capsys.readouterr().out)
+    assert findings == [
+        {
+            "ticket_id": "TICK-001",
+            "status": "failed",
+            "signature": "halted:TICK-001(failed)",
+            "message": "orchestrate is not running — 1 ticket(s) waiting: TICK-001(failed)",
+            "action_required": "read the audit bundle, then reopen once root-caused",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

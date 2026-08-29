@@ -1334,6 +1334,10 @@ def _stream_subprocess(
             # a command that never touches stdin) — not our failure to report.
             pass
 
+    # CPU time barely advances while the whole orchestrator is SIGSTOPped,
+    # unlike wall-clock time.  Keep this snapshot in the watchdog process
+    # (rather than the child) so a delayed watchdog wake-up is detectable.
+    watchdog_cpu_start = os.times().user + os.times().system
     kill_reason: str | None = None
     budget_msg: str | None = None
     if idle_timeout is None and absolute_ceiling is None and budget_probe is None:
@@ -1367,7 +1371,14 @@ def _stream_subprocess(
                 and absolute_ceiling is None
                 and now - start_ts > timeout
             ):
-                kill_reason = "timeout"
+                elapsed = now - start_ts
+                watchdog_cpu_elapsed = (
+                    os.times().user + os.times().system - watchdog_cpu_start
+                )
+                if elapsed > 3 * timeout and watchdog_cpu_elapsed < 10:
+                    kill_reason = "suspend_gap"
+                else:
+                    kill_reason = "timeout"
                 break
             if absolute_ceiling is not None and now - start_ts > absolute_ceiling:
                 kill_reason = "ceiling"
@@ -1409,6 +1420,12 @@ def _stream_subprocess(
         _terminate_process_tree(proc)
         if kill_reason == "timeout":
             message = f"timed out after {timeout}s"
+        elif kill_reason == "suspend_gap":
+            message = (
+                f"wall-clock elapsed ({int(time.time() - start_ts)}s) far exceeds both the "
+                f"{timeout}s timeout and near-zero watchdog CPU time — the orchestrator "
+                "was suspended, not the executor stuck"
+            )
         elif kill_reason == "idle":
             message = f"was idle for {idle_timeout}s"
         elif kill_reason == "stall":

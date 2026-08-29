@@ -96,3 +96,11 @@ def isolate_context_log_db(tmp_path_factory: pytest.TempPathFactory, monkeypatch
     monkeypatch.setenv("LANEGATE_CONTEXT_LOG_DB", str(db_path))
     return db_path
 
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """Minimal ticket repository used by split analyze tests."""
+    tickets = tmp_path / "tickets"
+    tickets.mkdir()
+    return tmp_path

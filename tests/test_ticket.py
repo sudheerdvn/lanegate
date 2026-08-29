@@ -888,6 +888,24 @@ def test_classify_needs_review_cause_prioritizes_explicit_patterns():
     assert classify_needs_review_cause(ticket) == "protected_path"
 
 
+def test_classify_needs_review_cause_ignores_stale_hibernation_rate_limit_marker():
+    from lanegate.ticket import classify_needs_review_cause, needs_review_recovery_advice
+
+    ticket = {
+        "id": "TICK-548",
+        "status": "needs_review",
+        "_body": (
+            "## Hibernation Reason\n\n"
+            "rate limit or quota interruption (executor exited 429)\n\n"
+            "## Needs Review Reason\n\n"
+            "independent fix executor unavailable"
+        ),
+    }
+
+    assert classify_needs_review_cause(ticket) == "unknown"
+    assert "recover-rate-limited-reviews" not in needs_review_recovery_advice(ticket)
+
+
 def test_classify_needs_review_cause_identifies_exhausted_auto_fix():
     from lanegate.ticket import classify_needs_review_cause, needs_review_recovery_advice
 
@@ -1004,6 +1022,48 @@ def test_needs_attention():
 
 # --- quarantine ---
 
+
+
+def test_active_rate_limit_hibernation_structured_429_overrides_hard_error():
+    from lanegate.ticket import _active_rate_limit_hibernation, _is_resumable_rate_limit
+
+    text = (
+        "rate limit or quota interruption\n"
+        "ERROR: invalid_request_error: unknown model\n"
+        '{"error":"rate_limit","api_error_status":429}'
+    )
+
+    assert _is_resumable_rate_limit(text, rate_limit_detected=True)
+    assert _active_rate_limit_hibernation({"_body": text})
+
+
+def test_active_rate_limit_hibernation_hard_error_without_structured_429_is_not_resumable():
+    from lanegate.ticket import _active_rate_limit_hibernation
+
+    ticket = {
+        "_body": "rate limit or quota interruption; invalid_request_error: unknown model"
+    }
+
+    assert not _active_rate_limit_hibernation(ticket)
+
+
+def test_active_rate_limit_hibernation_ignores_embedded_429_without_marker():
+    """TICK-732: a stray structured 429 line embedded in an error snippet that
+    lanegate wrote WITHOUT the rate-limit marker (e.g. a transient 429 in an
+    executor transcript, then an interrupt) must not classify the hibernation
+    as rate-limited — that hides the ticket from the human-attention view and
+    hands it to resume-watch's quota timer."""
+    from lanegate.ticket import _active_rate_limit_hibernation, _is_resumable_rate_limit
+
+    snippet = (
+        "## Hibernation Reason\n"
+        "executor interrupted by SIGINT (exit 130)\n"
+        "**Error Output Snippet:**\n"
+        '{"type":"result","subtype":"error_during_execution","api_error_status":429}'
+    )
+    assert not _active_rate_limit_hibernation({"status": "hibernated", "_body": snippet})
+    # the live-transcript caller still short-circuits on a structured 429
+    assert _is_resumable_rate_limit(snippet, rate_limit_detected=False)
 
 
 def test_attention_summary_ignores_stale_hibernation_reason(tmp_path):
@@ -1895,4 +1955,43 @@ def test_upsert_body_section_with_nested_subheadings():
     assert "summary 1" not in body2
     assert "finding 1" not in body2
     assert body2.count("### Findings") == 1
+
+
+def test_collect_notes_global_md_nudge(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+    from lanegate.ticket import collect_cross_ticket_change_notes, write_ticket
+
+    tickets_dir = tmp_path / ".lanegate" / "tickets"
+    tickets_dir.mkdir(parents=True)
+
+    t1 = {
+        "id": "TICK-101",
+        "title": "First ticket",
+        "status": "done",
+        "touches": ["src/foo.py"],
+        "change_notes": {"src/foo.py": "added foo feature"},
+        "_path": tickets_dir / "TICK-101.md",
+    }
+    write_ticket(t1)
+
+    new_ticket = {"id": "TICK-102", "touches": ["src/foo.py"]}
+    cnotes = collect_cross_ticket_change_notes(new_ticket, tickets_dir, {"ticket_prefix": "TICK"})
+    assert "**src/foo.py** (TICK-101): added foo feature" in cnotes
+
+    # Shared notes test under ticket module context
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "src_foo.py.md").write_text("file note")
+
+    # Without global.md -> nudge present
+    shared_no_global = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+    assert "file note" in shared_no_global
+    assert "NOTE: No global.md exists." in shared_no_global
+
+    # With global.md -> unchanged per-file notes, no nudge
+    (notes_root / "global.md").write_text("global invariant")
+    shared_with_global = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+    assert "global invariant" in shared_with_global
+    assert "file note" in shared_with_global
+    assert "NOTE: No global.md exists." not in shared_with_global
 

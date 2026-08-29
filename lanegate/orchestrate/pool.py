@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 
+from lanegate import APP_NAME
 from lanegate.budget import DispatchMeter, metering_supported_for
 from lanegate.config import (
     CONFIG_FILENAME,
@@ -27,6 +28,7 @@ from lanegate.config import (
 )
 from lanegate.executor import (
     _CLAUDE_SUBPROCESS_TYPES,
+    _SESSION_RESUME_TYPES,
     _check_aider_parser_rejection,
     build_executor_cmd,
     executor_types_with,
@@ -79,6 +81,28 @@ _DEFAULT_HEARTBEAT_SECONDS = 30.0
 # run_fix_agent's fix-pass dispatch) fail this one ticket via their existing
 # "executor exited nonzero" handling instead of raising past them.
 _CONFIG_ERROR_EXIT_CODE = 78
+
+# Substrings that mark a nonzero exit as "the --resume session id was
+# rejected / stale" rather than a genuine task failure. When one of these
+# appears with an active resume_session_id, invoke_executor retries once
+# without --resume (losing the prior conversation context but letting the
+# ticket proceed). Kept deliberately anchored on resume/session wording so a
+# task that merely failed on its own merits is not silently retried at
+# double cost. codex's exact string is listed first; the rest are the
+# generic shapes cursor-agent / agy / claude emit for an unknown session.
+_RESUME_REJECTION_MARKERS = (
+    "thread/resume failed: no rollout found for thread id",
+    "no rollout found",
+    "session not found",
+    "no such session",
+    "unknown session id",
+    "invalid session id",
+    "session has expired",
+    "session expired",
+    "could not resume session",
+    "failed to resume session",
+    "resume failed",
+)
 
 
 class WorktreeGuardViolation(RuntimeError):
@@ -134,17 +158,31 @@ def _assert_path_in_worktree(tool_name: str, path: str | Path, worktree_root: Pa
 
 def _is_main_checkout_bookkeeping_path(path: str, cfg: dict, repo_root: Path) -> bool:
     """True if `path` is lanegate's own control-plane bookkeeping (ticket
-    status files, top-level config) rather than user source code an
-    executor's own dispatch could plausibly have touched.  These routinely
-    change in the main checkout during concurrent orchestration -- a
-    sibling ticket's status-transition commit, a human editing
-    .lanegate.yml -- and are not evidence of an executor escaping its
-    assigned worktree.
+    status files, top-level config, generated analysis/log state) or project
+    documentation -- rather than user source code an executor's own dispatch
+    could plausibly have touched.  These routinely change in the main checkout
+    during concurrent orchestration -- a sibling ticket's status-transition
+    commit, an analyze pass rewriting a `file_skeletons.json`, a human editing
+    `.lanegate.yml` or a supervision-session doc -- and are not evidence of an
+    executor escaping its assigned worktree.
+
+    The isolation-leak check exists to catch an executor writing *shared source
+    code* into the main checkout instead of its worktree, so the whitelist is
+    deliberately broad: lanegate's own state tree, top-level config, the docs/
+    tree and root-level Markdown are treated as bookkeeping (see TICK-680,
+    TICK-708, TICK-722).
     """
     normalized = path.strip().strip('"')
     if normalized == CONFIG_FILENAME:
         return True
-    tickets_dir = str(cfg.get("tickets_dir", ".lanegate/tickets"))
+
+    app_state_dir = f".{APP_NAME}"
+    if normalized == app_state_dir or normalized.startswith(app_state_dir + "/"):
+        # Everything lanegate itself generates in the main checkout:
+        # tickets/, context/ skeletons, logs/, prompts/, executor-runs/, notes/.
+        return True
+
+    tickets_dir = str(cfg.get("tickets_dir", f".{APP_NAME}/tickets"))
     if os.path.isabs(tickets_dir):
         try:
             tickets_dir = os.path.relpath(tickets_dir, repo_root)
@@ -154,7 +192,20 @@ def _is_main_checkout_bookkeeping_path(path: str, cfg: dict, repo_root: Path) ->
     # to that separator so a Windows os.path.normpath("\\") result still
     # compares correctly against them (see TICK-680 review).
     tickets_dir = os.path.normpath(tickets_dir).replace(os.sep, "/")
-    return normalized == tickets_dir or normalized.startswith(tickets_dir + "/")
+    if normalized == tickets_dir or normalized.startswith(tickets_dir + "/"):
+        return True
+
+    # Documentation the supervisor edits during a run: the docs/ tree and
+    # top-level Markdown (README.md, CHANGELOG.md, ...). A *nested* .md
+    # (lanegate/skills/*.md, a package README) is a real project file an
+    # executor edits in its worktree, so a concurrent main-checkout change to
+    # one still counts as a possible leak — only docs/ and root .md are exempt.
+    if normalized.startswith("docs/"):
+        return True
+    if normalized.endswith(".md") and "/" not in normalized:
+        return True
+
+    return False
 
 
 def _main_checkout_leak_diff(before: str, after: str, cfg: dict, repo_root: Path) -> str:
@@ -870,6 +921,10 @@ def invoke_executor(
         executor = dispatch["executor"]
         executor_cfg = get_executor_config(executor, cfg)
         executor_type = executor_cfg.get("type", executor)
+        claude_config_dir = None
+        if executor_type in _CLAUDE_SUBPROCESS_TYPES:
+            configured_bin = executor_cfg.get("bin") or "claude"
+            claude_config_dir = Path.home() / f".{Path(str(configured_bin)).name}"
         reject_ollama_for_code_step(step, executor_type)
         # Resolve the model for this ticket's step after knowing the effective
         # executor type. Per-ticket model overrides from old analysis runs are
@@ -951,6 +1006,7 @@ def invoke_executor(
                 executor, prompt, command_cfg, model=model, touches=touches,
                 analyze_session_id=resume_session_id,
                 worktree_path=worktree_path,
+                claude_config_dir=claude_config_dir,
                 use_stdin=True,
                 max_turns=step_max_turns,
             )
@@ -960,6 +1016,7 @@ def invoke_executor(
                 executor, prompt, command_cfg, model=model, touches=touches,
                 analyze_session_id=resume_session_id,
                 worktree_path=worktree_path,
+                claude_config_dir=claude_config_dir,
                 max_turns=step_max_turns,
             )
     except ConfigError as exc:
@@ -1216,20 +1273,21 @@ def invoke_executor(
         resume_error = (captured_stdout + "\n" + captured_stderr).lower()
         if (
             rc != 0
-            and executor_type == "codex"
-            and step == "implement"
             and resume_session_id is not None
-            and "thread/resume failed: no rollout found for thread id" in resume_error
+            and step in ("implement", "fix")
+            and executor_type in _SESSION_RESUME_TYPES
+            and any(marker in resume_error for marker in _RESUME_REJECTION_MARKERS)
         ):
             fresh_cmd = build_executor_cmd(
                 executor, prompt, command_cfg, model=model, touches=touches,
                 worktree_path=worktree_path,
+                claude_config_dir=claude_config_dir,
                 use_stdin=prompt_stdin is not None,
                 max_turns=step_max_turns,
             )
             if log_stream is not None:
                 log_stream.write(
-                    f"[orchestrate] {ticket['id']}: Codex resume session expired; retrying fresh\n"
+                    f"[orchestrate] {ticket['id']}: {executor} resume session expired/rejected; retrying fresh\n"
                 )
                 log_stream.flush()
             rc, captured_stdout, captured_stderr, kill_reason = stream_executor(fresh_cmd)
@@ -1277,7 +1335,7 @@ def invoke_executor(
         _check_aider_parser_rejection(captured_stdout + "\n" + captured_stderr)
 
     _check_budget()
-    if kill_reason in ('idle', 'stall', 'ceiling', 'timeout'):
+    if kill_reason in ('idle', 'stall', 'ceiling', 'timeout', 'suspend_gap'):
         elapsed_diag = int(time.time() - start_time)
         hb_count = current_status.get("heartbeat_count", 0)
         diag_msg = f"[orchestrate] {tid}: dispatch terminated due to '{kill_reason}' after {elapsed_diag}s ({hb_count} heartbeats received)\n"

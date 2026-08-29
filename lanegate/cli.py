@@ -36,6 +36,7 @@ COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
         "validate",
         "done",
         "hibernate",
+        "reset",
         "stop",
         "needs-review",
         "reopen",
@@ -54,6 +55,8 @@ COMMAND_GROUPS: dict[str, tuple[str, ...]] = {
         "route",
         "stats",
         "analytics",
+        "audit-refactor",
+        "decompose",
         "log",
         "logs",
         "session-summary",
@@ -410,6 +413,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hibernate_p.add_argument("--reason", default="", help="Reason recorded in ticket notes")
 
+    reset_p = sub.add_parser(
+        "reset", help="Discard a non-terminal ticket's worktree and branch, then reopen it"
+    )
+    reset_p.add_argument("ticket_id")
+
     stop_p = sub.add_parser(
         "stop", help="Stop a ticket's live executor: SIGTERM the durable PID, wait, hibernate"
     )
@@ -594,6 +602,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="M",
         help="Milestone tag for this ticket (overrides interactive prompt and config default)",
     )
+
+    audit_refactor_p = sub.add_parser(
+        "audit-refactor", help="Create extraction and wiring draft-ticket pairs for oversized Python files"
+    )
+    audit_refactor_p.add_argument("--threshold", type=int, default=500, metavar="LINES")
+    audit_refactor_p.add_argument("--milestone", default=None, metavar="M")
+    audit_refactor_p.add_argument("--path", default=None, metavar="DIR")
+    decompose_p = sub.add_parser(
+        "decompose", help="Create an extraction and wiring ticket pair for one Python file"
+    )
+    decompose_p.add_argument("file", metavar="FILE")
+    decompose_p.add_argument("--milestone", default=None, metavar="M")
 
     # analyze
     analyze_p = sub.add_parser(
@@ -943,6 +963,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Spawn the watcher detached and exit; survives this terminal closing (no nohup/systemd needed)",
+    )
+    notify_watch_p.add_argument(
+        "--once",
+        dest="notify_watch_once",
+        action="store_true",
+        default=False,
+        help="Check once and exit without creating watcher state or sending a push",
+    )
+    notify_watch_p.add_argument(
+        "--json",
+        dest="notify_watch_json",
+        action="store_true",
+        default=False,
+        help="Emit structured finding records",
     )
 
     # run / orchestrate
@@ -1301,6 +1335,12 @@ def _dispatch(args) -> None:
 
         cmd_hibernate(args.ticket_id, cfg, repo_root, reset=args.reset, reason=args.reason)
 
+    elif args.cmd == "reset":
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.lifecycle import cmd_reset
+
+        cmd_reset(args.ticket_id, cfg, repo_root)
+
     elif args.cmd == "stop":
         cfg, repo_root = _get_cfg_and_root()
         from lanegate.lifecycle import cmd_stop
@@ -1460,6 +1500,19 @@ def _dispatch(args) -> None:
                 _report_analyze_skip(detail)
             except Exception as exc:
                 _report_analyze_skip(exc)
+
+    elif args.cmd in ("audit-refactor", "decompose"):
+        cfg, repo_root = _get_cfg_and_root()
+        from lanegate.orchestrate.audit import cmd_audit_refactor
+
+        cmd_audit_refactor(
+            cfg,
+            repo_root,
+            threshold=getattr(args, "threshold", 500),
+            milestone=args.milestone,
+            path=Path(args.path) if getattr(args, "path", None) else None,
+            target=Path(args.file) if args.cmd == "decompose" else None,
+        )
 
     elif args.cmd == "analyze":
         cfg, repo_root = _get_cfg_and_root()
@@ -1711,16 +1764,20 @@ def _dispatch(args) -> None:
 
     elif args.cmd == "notify-watch":
         cfg, repo_root = _get_cfg_and_root()
-        from lanegate.notify_watch import cmd_notify_watch
+        from lanegate.notify_watch import cmd_notify_watch, cmd_notify_watch_once
 
-        cmd_notify_watch(
-            cfg,
-            repo_root,
-            status=args.notify_watch_status,
-            stop=args.notify_watch_stop,
-            test=args.notify_watch_test,
-            background=args.notify_watch_background,
-        )
+        if args.notify_watch_once:
+            cmd_notify_watch_once(cfg, repo_root, json_output=args.notify_watch_json)
+        else:
+            cmd_notify_watch(
+                cfg,
+                repo_root,
+                status=args.notify_watch_status,
+                stop=args.notify_watch_stop,
+                test=args.notify_watch_test,
+                background=args.notify_watch_background,
+                json_output=args.notify_watch_json,
+            )
 
     elif args.cmd in ("run", "orchestrate"):
         cfg, repo_root = _get_cfg_and_root()

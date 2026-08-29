@@ -14,6 +14,7 @@ from lanegate.timeutil import utc_now_iso as _utc_now_iso
 
 MAX_PATH_LENGTH = 256
 MAX_STRING_LENGTH = 512
+MAX_INTENT_LENGTH = 160
 
 _PHASES = {"analyzing", "implementing", "reviewing", "testing", "waiting"}
 _ACTIVITIES = {
@@ -21,7 +22,7 @@ _ACTIVITIES = {
     "testing", "thinking", "searching", "provider_wait", "stall", "heartbeat",
     "completed",
 }
-_TOOL_CATEGORIES = {"file_read", "file_write", "command", "search", "think", "pytest", "test", "other"}
+_TOOL_CATEGORIES = {"file_read", "file_write", "command", "search", "think", "pytest", "mypy", "test", "other"}
 _TEST_STATUSES = {"running", "pass", "fail", "unknown"}
 _USAGE_KEYS = {"input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd"}
 
@@ -99,6 +100,14 @@ def _safe_label(value: object, default: str | None = None) -> str | None:
     return redact_text(str(value), 96) or default
 
 
+def _safe_intent(value: object) -> str | None:
+    """Keep a short, redacted operator-facing description from an event."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    return redact_text(text, MAX_INTENT_LENGTH) if text else None
+
+
 def _safe_timestamp(value: object) -> str:
     """Keep only a compact ISO-like timestamp; executor text never supplies it."""
     if isinstance(value, str) and len(value) <= 64:
@@ -128,7 +137,7 @@ def _safe_test_summary(value: object) -> dict[str, Any] | None:
     status = value.get("status")
     if status in _TEST_STATUSES:
         result["status"] = status
-    for key in ("passed", "failed"):
+    for key in ("passed", "failed", "errors"):
         number = _safe_number(value.get(key))
         if number is not None:
             result[key] = int(number)
@@ -157,6 +166,7 @@ class ExecutorEvent:
     model: str | None = None
     tool_category: str | None = None  # "file_read", "file_write", "command", "search", "think", "test", "other"
     path: str | None = None
+    intent: str | None = None
     test_summary: dict[str, Any] | None = None
     provider_usage: dict[str, Any] | None = None
     turns: int | None = None
@@ -184,6 +194,7 @@ class ExecutorEvent:
             model=_safe_label(data.get("model")),
             tool_category=data.get("tool_category") if data.get("tool_category") in _TOOL_CATEGORIES else None,
             path=bound_path(data.get("path")),
+            intent=_safe_intent(data.get("intent")),
             test_summary=_safe_test_summary(data.get("test_summary")),
             provider_usage=_safe_provider_usage(data.get("provider_usage")),
             turns=int(turns_val) if turns_val is not None else None,
@@ -198,14 +209,67 @@ def parse_command_category(cmd_text: str) -> tuple[str, str, dict[str, Any] | No
     Never retains full command line or arguments to prevent secret leakage.
     """
     cmd_lower = cmd_text.lower()
-    if any(t in cmd_lower for t in ["pytest", "unittest", "npm test", "jest", "go test", "cargo test", "vitest"]):
-        cat = "pytest" if "pytest" in cmd_lower else "test"
+    if any(t in cmd_lower for t in ["pytest", "mypy", "unittest", "npm test", "jest", "go test", "cargo test", "vitest"]):
+        cat = "pytest" if "pytest" in cmd_lower else "mypy" if "mypy" in cmd_lower else "test"
         return cat, "testing", {"category": cat, "status": "running"}
     elif any(t in cmd_lower for t in ["grep", "rg ", "find ", "locate"]):
         return "search", "searching", None
     elif any(t in cmd_lower for t in ["git diff", "git status", "git log"]):
         return "command", "running_command", None
     return "command", "running_command", None
+
+
+def _test_summary_from_text(text: str) -> dict[str, Any] | None:
+    """Extract bounded test status metadata without retaining command output."""
+    lowered = text.lower()
+    if not any(marker in lowered for marker in ("pytest", "mypy", "passed", "failed", "error", "success", "no issues")):
+        return None
+
+    summary: dict[str, Any] = {"category": "pytest" if "pytest" in lowered else "mypy" if "mypy" in lowered else "test"}
+    passed = re.search(r"\b(\d+)\s+passed\b", lowered)
+    failed = re.search(r"\b(\d+)\s+failed\b", lowered)
+    errors = re.search(r"\b(\d+)\s+errors?\b", lowered)
+    if passed:
+        summary["passed"] = int(passed.group(1))
+    if failed:
+        summary["failed"] = int(failed.group(1))
+    if errors:
+        summary["errors"] = int(errors.group(1))
+
+    if failed or re.search(r"\b[1-9]\d*\s+errors?\b", lowered):
+        summary["status"] = "fail"
+    elif passed or "success" in lowered or "no issues" in lowered or re.search(r"\b0\s+errors?\b", lowered):
+        summary["status"] = "pass"
+    else:
+        summary["status"] = "unknown"
+    return summary
+
+
+def _event_from_semantic_text(
+    text: object,
+    *,
+    executor: str,
+    model: str | None,
+    current_phase: str,
+    intent: object = None,
+) -> ExecutorEvent | None:
+    """Create a bounded progress event from driver-supplied prose or results."""
+    if not isinstance(text, str):
+        return None
+    test_summary = _test_summary_from_text(text)
+    safe_intent = _safe_intent(intent) or _safe_intent(text)
+    if not test_summary and not safe_intent:
+        return None
+    return ExecutorEvent(
+        phase="testing" if test_summary else current_phase,
+        activity="testing" if test_summary else "planning",
+        ts=_utc_now_iso(),
+        executor=executor,
+        model=model,
+        tool_category=test_summary["category"] if test_summary else None,
+        intent=safe_intent,
+        test_summary=test_summary,
+    )
 
 
 def normalize_claude_event(
@@ -231,6 +295,13 @@ def normalize_claude_event(
         if tool:
             data = {"type": "tool_use", **tool}
             event_type = "tool_use"
+        else:
+            text = next((item.get("text") for item in content if isinstance(item, dict) and item.get("type") == "text"), None)
+            semantic_event = _event_from_semantic_text(
+                text, executor=executor, model=model, current_phase=current_phase
+            )
+            if semantic_event:
+                return semantic_event
 
     # Extract model if available
     if event_type == "message_start":
@@ -294,6 +365,7 @@ def normalize_claude_event(
                 executor=executor,
                 model=model,
                 tool_category=category,
+                intent=_safe_intent(inputs.get("description")),
                 test_summary=test_sum,
             )
         elif tool_name in ("Grep", "Glob", "Search"):
@@ -325,6 +397,18 @@ def normalize_claude_event(
             tool_category="think",
         )
 
+    if event_type == "user":
+        content = ((data.get("message") or {}).get("content") or [])
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            result_content = block.get("content")
+            semantic_event = _event_from_semantic_text(
+                result_content, executor=executor, model=model, current_phase=current_phase
+            )
+            if semantic_event:
+                return semantic_event
+
     if event_type == "result":
         usage = data.get("usage") or {}
         raw_usage = {
@@ -345,6 +429,14 @@ def normalize_claude_event(
         )
 
     if event_type in ("assistant", "text"):
+        semantic_event = _event_from_semantic_text(
+            data.get("text") or data.get("content"),
+            executor=executor,
+            model=model,
+            current_phase=current_phase,
+        )
+        if semantic_event:
+            return semantic_event
         return ExecutorEvent(
             phase=current_phase,
             activity="planning",
@@ -422,6 +514,7 @@ def normalize_codex_event(
                     executor=executor,
                     model=model,
                     tool_category=category,
+                    intent=_safe_intent(item.get("description") or item.get("summary")),
                     test_summary=test_sum,
                 )
 
@@ -459,6 +552,13 @@ def normalize_executor_event(
     try:
         data = json.loads(raw_line.strip())
     except (json.JSONDecodeError, TypeError):
+        # Aider has no structured progress stream, but its terminal output can
+        # still carry a concise test result.  Do not reinterpret arbitrary
+        # malformed output from structured or unknown executors as progress.
+        if "aider" in executor:
+            return _event_from_semantic_text(
+                raw_line, executor=executor, model=model, current_phase=phase_for_step(current_phase)
+            )
         return None
 
     if not isinstance(data, dict):
@@ -470,6 +570,16 @@ def normalize_executor_event(
     elif "codex" in executor:
         return normalize_codex_event(data, executor=executor, model=model, current_phase=current_phase)
     else:
+        semantic_text = data.get("toolSummary") or data.get("response") or data.get("content") or data.get("message")
+        semantic_event = _event_from_semantic_text(
+            semantic_text,
+            executor=executor,
+            model=model,
+            current_phase=current_phase,
+            intent=data.get("toolAction") or data.get("toolSummary"),
+        )
+        if semantic_event:
+            return semantic_event
         # Generic JSON event attempt
         if "type" in data:
             if "claude" in str(data.get("type")):

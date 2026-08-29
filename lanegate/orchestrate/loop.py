@@ -48,9 +48,11 @@ from lanegate.executor import (
     DEFAULT_COOLDOWN_TTL_SECONDS,
     available_instances as _available_executor_instances,
     build_executor_cmd,
+    clear_cooldown as _clear_executor_cooldown,
     clear_failure_streak as _clear_pool_failure_streak,
     get_executor_config,
     is_cooling_down as _executor_is_cooling_down,
+    read_cooldown as _read_executor_cooldown,
     record_failure_signature as _record_pool_failure_signature,
     resolve_executor_env,
     write_cooldown as _write_executor_cooldown,
@@ -63,6 +65,7 @@ from lanegate.ticket import (
     _active_rate_limit_hibernation,
     _clean_attention_reason,
     _has_non_rate_limit_hard_error,
+    _is_resumable_rate_limit,
     branch_name,
     is_lanegate_notes_file,
     is_paired_test_file,
@@ -76,6 +79,50 @@ _git_text = git_text
 # Kept at module scope so tests and operators can shorten the bounded
 # cooldown-poll interval without reaching into _drain_loop's closure.
 _COOLDOWN_POLL_SECONDS = 30
+
+
+def _configured_executor_names(cfg: dict) -> list[str]:
+    """Return configured executor instances, in stable first-seen order."""
+    names: list[str] = []
+
+    def add(name: object) -> None:
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+
+    executors = cfg.get("executors") or {}
+    if isinstance(executors, dict):
+        for name, executor_cfg in executors.items():
+            if isinstance(executor_cfg, dict) and executor_cfg.get("type"):
+                add(name)
+    pools = cfg.get("pools") or {}
+    if isinstance(pools, dict):
+        for pool_cfg in pools.values():
+            if isinstance(pool_cfg, dict):
+                for name in pool_cfg.get("executors") or []:
+                    add(name)
+    return names
+
+
+def _auto_reset_elapsed_executor_cooldowns(cfg: dict, repo_root: Path) -> list[str]:
+    """Clear only configured cooldowns with an elapsed, parseable time window."""
+    now = datetime.datetime.now(datetime.UTC)
+    reset: list[str] = []
+    for name in _configured_executor_names(cfg):
+        if not _executor_is_cooling_down(repo_root, name):
+            continue
+        cooldown = _read_executor_cooldown(repo_root, name)
+        until = cooldown.get("until") if cooldown else None
+        if not isinstance(until, str) or not until:
+            continue
+        try:
+            deadline = datetime.datetime.fromisoformat(until.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if deadline.tzinfo is None:
+            continue
+        if deadline.astimezone(datetime.UTC) <= now and _clear_executor_cooldown(repo_root, name):
+            reset.append(name)
+    return reset
 
 # Safety gates (injection scan, blocked-file check, diff parser, static
 # analysis) live in orchestrate/guards.py; re-exported here so
@@ -210,148 +257,20 @@ from .pool import resolve_driver as resolve_driver
 from .status import write_executing_status as write_executing_status
 
 
-def _is_interrupted_exit(exit_code: int) -> bool:
-    # A signal received directly by a child is reported as a negative return
-    # code, while a shell/CLI that catches SIGINT commonly reports 130.
-    return exit_code < 0 or exit_code == 130
 
 
-def _interrupted_exit_reason(exit_code: int) -> str:
-    if exit_code == 130:
-        return "executor interrupted by SIGINT (exit 130)"
-    signum = abs(exit_code)
-    try:
-        signal_name = signal.Signals(signum).name
-    except ValueError:
-        signal_name = f"signal {signum}"
-    return f"executor interrupted by {signal_name} (exit {exit_code})"
 
 
-def _pool_state_path(repo_root: Path) -> Path:
-    return repo_root / ".lanegate" / "pool_state.json"
 
 
-def _load_pool_state(repo_root: Path) -> dict:
-    """Load persisted pool rotation/dispatch state from .lanegate/pool_state.json."""
-    path = _pool_state_path(repo_root)
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
 
 
-def _save_pool_state(
-    repo_root: Path, pool_name: str, rr_index: int, dispatch_counts: dict[str, int]
-) -> None:
-    """Persist pool rotation state so the next orchestrate run continues rotation."""
-    path = _pool_state_path(repo_root)
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        state = {}
-    state[pool_name] = {"rr_index": rr_index, "dispatch_counts": dict(dispatch_counts)}
-    _write_json_atomic(path, state)
 
 
-def _last_cooldown_event(repo_root: Path) -> dict | None:
-    """Return the most recent executor_cooldown event (instance/reason/ts)
-    from the most recently started orchestrate run, or None.
-
-    Resume-watch's own "waiting"/"retrying" phase is instance-agnostic — it
-    just means *some* executor is hibernated for a rate limit — so without
-    this, a caller (run-report's CLI text already reads this from the events
-    log directly) has no way to say *which* pool instance (claude-a,
-    claude-b, codex, ...) actually hit the limit.
-    """
-    session_ts = _resolve_run_session_ts(repo_root, None)
-    if not session_ts:
-        return None
-    cooldowns = [e for e in _load_run_events(repo_root, session_ts) if e.get("event") == "executor_cooldown"]
-    return cooldowns[-1] if cooldowns else None
 
 
-def _kill_pid(pid: int, *, grace_seconds: float = 2.0) -> bool:
-    """Best-effort terminate a PID this process does not own as a child.
-
-    Since these are orphaned executor subprocesses of a dead orchestrate
-    driver (not our own children), there is no Popen handle to call
-    .wait()/.kill() on — only a bare PID recorded in a marker file. SIGTERM
-    first, then SIGKILL if it's still alive after the grace period. Returns
-    True if the PID was alive and a signal was sent, False if it was already
-    gone or unsignalable (e.g. owned by another user).
-    """
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return False
-    deadline = time.time() + grace_seconds
-    while time.time() < deadline and pid_alive(pid):
-        time.sleep(0.05)
-    if pid_alive(pid):
-        force_kill_pid(pid)
-    return True
 
 
-def _reap_orphaned_executor_processes(
-    cfg: dict, repo_root: Path, *, out_stream=None, session_ts: str | None = None
-) -> list[str]:
-    """Kill live executor subprocesses left behind by a dead orchestrate driver.
-
-    _collect_live_lanegate_processes already *detects* this exact
-    situation — a ticket-executor PID still alive while the orchestrator
-    lock that dispatched it is dead — and `lanegate ps` prints it as
-    `[ORPHANED]` for a human to kill by hand. That detection is reused
-    as-is here; this only adds the missing kill + durable-event + hibernate
-    steps, so an orphan left running unsupervised gets bounded by
-    the next `lanegate run` invocation instead of running until someone
-    happens to notice via `lanegate ps`.
-
-    A driver killed via SIGKILL/OOM can't run any in-process cleanup of its
-    own, so this is an external reconciliation point (the next orchestrate
-    run's startup, called from the same site as
-    `_reconcile_stale_executor_markers`), not a same-process try/finally.
-    """
-    stream = out_stream if out_stream is not None else sys.stderr
-    reaped: list[str] = []
-    for p in _collect_live_lanegate_processes(cfg, repo_root):
-        if p["kind"] != "ticket-executor" or not p["orphaned"]:
-            continue
-        pid = p["pid"]
-        tid = p["ticket_id"]
-        print(
-            f"[orchestrate] {tid}: orphaned executor PID {pid} still running with no live "
-            "driver - killing",
-            file=stream,
-        )
-        killed = _kill_pid(pid)
-        _append_run_event(
-            repo_root,
-            session_ts,
-            "orphan_reaped",
-            ticket_id=tid,
-            pid=pid,
-            killed=killed,
-            reason=p["detail"],
-        )
-        _remove_executor_markers(repo_root, tid)
-
-        tickets_dir = repo_root / cfg["tickets_dir"]
-        tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-        ticket = next((t for t in tickets if t.get("id") == tid), None)
-        if ticket is not None and ticket.get("status") == "in_progress":
-            from lanegate.lifecycle import cmd_hibernate
-
-            cmd_hibernate(
-                tid,
-                cfg,
-                repo_root,
-                reason=(
-                    f"orphaned executor PID {pid} reaped by orchestrate: its driver "
-                    "process was no longer alive"
-                ),
-            )
-        reaped.append(tid)
-    return reaped
 
 
 # ---------------------------------------------------------------------------
@@ -359,132 +278,10 @@ def _reap_orphaned_executor_processes(
 # ---------------------------------------------------------------------------
 
 
-def _recent_hibernation_status(ticket: dict) -> bool:
-    """Whether a hibernation timestamp is still within the cooldown window."""
-    raw = ticket.get("status_changed_at")
-    if not isinstance(raw, str):
-        return False
-    text = raw.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        changed_at = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return False
-    if changed_at.tzinfo is None:
-        return False
-    now = datetime.datetime.now(datetime.UTC)
-    return now - datetime.timedelta(seconds=DEFAULT_COOLDOWN_TTL_SECONDS) <= changed_at <= now
 
 
-def _pool_instance_healthy(repo_root: Path, cfg: dict, instance_name: str) -> bool:
-    """Return whether a named pool instance is available for new work.
-
-    The executor cooldown is authoritative. A hibernated ticket marker only
-    fills the brief persistence gap while that cooldown is being recorded, so
-    legacy markers expire with the same fallback TTL as executor cooldowns.
-    """
-    if _executor_is_cooling_down(repo_root, instance_name):
-        return False
-    tickets_dir = repo_root / cfg.get("tickets_dir", ".lanegate/tickets")
-    try:
-        tickets, _ = load_all_tickets(tickets_dir, cfg.get("ticket_prefix", "TICK"), cfg)
-    except (OSError, ValueError):
-        # A missing or malformed ticket directory must not make an otherwise
-        # healthy executor unavailable. Lifecycle validation owns that error.
-        return True
-    marker = f"pool instance: {instance_name}"
-    return not any(
-        t.get("status") == "hibernated"
-        and _active_rate_limit_hibernation(t)
-        and _recent_hibernation_status(t)
-        and marker in (t.get("_body") or "")
-        for t in tickets
-    )
 
 
-def resolve_pool_executor(
-    step: str,
-    ticket: dict,
-    cfg: dict,
-    repo_root: Path,
-    *,
-    pool_name: str | None = None,
-    excluded: set[str] | None = None,
-    healthy_only: bool = False,
-    running_counts: dict[str, int] | None = None,
-    rr_index: dict[str, int] | None = None,
-    dispatch_counts: dict[str, int] | None = None,
-) -> str | None:
-    """Resolve *step* to a healthy pool instance when a pool is available.
-
-    This is the common pool-dispatch seam for implement, analyze, and review.
-    ``healthy_only`` is used after a rate limit: it declines to select an
-    exhausted instance instead of falling back to the ordinary driver.
-    """
-    driver_name = resolve_driver(step, ticket, cfg)
-    if (step in ("implement", "fix") and ticket.get("executor")) or (
-        step == "review" and ticket.get("reviewer")
-    ):
-        return driver_name
-
-    if pool_name is None:
-        pool_name, _ = resolve_ticket_pool(cfg, ticket)
-    pool_cfg = (cfg.get("pools") or {}).get(pool_name) if pool_name else None
-    if not isinstance(pool_cfg, dict):
-        # A named review/implement driver can be cooling down even without a
-        # pool.  ``healthy_only`` is a hard promise to callers: never quietly
-        # turn an empty healthy set into an exhausted direct driver.
-        if healthy_only and not _pool_instance_healthy(repo_root, cfg, driver_name):
-            return None
-        return driver_name
-
-    assert pool_name is not None  # pool_cfg is a dict only when pool_name was truthy (line above)
-    excluded = excluded or set()
-    candidates = [
-        name for name in pool_cfg.get("executors") or [] if name not in excluded
-    ]
-    if not candidates:
-        return None if healthy_only else driver_name
-    healthy = [name for name in candidates if _pool_instance_healthy(repo_root, cfg, name)]
-    if healthy_only and not healthy:
-        return None
-    # New dispatches must never spend an attempt on a known-cooling account.
-    # The old ``healthy or candidates`` fallback is what selected Claude A
-    # after its weekly quota had already been recorded.
-    if not healthy:
-        return None
-    pick_from = healthy
-
-    running_counts = running_counts or {}
-    dispatch_counts = dispatch_counts or {}
-
-    # Prefer instances that still have room under their own
-    # executors[name].max_parallel cap (running_counts is the caller's live
-    # concurrent-dispatch count, e.g. pool_running for implement; callers
-    # that don't track one, like analyze/review, pass none and this is a
-    # no-op). Only fall back to a capacity-exhausted instance when literally
-    # every candidate is already full — that means the global gate let more
-    # work through than the pool can absorb without overloading someone, and
-    # dispatching anyway (today's behavior) beats stalling the run outright.
-    def _has_capacity(name: str) -> bool:
-        cap = (cfg.get("executors") or {}).get(name, {}).get("max_parallel")
-        return cap is None or running_counts.get(name, 0) < cap
-
-    available = [name for name in pick_from if _has_capacity(name)]
-    pick_from = available or pick_from
-
-    if pool_cfg.get("strategy", "least-loaded") == "round-robin":
-        index = (rr_index or {}).get(pool_name, 0)
-        chosen = pick_from[index % len(pick_from)]
-        if rr_index is not None:
-            rr_index[pool_name] = index + 1
-        return chosen
-
-    return min(
-        pick_from,
-        key=lambda name: (running_counts.get(name, 0), dispatch_counts.get(name, 0)),
-    )
 
 
 # Review subagent and review-related daemon helpers live in
@@ -522,7 +319,6 @@ from .autofix import run_fix_agent as run_fix_agent
 # Consecutive drafts that must fail with the identical stderr text before
 # _analyze_drafts treats it as a systemic problem and stops the whole pass
 # rather than a per-ticket content issue.
-_ANALYZE_SYSTEMIC_FAILURE_THRESHOLD = 2
 
 # Consecutive same-signature executor failures on one pool instance, within
 # _POOL_FAILURE_STREAK_WINDOW_S of each other, treated as equivalent to a
@@ -532,983 +328,118 @@ _POOL_FAILURE_STREAK_THRESHOLD = 5
 _POOL_FAILURE_STREAK_WINDOW_S = 900
 
 
-_ANALYZE_FAILURE_VOLATILE_ID_RE = re.compile(
-    r'''(?ix)
-    (?P<key>
-        ["']?(?:session|message|request)[_-]?id["']?
-        | ["']?uuid["']?
-    )
-    \s*[:=]\s*
-    (?P<value>["'][^"']*["']|[^\s,}\]]+)
-    '''
-)
-_ANALYZE_FAILURE_UUID_RE = re.compile(
-    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
-    re.IGNORECASE,
-)
-_ANALYZE_FAILURE_TIMESTAMP_RE = re.compile(
-    r"\b\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-][0-2]\d:?[0-5]\d)?\b"
-)
-_ANALYZE_FAILURE_USAGE_RE = re.compile(
-    r'''(?ix)
-    (?P<key>
-        ["']?(?:total_)?cost(?:_usd)?["']?
-        | ["']?(?:input|output|cache(?:_creation|_read)?|reasoning)[_-]?tokens?["']?
-        | ["']?(?:duration(?:_api)?_?ms|duration_seconds|num_turns)["']?
-    )
-    \s*[:=]\s*
-    -?\d+(?:\.\d+)?
-    '''
-)
 
 
-def _normalize_analyze_failure_reason(reason: str) -> str:
-    """Return a stable comparison key for executor failure diagnostics.
-
-    Executor stderr is retained verbatim for operators, but common per-run
-    metadata must not prevent the draft-analysis circuit breaker from
-    recognizing one repeated systemic failure.
-    """
-    normalized = _ANALYZE_FAILURE_VOLATILE_ID_RE.sub(
-        lambda match: f"{match.group('key')}=<volatile>", reason
-    )
-    normalized = _ANALYZE_FAILURE_UUID_RE.sub("<uuid>", normalized)
-    normalized = _ANALYZE_FAILURE_TIMESTAMP_RE.sub("<timestamp>", normalized)
-    normalized = _ANALYZE_FAILURE_USAGE_RE.sub(
-        lambda match: f"{match.group('key')}=<usage>", normalized
-    )
-    return normalized
 
 
-class _Tee:
-    """Write-only file-like object that mirrors writes to two streams."""
-
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data: str) -> int:
-        for stream in self._streams:
-            stream.write(data)
-        return len(data)
-
-    def flush(self) -> None:
-        for stream in self._streams:
-            stream.flush()
 
 
-def _analyze_drafts(
-    cfg: dict,
-    repo_root: Path,
-    milestone: str | None = None,
-    tickets_dir=None,
-    ticket_ids: set[str] | None = None,
-    pool_name: str | None = None,
-    session_ts: str | None = None,
-) -> bool:
-    """Analyze eligible draft tickets, one at a time, until one is dispatchable.
-
-    Skips drafts outside the active milestone filter, and outside an explicit
-    ticket scope when one is given — a run scoped to specific
-    ticket(s) must not go analyze unrelated drafts elsewhere in the milestone
-    just because none of the requested ticket(s) were ready to dispatch.
-    On analyze failure, logs a warning and continues to the next draft — UNLESS
-    the same failure reason repeats on consecutive drafts, which means the
-    problem is systemic (bad executor config, a parsing bug, ...) rather than
-    that one ticket's content. Repeating the same doomed call across every
-    remaining draft just burns model cost for a guaranteed-identical failure,
-    so the whole draft-analysis pass stops early in that case instead.
-
-    Returns as soon as a successful analyze produces a dispatchable ticket,
-    instead of draining the entire draft backlog first — ready-to-implement
-    work must never sit idle behind unrelated drafts still waiting their turn.
-    Callers sit inside a loop that re-invokes this (checking for dispatchable
-    work first each time), so remaining drafts still get analyzed — just
-    interleaved with dispatch instead of front-loaded before it.
-
-    Returns True when the analysis subprocess was interrupted by the operator.
-    Callers must halt the run rather than dispatching another draft or worker.
-    """
-    from lanegate.analyze import cmd_analyze
-    from lanegate.ticket import load_all_tickets as _load_all_tickets
-
-    if tickets_dir is None:
-        tickets_dir = repo_root / cfg["tickets_dir"]
-
-    tickets, _ = _load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    drafts = [
-        t
-        for t in tickets
-        if (t.get("status") == "draft" or (t.get("status") == "open" and not t.get("touches")))
-        and (milestone is None or t.get("milestone") == milestone)
-        and (ticket_ids is None or t["id"] in ticket_ids)
-    ]
-    last_failure_reason: str | None = None
-    repeat_count = 0
-    for t in drafts:
-        if (t.get("review_summary") or "").startswith("already_resolved:") or "analyze: ticket premise appears already resolved" in (t.get("_body") or ""):
-            print(f"[orchestrate] skipping draft {t['id']} (already flagged as already_resolved)")
-            continue
-        print(f"[orchestrate] auto-analyzing draft {t['id']}")
-        captured = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(_Tee(sys.stderr, captured)):
-                cmd_analyze(t["id"], cfg, repo_root, pool_name=pool_name)
-        except (Exception, SystemExit) as exc:
-            code = exc.code if isinstance(exc, SystemExit) else exc
-            reason = captured.getvalue().strip() or str(exc)
-            if isinstance(code, int) and _is_interrupted_exit(code):
-                print(
-                    f"[orchestrate] draft analysis for {t['id']} was interrupted — "
-                    "stopping further dispatch",
-                    file=sys.stderr,
-                )
-                return True
-            comparison_reason = _normalize_analyze_failure_reason(reason)
-            print(
-                f"WARNING: analyze failed for {t['id']}: {code} — skipping",
-                file=sys.stderr,
-            )
-            _append_run_event(
-                repo_root, session_ts, "ticket_outcome",
-                ticket_id=t["id"], outcome="failure", reason=reason,
-            )
-            if comparison_reason and comparison_reason == last_failure_reason:
-                repeat_count += 1
-            else:
-                last_failure_reason = comparison_reason
-                repeat_count = 1
-            if repeat_count >= _ANALYZE_SYSTEMIC_FAILURE_THRESHOLD:
-                print(
-                    f"ERROR: analyze failed with the same error on {repeat_count} consecutive "
-                    f"drafts — this looks like a systemic executor/config problem, not a "
-                    f"per-ticket issue. Stopping draft analysis instead of repeating the same "
-                    f"failure across the rest of the queue.",
-                    file=sys.stderr,
-                )
-                return False
-            continue
-        last_failure_reason = None
-        repeat_count = 0
-        if next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids):
-            return False
-    return False
 
 
-def _queue_code_complete_reviews(
-    cfg: dict,
-    repo_root: Path,
-    *,
-    milestone: str | None = None,
-    ticket_ids: set[str] | None = None,
-    exclude_ticket_ids: set[str] | None = None,
-    reason: str = "awaiting independent review",
-) -> list[str]:
-    """Move eligible completed work into the existing review-resume path.
-
-    A ticket with a changes-requested verdict is deliberately excluded: it must
-    stay visible to the fix workflow, not be silently sent through a fresh
-    review. This helper is used both at startup and before draft analysis.
-    """
-    from lanegate.lifecycle import mark_review_pending
-
-    tickets_dir = repo_root / cfg["tickets_dir"]
-    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    queued: list[str] = []
-    for ticket in tickets:
-        if ticket.get("status") != "code_complete" or ticket.get("review_verdict"):
-            continue
-        if exclude_ticket_ids is not None and ticket["id"] in exclude_ticket_ids:
-            continue
-        if milestone is not None and ticket.get("milestone") != milestone:
-            continue
-        if ticket_ids is not None and ticket["id"] not in ticket_ids:
-            continue
-        mark_review_pending(ticket, cfg, repo_root, reason=reason)
-        queued.append(ticket["id"])
-    return queued
 
 
-def _print_draft_analysis_plan(
-    cfg: dict,
-    repo_root: Path,
-    milestone: str | None = None,
-    tickets_dir=None,
-    ticket_ids: set[str] | None = None,
-) -> None:
-    """Print which drafts would be analyzed (dry-run mode)."""
-    from lanegate.ticket import load_all_tickets as _load_all_tickets
-
-    if tickets_dir is None:
-        tickets_dir = repo_root / cfg["tickets_dir"]
-
-    tickets, _ = _load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    drafts = [
-        t
-        for t in tickets
-        if (t.get("status") == "draft" or (t.get("status") == "open" and not t.get("touches")))
-        and (milestone is None or t.get("milestone") == milestone)
-        and (ticket_ids is None or t["id"] in ticket_ids)
-    ]
-    for t in drafts:
-        print(f"[dry-run] would analyze draft {t['id']}")
 
 
-def _executor_alive(ticket: dict, cfg: dict, repo_root: Path) -> bool:
-    """Return whether the recorded executor/session marker is still alive."""
-    tid = ticket["id"]
-    state = repo_root / ".lanegate"
-    pid_path = state / f"{tid}.pid"
-    session_path = state / f"{tid}.session"
-
-    if pid_path.exists():
-        try:
-            return pid_alive(int(pid_path.read_text(encoding="utf-8").strip()))
-        except ValueError:
-            return False
-
-    if session_path.exists():
-        try:
-            started = float(session_path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            return False
-        timeout_seconds = float(cfg.get("orphan_timeout_hours", 4)) * 3600
-        return (time.time() - started) < timeout_seconds
-
-    return False
 
 
-def _hibernate_orphaned(cfg: dict, repo_root: Path) -> int:
-    """Reclaim work stranded by a prior session.
-
-    Covers two cases: in-progress tickets whose executor marker is missing
-    or stale, and code_complete tickets left with no review verdict. The
-    latter can only be seen here because this runs once at startup, before
-    this run has dispatched any worker of its own -- so any code_complete
-    ticket already on the board was left behind by a session that ended
-    (crashed, was killed, or errored) before it could hand the ticket to
-    review. Routing it through mark_review_pending reuses the same
-    hibernated/review_pending resume orchestrate already trusts for
-    rate-limited reviews, so it flows back through review on this run
-    instead of sitting until someone runs `lanegate review` by hand.
-    """
-    from lanegate.lifecycle import cmd_hibernate
-
-    tickets_dir = repo_root / cfg["tickets_dir"]
-    tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    orphaned = [
-        t
-        for t in tickets
-        if t.get("status") == "in_progress" and not _executor_alive(t, cfg, repo_root)
-    ]
-    stranded_code_complete = [
-        t
-        for t in tickets
-        if t.get("status") == "code_complete" and not t.get("review_verdict")
-    ]
-
-    if not orphaned and not stranded_code_complete:
-        return 0
-
-    if orphaned:
-        print(
-            f"[orchestrate] {len(orphaned)} orphaned in_progress ticket(s) detected from prior session"
-        )
-        for t in orphaned:
-            branch = t.get("branch") or t["id"].lower()
-            print(f"[orchestrate] hibernating {t['id']} - partial work preserved in branch {branch}")
-            cmd_hibernate(t["id"], cfg, repo_root, reason="orphaned prior executor session")
-
-    if stranded_code_complete:
-        print(
-            f"[orchestrate] {len(stranded_code_complete)} code_complete ticket(s) stranded from a "
-            "prior session (no review verdict) — queuing for review resume"
-        )
-        queued = _queue_code_complete_reviews(
-            cfg,
-            repo_root,
-            reason="orphaned prior session: code_complete with no review verdict",
-        )
-        for tid in queued:
-            print(f"[orchestrate] queuing {tid} for review resume")
-
-    print("[orchestrate] resuming board clearing from hibernated tickets (priority-boosted)")
-    return len(orphaned) + len(stranded_code_complete)
 
 
-def _gather_rate_limit_texts(
-    worktree_path: Path | None = None, captured_stdout: str = "", captured_stderr: str = ""
-) -> list[str]:
-    """Collect the raw stdout/stderr text checked for rate-limit needles.
-
-    Shared by _is_rate_limit (boolean detection) and the hibernation reason
-    builder, so the raw text that triggered detection isn't thrown away.
-
-    stdout is checked as well as stderr: some executors (notably a ``claude``
-    CLI in non-interactive/print mode) write user-facing error/JSON responses
-    to stdout, not stderr, so a rate-limit message can land on either stream.
-
-    ``captured_stdout``/``captured_stderr`` (the executor subprocess's own
-    pipes, captured in-memory per call) are the only sources. This used to
-    also read executor.stderr/stderr.log/.lanegate/executor.{stderr,log} out of
-    the ticket's worktree, but nothing in the codebase ever wrote those files
-    — they were pure agent-writable attack surface, since an executor agent
-    has full write access to its own worktree and could plant rate-limit-
-    shaped text there to force its own ticket (or, via rate_limit_halt, every
-    in-flight ticket) into hibernation on demand. ``worktree_path`` stays in the signature only for call-site
-    stability.
-    """
-    del worktree_path
-    return [captured_stdout, captured_stderr]
 
 
-def _has_structured_rate_limit(texts: list[str]) -> bool:
-    """Return True if any text contains a JSON object with api_error_status == 429."""
-    for text in texts:
-        if not text:
-            continue
-        for line in text.splitlines():
-            line_str = line.strip()
-            if "api_error_status" not in line_str:
-                continue
-            try:
-                data = json.loads(line_str)
-                if isinstance(data, dict) and data.get("api_error_status") in (429, "429"):
-                    return True
-            except Exception:
-                if re.search(r'"api_error_status"\s*:\s*429\b', line_str):
-                    return True
-    return False
 
 
-def _is_rate_limit(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> bool:
-    if _is_interrupted_exit(exit_code):
-        return False
-    # exit_code == 429 is NOT checked here: OS process exit codes are
-    # truncated to a single byte (exit(N) -> N & 0xFF), so a subprocess that
-    # tried to signal HTTP 429 would surface as 173, never 429. No executor
-    # path in this codebase (subprocess-based or the ollama REST path, which
-    # raises on non-2xx and is swallowed into a plain exit code) can produce
-    # a literal 429 here — detection relies on structured fields or text matching below.
-    texts = _gather_rate_limit_texts(
-        worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-    )
-    # An executor-provided HTTP 429 is unambiguous.  Check it before scanning
-    # the rest of a (possibly very large) transcript for setup-error phrases:
-    # a session-limit result can include earlier command/configuration output,
-    # but must still enter the cooldown/resume path.
-    if _has_structured_rate_limit(texts):
-        return True
-    text = _rate_limit_detection_text(texts)
-    if _has_non_rate_limit_hard_error(text):
-        return False
-    patterns = (
-        r"\byou(?:'|’)ve hit your [\w\- ]{0,24}limit\b",
-        r"\b[\w\- ]{0,24}limit\b.{0,120}\b(?:try again|resets?|raise it)\b",
-        r"\b(?:try again|resets?|raise it)\b.{0,120}\b[\w\- ]{0,24}limit\b",
-        r"\brate[_ -]?limit[_ -]?exceeded\b",
-        r"\btoo many requests\b",
-        r"\bquota (?:exceeded|limit|reached)\b",
-        r"\bpurchase more credits\b",
-        r"\bclaude\.ai subscription\b",
-        r"\bretry-after\s*:\s*\d+\b",
-        r"\b429\b.{0,120}\b(?:too many requests|rate limit|quota)\b",
-        r"\b(?:too many requests|rate limit|quota)\b.{0,120}\b429\b",
-        r"\b(?:error|hit|reached|exceeded|retry|throttled|throttle)\b.{0,120}\brate limit\b",
-        r"\brate limit\b.{0,120}\b(?:error|hit|reached|exceeded|retry|throttled|throttle)\b",
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
 
 
-def _rate_limit_detection_text(texts: list[str]) -> str:
-    """Return executor-output text relevant for rate-limit classification.
-
-    Codex-style failures can echo large generated diffs or source excerpts
-    before ending with ``turn interrupted``.  A bare phrase like "rate limit"
-    inside that code is not an executor quota error, so diff/code-looking lines
-    are filtered before the stricter classifier runs.
-    """
-    lines: list[str] = []
-    for text in texts:
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith(("+++", "---", "@@")):
-                continue
-            if line[:1] in {"+", "-"}:
-                continue
-            lines.append(line)
-    return "\n".join(lines).lower()
-
-
-_MAX_RATE_LIMIT_EXCERPT = 2000  # cap raw text embedded in the hibernation reason
 
 # The shared ticket.py classifier distinguishes resumable rate-limit
 # hibernations from human-actionable hibernations; this loop also uses its
 # marker to identify pool instances that remain in cooldown.
-def _is_executor_setup_error(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> bool:
-    """True when retrying more tickets would repeat the same executor setup failure."""
-    if exit_code == 0 or _is_interrupted_exit(exit_code):
-        return False
-    text = _rate_limit_detection_text(
-        _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
-    )
-    return _has_non_rate_limit_hard_error(text)
 
 
-def _executor_setup_error_reason(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> str:
-    raw = "\n".join(
-        t
-        for t in _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
-        if t.strip()
-    ).strip()
-    header = f"executor setup error (executor exited {exit_code})"
-    if not raw:
-        return header
-    if len(raw) > _MAX_RATE_LIMIT_EXCERPT:
-        raw = raw[-_MAX_RATE_LIMIT_EXCERPT:]
-        raw = f"...(truncated)...\n{raw}"
-    return f"{header}\n\nRaw executor output:\n{raw}"
 
 
-_AUTH_ERROR_PATTERNS = (
-    r"\bauthentication required\b",
-    r"\bauthentication failed or timed out\b",
-    r"\bplease visit the url to log in\b",
-)
 
 
-def _is_auth_error(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> bool:
-    """True when the executor exited because it needs interactive re-authentication.
 
-    Distinguishes an expired OAuth session (e.g. agy's Google device-code
-    prompt) from an ordinary implementation failure, so orchestrate can
-    hibernate with an actionable reason and cool down the instance instead of
-    burning retries on a prompt that non-interactive dispatch can never answer.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Dispatch helpers live separately; re-export the historical loop surface.
+from .loop_dispatch import (_auth_error_reason,_executor_alive,_executor_setup_error_reason,_gather_rate_limit_texts,_hibernate_orphaned,_interrupted_exit_reason,_is_auth_error,_is_executor_setup_error,_is_interrupted_exit,_is_rate_limit,_kill_pid,_last_cooldown_event,_load_pool_state,_pool_instance_healthy,_pool_state_path,_rate_limit_detection_text,_rate_limit_reason,_watchdog_termination_reason,_reap_orphaned_executor_processes,_recent_hibernation_status,_save_pool_state,resolve_pool_executor)
+
+from .loop_analyze import _Tee, _analyze_drafts, _normalize_analyze_failure_reason, _print_draft_analysis_plan, _queue_code_complete_reviews
+
+from .loop_recovery import _abort_rebase, _collect_prior_notes, _conflicted_files, _continue_rebase, _extract_conflict_hunks, _format_conflict_detail, _prepend_context, _record_auto_claimed_touches, _run_rebase, _scope_only_needs_review_files, _ticket_has_real_progress, _worktree_is_dirty, is_mid_rebase, recover_scope_only_needs_review_tickets
+
+
+def _is_suspend_gap(captured_stdout: str = "", captured_stderr: str = "") -> bool:
+    """True when LaneGate's own watchdog classified the kill as an orchestrator
+    suspend gap (wall-clock elapsed far exceeds timeout while watchdog CPU time
+    barely moved).
+
+    Matches the diagnostic line ``invoke_executor`` appends *after* the kill
+    (``dispatch terminated due to 'suspend_gap'``) — a LaneGate-generated string,
+    not executor-controlled output. Used only to phrase the hibernation reason:
+    the hibernate-vs-halt decision is made by ``_watchdog_termination_reason``.
     """
-    if exit_code == 0 or _is_interrupted_exit(exit_code):
-        return False
-    text = _rate_limit_detection_text(
-        _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
-    )
-    return any(re.search(pattern, text) for pattern in _AUTH_ERROR_PATTERNS)
+    return "dispatch terminated due to 'suspend_gap'" in (captured_stdout + "\n" + captured_stderr)
 
 
-def _auth_error_reason(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> str:
-    raw = "\n".join(
-        t
-        for t in _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
-        if t.strip()
-    ).strip()
-    header = f"executor requires re-authentication (executor exited {exit_code})"
-    if not raw:
-        return header
-    if len(raw) > _MAX_RATE_LIMIT_EXCERPT:
-        raw = raw[-_MAX_RATE_LIMIT_EXCERPT:]
-        raw = f"...(truncated)...\n{raw}"
-    return f"{header}\n\nRaw executor output:\n{raw}"
-
-
-def _rate_limit_reason(
-    exit_code: int,
-    worktree_path: Path | None = None,
-    captured_stdout: str = "",
-    captured_stderr: str = "",
-) -> str:
-    """Build a hibernation reason that includes the raw executor error text.
-
-    Without this, the boolean-only detection in _is_rate_limit discards
-    whatever the executor actually printed (e.g. a reset-time hint), so a
-    future auto-resume watcher would have nothing to parse.
+def _checkpoint_before_hibernate(repo_root: Path, wt: str | Path | None, tid: str, kind: str) -> None:
+    """WIP-commit any uncommitted edits in the ticket worktree before a
+    hibernation path discards the run context, so ``lanegate run`` can resume
+    the work later. No-op when there is no usable worktree; a checkpoint
+    failure is logged, not raised (hibernation must still proceed).
     """
-    raw = "\n".join(
-        t
-        for t in _gather_rate_limit_texts(
-            worktree_path, captured_stdout=captured_stdout, captured_stderr=captured_stderr
-        )
-        if t.strip()
-    ).strip()
-    header = f"{_RATE_LIMIT_MARKER} (executor exited {exit_code})"
-    if not raw:
-        return header
-    if len(raw) > _MAX_RATE_LIMIT_EXCERPT:
-        raw = raw[-_MAX_RATE_LIMIT_EXCERPT:]
-        raw = f"...(truncated)...\n{raw}"
-    return f"{header}\n\nRaw executor output:\n{raw}"
-
-
-def _collect_prior_notes(ticket: dict, repo_root: Path) -> str:
-    """Return hibernation recovery context for *ticket*, if any."""
-    recovery_path = repo_root / ".lanegate" / "recovery" / f"{ticket['id']}.md"
-    if ticket.get("status") not in ("hibernated", "needs_review") or not recovery_path.exists():
-        return ""
-    recovery_text = recovery_path.read_text(encoding="utf-8", errors="replace").strip()
-    if not recovery_text:
-        return ""
-    return "## Hibernation Recovery Context\n\n" + recovery_text
-
-
-
-def _conflicted_files(worktree_path: Path) -> list[str]:
-    """Return files with unresolved conflict markers in the active rebase."""
-
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=U"],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True, encoding="utf-8",
-        )
-    except FileNotFoundError:
-        return []
-    if result.returncode != 0:
-        return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
-
-
-def _extract_conflict_hunks(text: str) -> list[str]:
-    hunks: list[str] = []
-    current: list[str] = []
-    in_hunk = False
-    for line in text.splitlines():
-        if line.startswith("<<<<<<<"):
-            in_hunk = True
-            current = [line]
-            continue
-        if in_hunk:
-            current.append(line)
-            if line.startswith(">>>>>>>"):
-                hunks.append("\n".join(current))
-                current = []
-                in_hunk = False
-    if current:
-        hunks.append("\n".join(current))
-    return hunks
-
-
-def _format_conflict_detail(worktree_path: Path, conflict_files: list[str]) -> str:
-    """Return only conflict hunks for executor resume context."""
-
-    sections = [
-        "## Conflict resolution required",
-        "",
-        "The following files have merge conflicts from rebasing onto main.",
-        "Resolve ONLY the conflict markers shown. Do not rewrite unrelated code.",
-        "After resolving, the implementation should still satisfy the close criteria.",
-    ]
-    for rel_path in conflict_files:
-        path = worktree_path / rel_path
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            sections.extend(["", f"### {rel_path}", f"(could not read file: {exc})"])
-            continue
-
-        hunks = _extract_conflict_hunks(text)
-        sections.extend(["", f"### {rel_path}"])
-        if hunks:
-            for idx, hunk in enumerate(hunks, start=1):
-                sections.extend(["", f"#### Hunk {idx}", "```", hunk, "```"])
-        else:
-            sections.append("(no conflict marker hunks found)")
-    return "\n".join(sections)
-
-
-def _worktree_is_dirty(worktree_path: Path) -> bool:
-    """Return True if the worktree has uncommitted tracked changes.
-
-    `git rebase` refuses to run against these, so callers must check this
-    before attempting a resume rebase rather than treating the resulting
-    git error as a generic rebase failure.
-    """
-    if not worktree_path.exists():
-        return False
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree_path,
-        capture_output=True,
-        text=True, encoding="utf-8",
-    )
-    return any(line and not line.startswith("??") for line in result.stdout.splitlines())
-
-
-def _ticket_has_real_progress(worktree_path: Path) -> bool:
-    """Heuristic for whether a rate-limited ticket is worth
-    resuming on a healthy sibling pool instance rather than hibernating.
-
-    True when the worktree shows real work-in-progress: commits ahead of
-    main, or uncommitted tracked changes. False is more consistent with a
-    stuck/looping session that burned quota without producing anything —
-    that case should still hibernate rather than risk depleting a second
-    pool instance's quota on the same bad ticket.
-    """
-    if not worktree_path.exists():
-        return False
-    try:
-        if check_worktree_has_commits(worktree_path):
-            return True
-    except FileNotFoundError:
-        return False
-    return _worktree_is_dirty(worktree_path)
-
-
-def _run_rebase(worktree_path: Path, *, base: str | None = None) -> tuple[str, str]:
-    """Return (clean|conflict|error, detail) after rebasing onto the trunk."""
-
-    if not worktree_path.exists():
-        return "error", f"missing worktree: {worktree_path}"
-    base = base or resolve_trunk_branch({}, worktree_path)
-    result = subprocess.run(
-        ["git", "rebase", base],
-        cwd=worktree_path,
-        capture_output=True,
-        text=True, encoding="utf-8",
-    )
-    if result.returncode == 0:
-        return "clean", result.stdout.strip()
-
-    conflict_files = _conflicted_files(worktree_path)
-    if conflict_files:
-        return "conflict", _format_conflict_detail(worktree_path, conflict_files)
-
-    detail = result.stderr.strip() or result.stdout.strip() or f"git rebase {base} failed"
-    return "error", detail
-
-
-def _continue_rebase(worktree_path: Path, conflict_files: list[str]) -> tuple[bool, str]:
-    if not worktree_path.exists():
-        return False, f"missing worktree: {worktree_path}"
-    try:
-        add_cmd = ["git", "add", "--", *conflict_files] if conflict_files else ["git", "add", "-u"]
-        add_result = subprocess.run(add_cmd, cwd=worktree_path, capture_output=True, text=True, encoding="utf-8")
-    except FileNotFoundError:
-        return False, f"missing worktree: {worktree_path}"
-    if add_result.returncode != 0:
-        detail = add_result.stderr.strip() or add_result.stdout.strip() or "git add failed"
-        return False, detail
-
-    env = os.environ.copy()
-    env.setdefault("GIT_EDITOR", "true")
-    try:
-        result = subprocess.run(
-            ["git", "rebase", "--continue"],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True, encoding="utf-8",
-            env=env,
-        )
-    except FileNotFoundError:
-        return False, f"missing worktree: {worktree_path}"
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    detail = result.stderr.strip() or result.stdout.strip() or "git rebase --continue failed"
-    return False, detail
-
-
-def _abort_rebase(worktree_path: Path) -> None:
-    try:
-        subprocess.run(["git", "rebase", "--abort"], cwd=worktree_path, capture_output=True, text=True, encoding="utf-8")
-    except FileNotFoundError:
-        pass
-
-
-def is_mid_rebase(worktree_path: Path) -> bool:
-    """Return True if git rebase is currently in progress in worktree_path."""
-    if not worktree_path or not worktree_path.exists():
-        return False
-    try:
-        for folder in ("rebase-merge", "rebase-apply"):
-            res = subprocess.run(
-                ["git", "rev-parse", "--git-path", folder],
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-            if res.returncode == 0:
-                p_str = res.stdout.strip()
-                if p_str:
-                    p = Path(p_str)
-                    full_p = p if p.is_absolute() else (worktree_path / p)
-                    if full_p.exists():
-                        return True
-    except FileNotFoundError:
-        pass
-    return False
-
-
-
-def _prepend_context(ticket: dict, *sections: str) -> dict:
-    parts = [section.strip() for section in sections if section and section.strip()]
-    if not parts:
-        return ticket
-    updated = dict(ticket)
-    body = updated.get("_body", "")
-    updated["_body"] = "\n\n".join(parts + [body])
-    return updated
-
-
-_SCOPE_ONLY_NEEDS_REVIEW_REASON = re.compile(
-    r"committed files outside touches list:\s*(?P<paths>.+)"
-)
-
-
-def _scope_only_needs_review_files(ticket: dict) -> set[str] | None:
-    """Return the declared scope-drift files for a narrowly recoverable ticket."""
-    if ticket.get("status") != "needs_review":
-        return None
-    body = ticket.get("_body") or ""
-    header = "## Needs Review Reason"
-    if header not in body:
-        return None
-    reason = body.split(header, 1)[1].lstrip("\n")
-    if "\n##" in reason:
-        reason = reason.split("\n##", 1)[0]
-    match = _SCOPE_ONLY_NEEDS_REVIEW_REASON.fullmatch(reason.strip())
-    if not match:
-        return None
-    paths = {path.strip() for path in match.group("paths").split(",") if path.strip()}
-    return paths or None
-
-
-def _record_auto_claimed_touches(ticket: dict, paths: set[str]) -> None:
-    """Persist a human-readable audit trail for an automatic scope expansion."""
-    if not paths:
+    if not (wt and Path(wt).exists() and (Path(wt) / ".git").exists()):
         return
-    entry = "- Auto-claimed after implementation: " + ", ".join(f"`{path}`" for path in sorted(paths))
-    header = "## Scope Updates"
-    body = (ticket.get("_body") or "").rstrip()
-    if header not in body:
-        ticket["_body"] = f"{body}\n\n{header}\n\n{entry}\n"
-        return
-    before, _, remainder = body.partition(header)
-    section, separator, following = remainder.partition("\n##")
-    updated_section = section.rstrip() + "\n" + entry
-    ticket["_body"] = before.rstrip() + f"\n\n{header}\n" + updated_section
-    if separator:
-        ticket["_body"] += separator + following
-    ticket["_body"] += "\n"
-
-
-def recover_scope_only_needs_review_tickets(
-    cfg: dict,
-    repo_root: Path,
-    *,
-    milestone: str | None = None,
-    ticket_ids: set[str] | None = None,
-    dry_run: bool = False,
-) -> list[str]:
-    """Return scope-only paused tickets to the normal review/merge pipeline.
-
-    ``needs_review`` is always a human-safety state by default.  This opt-in
-    exception recognizes only the exact stale-touches reason emitted by the
-    touched-files guard, re-derives the branch diff, atomically claims every
-    missing path, and repeats the intervening safety gates before review.
-    """
-    if cfg.get("auto_claim_touches") is not True:
-        return []
-
-    from lanegate.claim_file import claim_files
-    from lanegate.concurrency import SafeguardLockHeld, safeguard_lock
-    from lanegate.lifecycle import _commit_generated_ticket_write, _mark_needs_review, cmd_reopen, cmd_review
-    from lanegate.safeguards import run_safeguards
-    from lanegate.ticket import write_ticket
-
-    tickets_dir = repo_root / cfg["tickets_dir"]
-    all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-    recovered: list[str] = []
-
-    for ticket in all_tickets:
-        tid = ticket["id"]
-        if milestone is not None and ticket.get("milestone") != milestone:
-            continue
-        if ticket_ids is not None and tid not in ticket_ids:
-            continue
-        recorded_missing = _scope_only_needs_review_files(ticket)
-        if recorded_missing is None:
-            continue
-
-        wt_value = ticket.get("worktree")
-        wt = Path(wt_value) if wt_value else None
-        if wt is None or not wt.exists():
-            print(f"[orchestrate] {tid}: scope recovery skipped — missing worktree", file=sys.stderr)
-            continue
-
-        declared = set(ticket.get("touches") or [])
-        if "*" in declared:
-            continue
-        committed = _committed_files(wt)
-        unexpected = committed - declared
-        unexpected = {path for path in unexpected if not is_paired_test_file(path, declared)}
-        unexpected = {path for path in unexpected if not is_lanegate_notes_file(path)}
-        if not unexpected or unexpected != recorded_missing:
-            print(
-                f"[orchestrate] {tid}: scope recovery skipped — worktree diff no longer "
-                "matches the recorded scope-drift reason",
-                file=sys.stderr,
-            )
-            continue
-
-        blocked = [
-            f"{path} [{rule}]"
-            for path in sorted(committed)
-            for is_blocked, rule in [_is_blocked_file(path, cfg.get("protected_paths") or [])]
-            if is_blocked
-        ]
-        if blocked:
-            print(
-                f"[orchestrate] {tid}: scope recovery skipped — hard-blocked paths: "
-                + "; ".join(blocked),
-                file=sys.stderr,
-            )
-            continue
-
-        sensitive_patterns = cfg.get("security_sensitive_paths") or []
-        sensitive = [
-            path
-            for path in sorted(committed)
-            if any(
-                fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(Path(path).name, pattern)
-                for pattern in sensitive_patterns
-            )
-        ]
-        if sensitive:
-            print(
-                f"[orchestrate] {tid}: scope recovery skipped — security-sensitive paths: "
-                + ", ".join(sensitive),
-                file=sys.stderr,
-            )
-            continue
-
-        if dry_run:
-            print(
-                f"[orchestrate] {tid}: would auto-claim {sorted(unexpected)} and return it to review"
-            )
-            recovered.append(tid)
-            continue
-
-        claimed, detail = claim_files(sorted(unexpected), tid, cfg, repo_root)
-        if not claimed:
-            print(
-                f"[orchestrate] {tid}: scope recovery skipped — could not claim files: {detail}",
-                file=sys.stderr,
-            )
-            continue
-
-        try:
-            cmd_reopen(tid, cfg, repo_root)
-        except SystemExit:
-            # cmd_reopen leaves its actionable conflict/error detail on the
-            # ticket and stderr; never let one paused ticket abort the board.
-            continue
-
-        refreshed, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
-        restored = next((item for item in refreshed if item["id"] == tid), None)
-        if not restored or restored.get("status") != "code_complete":
-            continue
-
-        # cmd_reopen clears the old Needs Review section, so write the scope
-        # audit after it restores the ticket rather than letting that cleanup
-        # discard the newly recorded explanation.
-        _record_auto_claimed_touches(restored, unexpected)
-        write_ticket(restored)
-        _commit_generated_ticket_write(
-            repo_root, Path(restored["_path"]), tid, "auto-claimed touches", cfg
+    from lanegate.lifecycle import checkpoint_dirty_worktree
+    try:
+        checkpoint_dirty_worktree(
+            repo_root,
+            Path(wt),
+            msg=f"wip: uncommitted edits preserved before hibernation ({kind})",
         )
-
-        try:
-            with safeguard_lock(repo_root, tid):
-                safeguards_passed, safeguard_reason = run_safeguards(
-                    "pre_complete", restored, cfg, wt
-                )
-        except SafeguardLockHeld as exc:
-            _mark_needs_review(restored, cfg, repo_root, reason=f"pre_complete safeguards unavailable: {exc}")
-            continue
-        if not safeguards_passed:
-            _mark_needs_review(
-                restored, cfg, repo_root, reason=f"pre_complete safeguards failed: {safeguard_reason}"
-            )
-            continue
-
-        findings = _run_static_analysis(wt, cfg)
-        threshold = int((cfg.get("static_analysis") or {}).get("threshold", 0))
-        if findings and len(findings) > threshold:
-            _mark_needs_review(
-                restored,
-                cfg,
-                repo_root,
-                reason=f"static analysis findings ({len(findings)}): {'; '.join(findings[:5])}",
-            )
-            continue
-        ok_cp, cp_err = check_control_plane_compliance(restored, repo_root=repo_root, cfg=cfg, worktree_path=wt, check_review_independence=False)
-        if not ok_cp:
-            _mark_needs_review(
-                restored,
-                cfg,
-                repo_root,
-                reason=f"control plane compliance failed: {cp_err}",
-            )
-            continue
-
-        acceptance_findings = _run_acceptance_contract_audit(restored, repo_root, cfg)
-        if acceptance_findings and resolve_acceptance_contract_mode(cfg) == "blocker":
-            _invoke_cmd_review(
-                cmd_review,
-                tid,
-                cfg,
-                repo_root,
-                verdict="changes_requested",
-                summary="acceptance-contract audit failed",
-                findings="\n".join(acceptance_findings),
-            )
-            continue
-
+    except RuntimeError as exc:
         print(
-            f"[orchestrate] {tid}: auto-claimed {sorted(unexpected)} — returning to review",
+            f"[orchestrate] {tid}: failed to checkpoint worktree before hibernation: {exc}",
             file=sys.stderr,
         )
-        try:
-            cmd_review(tid, cfg, repo_root)
-        except SystemExit:
-            # Review failures are persisted by cmd_review; other tickets still
-            # need a chance to run.
-            continue
-        recovered.append(tid)
-
-    return recovered
 
 
 def cmd_orchestrate(
@@ -1750,6 +681,7 @@ def _cmd_orchestrate_body(
     # rather than replacing it — an id must still pass the usual eligibility
     # filtering (status/deps/lock) in next_batch() to actually be dispatched.
     effective_ticket_ids: set[str] | None = None
+    milestone_excluded_ticket_scope = False
     if tickets:
         effective_ticket_ids = {tid.strip() for tid in tickets if tid and tid.strip()}
         if not effective_ticket_ids:
@@ -1765,6 +697,30 @@ def _cmd_orchestrate_body(
                 f"WARNING: --tickets includes unknown ticket id(s): {', '.join(unknown_ids)}",
                 file=sys.stderr,
             )
+        if effective_milestone:
+            milestone_excluded = [
+                ticket
+                for ticket in scope_all_tickets
+                if ticket["id"] in effective_ticket_ids
+                and ticket.get("milestone") != effective_milestone
+            ]
+            if milestone_excluded:
+                milestone_excluded_ticket_scope = True
+                excluded_details = ", ".join(
+                    f"{ticket['id']} (milestone {ticket.get('milestone')!r})"
+                    for ticket in milestone_excluded
+                )
+                milestones = {ticket.get("milestone") for ticket in milestone_excluded}
+                if len(milestones) == 1 and None not in milestones:
+                    fix = f"--milestone {next(iter(milestones))}"
+                else:
+                    fix = "--milestone <actual milestone>"
+                print(
+                    "WARNING: --tickets scope excludes ticket(s) due to the active "
+                    f"milestone filter {effective_milestone!r}: {excluded_details}\n"
+                    f"  Re-run with {fix} or --all to include them.",
+                    file=sys.stderr,
+                )
 
     max_parallel_detail = resolve_max_parallel_detail(cfg, override=max_parallel)
     effective_max = int(max_parallel_detail["value"])
@@ -1774,13 +730,20 @@ def _cmd_orchestrate_body(
     session_ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     log_path = logs_dir / f"orchestrate-{session_ts}.log"
 
-    # Keep 10 most recent in logs_dir; move older to archive, purge archive after 30 days.
+    # Keep 10 most recent in logs_dir; move older to archive. Archive purge is
+    # opt-in (run_history_purge_enabled, default False) and only then bounded
+    # by run_history_retention_days (default 60) -- see
+    # run_summary.list_run_summaries, which reads both logs_dir and archive_dir
+    # so archived runs stay visible in run history unless a project explicitly
+    # enables the purge.
     archive_dir = logs_dir / "archive"
     archive_dir.mkdir(exist_ok=True)
-    cutoff = datetime.datetime.now() - datetime.timedelta(days=30)
-    for f in archive_dir.glob("orchestrate-*.log"):
-        if datetime.datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
-            f.unlink(missing_ok=True)
+    if cfg.get("run_history_purge_enabled", False):
+        retention_days = cfg.get("run_history_retention_days", 60)
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=retention_days)
+        for f in archive_dir.glob("orchestrate-*.log"):
+            if datetime.datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
+                f.unlink(missing_ok=True)
     old_logs = sorted(logs_dir.glob("orchestrate-*.log"))
     for old in old_logs[:-9]:
         old.rename(archive_dir / old.name)
@@ -1901,6 +864,7 @@ def _cmd_orchestrate_body(
                     verbose=verbose,
                     pool_name=effective_pool,
                     ticket_ids=effective_ticket_ids,
+                    milestone_excluded_ticket_scope=milestone_excluded_ticket_scope,
                     _orig_out=_orig_out,
                     _log_f=_log_f,
                     session_ts=report_session_ts,
@@ -1936,6 +900,7 @@ def _drain_loop(
     verbose: bool = False,
     pool_name: str | None = None,
     ticket_ids: set[str] | None = None,
+    milestone_excluded_ticket_scope: bool = False,
     _orig_out=None,
     _log_f=None,
     session_ts: str | None = None,
@@ -2469,6 +1434,14 @@ def _drain_loop(
             if reconciled is not None:
                 break
 
+            reset_cooldowns = _auto_reset_elapsed_executor_cooldowns(cfg, repo_root)
+            if reset_cooldowns:
+                print(
+                    "[orchestrate] reset elapsed executor cooldown(s): "
+                    + ", ".join(reset_cooldowns),
+                    file=sys.stderr,
+                )
+
         # Approved, ready-to-merge tickets always drain ahead of dispatching
         # new open work -- otherwise WIP (and the touch-locks it holds) keeps
         # growing while already-finished tickets sit waiting, which is
@@ -2501,10 +1474,9 @@ def _drain_loop(
                 batch = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
 
         # Ready open/hibernated work always dispatches ahead of newly-created
-        # drafts — only spend a loop iteration analyzing drafts when there is
-        # nothing already dispatchable, so a steady trickle of new drafts can
-        # never starve an existing backlog.
-        if auto_analyze and not batch:
+        # drafts. Analyze only after selecting that work, and only when it
+        # leaves spare batch capacity, so drafts cannot displace the backlog.
+        if auto_analyze and len(batch) < max_parallel:
             if dry_run:
                 _print_draft_analysis_plan(
                     cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir, ticket_ids=ticket_ids
@@ -2513,10 +1485,34 @@ def _drain_loop(
                 if _analyze_drafts(
                     cfg, repo_root, milestone=milestone, tickets_dir=tickets_dir,
                     ticket_ids=ticket_ids, pool_name=pool_name, session_ts=session_ts,
-                ):
+                ) is True:
                     interrupt_halt = True
                     break
-                batch = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
+                # Re-select only to pick up newly-analyzed work. Preserve the
+                # selection that existed before analysis: a draft can become
+                # the greedy, non-parallel-safe head of the refreshed query,
+                # but it must not displace ready work already selected for
+                # this dispatch. Only add safe, non-overlapping candidates.
+                refreshed = next_batch(cfg, repo_root, milestone=milestone, ticket_ids=ticket_ids)
+                if not batch:
+                    batch = refreshed
+                elif all(ticket.get("parallel_safe") for ticket in batch):
+                    selected_ids = {ticket["id"] for ticket in batch}
+                    selected_touches = {
+                        touch for ticket in batch for touch in ticket.get("touches") or []
+                    }
+                    for ticket in refreshed:
+                        ticket_touches = set(ticket.get("touches") or [])
+                        if (
+                            len(batch) >= max_parallel
+                            or ticket["id"] in selected_ids
+                            or not ticket.get("parallel_safe")
+                            or touches_overlap(ticket_touches, selected_touches)
+                        ):
+                            continue
+                        batch.append(ticket)
+                        selected_ids.add(ticket["id"])
+                        selected_touches.update(ticket_touches)
 
         if not batch:
             all_tickets, _ = load_all_tickets(tickets_dir, cfg["ticket_prefix"], cfg)
@@ -2616,8 +1612,14 @@ def _drain_loop(
                         f"  {'; '.join(statuses_needed)}"
                     )
             else:
-                scope_desc = "in this ticket scope" if ticket_ids else "in this milestone"
-                print(f"[orchestrate] board clear — no more open tickets {scope_desc}")
+                if milestone_excluded_ticket_scope:
+                    print(
+                        "[orchestrate] no scoped tickets match the active milestone filter "
+                        "— see warning above"
+                    )
+                else:
+                    scope_desc = "in this ticket scope" if ticket_ids else "in this milestone"
+                    print(f"[orchestrate] board clear — no more open tickets {scope_desc}")
 
             _print_review_queue(all_tickets, milestone=milestone, stream=orig_out)
             _print_continuation_steps(all_tickets, milestone=milestone, stream=orig_out)
@@ -3008,7 +2010,12 @@ def _drain_loop(
                 # cmd_review's guard silently rejects the verdict write below
                 # (see resume_review_pending's docstring for the full chain).
                 resume_review_pending(fresh_ticket, cfg, repo_root)
-                review_executor = resolve_driver("review", fresh_ticket, cfg)
+                rotation_enabled = (
+                    bool(cfg.get("reviewer_rotation"))
+                    and not ((cfg.get("steps") or {}).get("review") or {}).get("driver")
+                    and not fresh_ticket.get("reviewer")
+                )
+                review_executor = "reviewer_rotation" if rotation_enabled else resolve_driver("review", fresh_ticket, cfg)
                 if review_executor in ("none", "auto-none"):
                     _invoke_cmd_review(
                         _cmd_review, tid, cfg, repo_root, verdict="approved",
@@ -3233,6 +2240,7 @@ def _drain_loop(
                         # so a later run's pool selection can tell which
                         # instance is currently exhausted and route around it.
                         reason = f"{reason}\n\npool instance: {pool_instance}"
+                    _checkpoint_before_hibernate(repo_root, wt, tid, "rate_limit")
                     if cfg.get("on_rate_limit") == "resume":
                         print(
                             f"[orchestrate] {tid}: rate limit hit — work preserved, hibernating.\n"
@@ -3279,9 +2287,34 @@ def _drain_loop(
                         # hibernate on the same limit), but no fresh work is pulled.
                         rate_limit_halt = True
                     return True
+                watchdog_reason = _watchdog_termination_reason(captured_stderr)
+                if watchdog_reason:
+                    # A watchdog kill (idle/stall/ceiling/timeout, or an orchestrator
+                    # suspend gap) is a per-ticket event: preserve any uncommitted work
+                    # and hibernate this ticket for retry, but do NOT halt the run —
+                    # the other in-flight and queued tickets are independent.
+                    if _is_suspend_gap(captured_stdout, captured_stderr):
+                        watchdog_reason = (
+                            "executor watchdog resumed after an apparent orchestrator "
+                            "suspend gap; preserving work for retry rather than treating "
+                            "this as a genuine executor timeout"
+                        )
+                    _checkpoint_before_hibernate(repo_root, wt, tid, "watchdog")
+                    print(
+                        f"[orchestrate] {tid}: {watchdog_reason} — work preserved, hibernating.\n"
+                        f"  Re-run when ready: lanegate run",
+                        file=sys.stderr,
+                    )
+                    if not verbose:
+                        _status(tid, "hibernated", orig_out, _log_f)
+                    cmd_hibernate(tid, cfg, repo_root, reason=watchdog_reason)
+                    _log_outcome(tid, "hibernated", reason=watchdog_reason)
+                    return True
+
                 if _is_interrupted_exit(exit_code):
                     reason = _interrupted_exit_reason(exit_code)
                     interrupt_halt = True
+                    _checkpoint_before_hibernate(repo_root, wt, tid, "interrupt")
                     print(
                         f"[orchestrate] {tid}: {reason} — work preserved, hibernating.\n"
                         f"  Re-run when ready: lanegate run",
@@ -3307,6 +2340,7 @@ def _drain_loop(
                     _write_executor_cooldown(repo_root, cooldown_instance, reason)
                     if pool_instance:
                         reason = f"{reason}\n\npool instance: {pool_instance}"
+                    _checkpoint_before_hibernate(repo_root, wt, tid, "auth_error")
                     print(
                         f"[orchestrate] {tid}: executor requires re-authentication — "
                         "work preserved, hibernating.\n"
@@ -3333,6 +2367,7 @@ def _drain_loop(
                     if pool_instance:
                         reason = f"{reason}\n\npool instance: {pool_instance}"
                     executor_setup_halt = True
+                    _checkpoint_before_hibernate(repo_root, wt, tid, "executor_setup_error")
                     print(
                         f"[orchestrate] {tid}: executor setup/configuration error — "
                         "work preserved, hibernating and halting this run.\n"
@@ -3901,7 +2936,12 @@ def _drain_loop(
                         f"[orchestrate] {tid}: acceptance-contract audit found "
                         f"{len(acceptance_findings)} finding(s) (advisory — deferring to reviewer)"
                     )
-                review_executor = resolve_driver("review", review_ticket, cfg)
+                rotation_enabled = (
+                    bool(cfg.get("reviewer_rotation"))
+                    and not ((cfg.get("steps") or {}).get("review") or {}).get("driver")
+                    and not review_ticket.get("reviewer")
+                )
+                review_executor = "reviewer_rotation" if rotation_enabled else resolve_driver("review", review_ticket, cfg)
                 if review_executor in ("none", "auto-none"):
                     # Explicitly configured no LLM review: record auto-approved verdict
                     _invoke_cmd_review(

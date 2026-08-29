@@ -39,9 +39,9 @@ def test_scope_only_pause_is_claimed_recorded_and_sent_to_review(tmp_path):
         path.write_text(text.replace("---\nBackground.", "review_verdict: approved\n---\nBackground."))
 
     with (
-        patch("lanegate.orchestrate._committed_files", return_value={"src/declared.py", "src/support.py"}),
-        patch("lanegate.orchestrate._run_static_analysis", return_value=[]),
-        patch("lanegate.orchestrate._run_acceptance_contract_audit", return_value=[]),
+        patch("lanegate.orchestrate.loop_recovery._committed_files", return_value={"src/declared.py", "src/support.py"}),
+        patch("lanegate.orchestrate.loop_recovery._run_static_analysis", return_value=[]),
+        patch("lanegate.orchestrate.loop_recovery._run_acceptance_contract_audit", return_value=[]),
         patch("lanegate.lifecycle.cmd_reopen", side_effect=fake_reopen) as reopen,
         patch("lanegate.lifecycle.cmd_review", side_effect=fake_review) as review,
     ):
@@ -64,7 +64,7 @@ def test_scope_recovery_does_not_bypass_hard_blocked_paths(tmp_path):
 
     with (
         patch(
-            "lanegate.orchestrate._committed_files",
+            "lanegate.orchestrate.loop_recovery._committed_files",
             return_value={"src/declared.py", ".github/workflows/checks.yml"},
         ),
         patch("lanegate.lifecycle.cmd_reopen") as reopen,
@@ -87,8 +87,8 @@ def test_recover_scope_only_continues_on_static_analysis_failure(tmp_path):
         path.write_text(path.read_text().replace("status: needs_review", "status: code_complete"))
 
     with (
-        patch("lanegate.orchestrate._committed_files", return_value={"src/declared.py", "src/support.py"}),
-        patch("lanegate.orchestrate._run_static_analysis", return_value=["finding 1"]),
+        patch("lanegate.orchestrate.loop_recovery._committed_files", return_value={"src/declared.py", "src/support.py"}),
+        patch("lanegate.orchestrate.loop_recovery._run_static_analysis", return_value=["finding 1"]),
         patch("lanegate.lifecycle.cmd_reopen", side_effect=fake_reopen),
         patch("lanegate.lifecycle.cmd_review") as review,
         patch("lanegate.lifecycle._mark_needs_review") as mark_nr,

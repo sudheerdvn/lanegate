@@ -603,6 +603,25 @@ def test_next_step_lines_rate_limit_uses_canonical_classifier():
     assert not any("rate-limited" in line for line in lines)
 
 
+def test_next_step_lines_structured_429_overrides_hard_error():
+    ticket = {
+        "id": "TICK-509",
+        "status": "hibernated",
+        "priority": 1,
+        "_body": (
+            "## Hibernation Reason\n\n"
+            "rate limit or quota interruption (executor exited 1)\n\n"
+            "Raw executor output:\n"
+            "ERROR: invalid_request_error: unknown model\n"
+            '{"error":"rate_limit","api_error_status":429}'
+        ),
+    }
+
+    lines = _next_step_lines([ticket])
+
+    assert any("rate-limited" in line for line in lines)
+
+
 def test_next_step_lines_states_auto_retry_for_reviewer_cooldown():
     """A reviewer-cooldown hibernation must be labeled distinctly from a
     plain rate-limit and state that it auto-retries after the recorded time,

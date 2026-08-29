@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+
+import portalocker
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,12 +20,17 @@ from lanegate.config import load_config, resolve_trunk_branch
 from lanegate import executor
 from lanegate.executor import _CLAUDE_SUBPROCESS_TYPES, matching_verification_groups
 from lanegate.safeguards import effective_safeguards
-from lanegate.ticket import load_acceptance_contract_audit, load_change_notes
+from lanegate.ticket import (
+    load_acceptance_contract_audit,
+    load_change_notes,
+    review_findings_sections,
+)
 from lanegate.prompts import (
     _resolve_control_root,
     build_prompt,
     component_for as _component,
     get_bounded_reference_excerpts,
+    get_bounded_shared_notes,
     get_payload_budget,
     load_project_guidance,
     load_prompt_template,
@@ -34,6 +41,85 @@ from lanegate.prompts import (
     truncate_to_budget,
 )
 from lanegate.ticket import load_file_skeletons
+
+
+def resolve_reviewer_rotation(
+    ticket: dict,
+    cfg: dict,
+    state_dir: Path,
+    implementer: str | None = None,
+) -> str | None:
+    """Resolve the next reviewer executor from ``reviewer_rotation``, if configured.
+
+    A per-ticket ``reviewer`` pin always wins.  A ticket already in
+    ``in_review`` keeps its recorded ``review_driver`` rather than advancing
+    the rotation while that review is pending.
+
+    When enabled (and neither ``steps.review.driver`` nor a per-ticket
+    ``reviewer`` pin is set), the next entry after the persisted last-used one
+    is selected, ``.lanegate/reviewer_rotation_state`` is advanced, and the
+    entry is returned.  ``implementer`` entries are skipped so rotation never
+    collapses a review into self-review — independence wins over rotation
+    diversity.  Returns ``None`` (caller resolves an independent reviewer the
+    normal way) when rotation is disabled/pinned, when every rotation entry is
+    the implementer, or when the state lock cannot be acquired.
+
+    The read→select→write of the state file is serialised with an exclusive
+    ``portalocker`` lock so concurrent ticket completions under
+    ``max_parallel > 1`` (``_drain_loop``'s ``ThreadPoolExecutor``) cannot race
+    and hand the same reviewer to multiple tickets.
+    """
+    if ticket.get("reviewer"):
+        return ticket["reviewer"]
+
+    if cfg.get("steps", {}).get("review", {}).get("driver"):
+        return None
+
+    rotation = cfg.get("reviewer_rotation")
+    if not rotation or not isinstance(rotation, list):
+        return None
+
+    if ticket.get("status") == "in_review" and ticket.get("review_driver"):
+        return ticket["review_driver"]
+
+    # Eligible entries exclude the implementer: a rotated reviewer that equals
+    # the implementer is not an independent review, and setting it anyway would
+    # silently bypass the review_fallback self-review guard downstream.
+    eligible = [entry for entry in rotation if entry != implementer]
+    if not eligible:
+        return None
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    state_file = state_dir / "reviewer_rotation_state"
+    lock_file = state_dir / "reviewer_rotation_state.lock"
+
+    try:
+        with portalocker.Lock(str(lock_file), "a", timeout=10):
+            last_used = None
+            if state_file.exists():
+                try:
+                    last_used = state_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+
+            start = rotation.index(last_used) + 1 if last_used in rotation else 0
+            selected = eligible[0]
+            for offset in range(len(rotation)):
+                entry = rotation[(start + offset) % len(rotation)]
+                if entry in eligible:
+                    selected = entry
+                    break
+
+            try:
+                state_file.write_text(selected, encoding="utf-8")
+            except OSError:
+                pass
+            return selected
+    except portalocker.exceptions.LockException:
+        return None
 
 
 class ReviewError(Exception):
@@ -690,6 +776,10 @@ def build_review_prompt(
 
     declared_touches = ticket.get("touches") or []
 
+    shared_notes = get_bounded_shared_notes(root, declared_touches, cfg=cfg, step="review")
+    if shared_notes:
+        trusted_parts.append(shared_notes)
+
     ref_doc_paths = resolve_reference_doc_paths(root, cfg)
     project_guidance = load_project_guidance(
         root, cfg, step="review", relevant_paths=declared_touches,
@@ -843,6 +933,10 @@ def build_review_prompt(
     if _components is not None:
         _components.append(_component("instruction-template", "prompts/review.md", "review", instruction))
         _components.append(_component(
+            "shared-notes", ".lanegate/notes", "review", shared_notes,
+            reason="global-and-touch-relevant" if shared_notes else "no-relevant-notes",
+        ))
+        _components.append(_component(
             "project-guidance", "project_guidance.files", "review", project_guidance,
             reason="matched-and-bounded" if project_guidance else "no-matching-files",
         ))
@@ -933,10 +1027,9 @@ def build_fix_prompt(
         ticket: A parsed ticket dict (as returned by ``parse_ticket``).
         diff: The current ``git diff base..branch`` output for the ticket's
             worktree branch — the diff the fix will build on top of.
-        findings: The review findings text to address (reviewer-produced
-            directive text, not raw ticket-author content — placed in the
-            trusted layer, mirroring how prior findings are treated in
-            ``build_review_prompt``).
+        findings: The latest review findings text to address. Reviewer-produced
+            text remains untrusted, as does the complete finding history read
+            from the ticket body.
         project_root: Root of the managed project.  When provided, a
             ``prompts/fix.md`` override in that directory takes precedence
             over the built-in template.
@@ -958,6 +1051,13 @@ def build_fix_prompt(
     title = ticket.get("title", tid)
     close_criteria = ticket.get("close_criteria", "")
     touches = ", ".join(ticket.get("touches") or []) or "none"
+    finding_sections = review_findings_sections(ticket.get("_body", ""))
+    findings_history = "\n\n".join(
+        f"{header}\n{section}" for header, section in finding_sections
+    )
+    findings_history, _ = truncate_to_budget(
+        findings_history, get_payload_budget("fix", cfg)
+    )
 
     template = load_prompt_template("fix", root)
     instruction = render_prompt(
@@ -975,6 +1075,10 @@ def build_fix_prompt(
         trusted_parts.append(_diff_truncation_note("GIT DIFF", _diff_omitted))
 
     declared_touches = ticket.get("touches") or []
+
+    shared_notes = get_bounded_shared_notes(root, declared_touches, cfg=cfg, step="fix")
+    if shared_notes:
+        trusted_parts.append(shared_notes)
 
     ref_doc_paths = resolve_reference_doc_paths(root, cfg)
     project_guidance = load_project_guidance(
@@ -998,6 +1102,13 @@ def build_fix_prompt(
             "## Review Findings To Address\n\n"
             "See REVIEW FINDINGS below for the specific items raised by the reviewer."
         )
+    if len(finding_sections) > 1:
+        trusted_parts.append(
+            "## Repeated review findings\n\n"
+            "Multiple review rounds reported findings. Before editing, perform a fresh "
+            "subsystem root-cause analysis and fix the underlying cause instead of "
+            "applying a literal one-finding patch."
+        )
 
     full_instruction = "\n\n".join(trusted_parts)
 
@@ -1009,9 +1120,15 @@ def build_fix_prompt(
         untrusted_sections["GIT DIFF"] = diff
     if findings:
         untrusted_sections["REVIEW FINDINGS"] = findings.strip()
+    if findings_history:
+        untrusted_sections["REVIEW FINDINGS HISTORY"] = findings_history
 
     if _components is not None:
         _components.append(_component("instruction-template", "prompts/fix.md", "fix", instruction))
+        _components.append(_component(
+            "shared-notes", ".lanegate/notes", "fix", shared_notes,
+            reason="global-and-touch-relevant" if shared_notes else "no-relevant-notes",
+        ))
         _components.append(_component(
             "project-guidance", "project_guidance.files", "fix", project_guidance,
             reason="matched-and-bounded" if project_guidance else "no-matching-files",
@@ -1022,6 +1139,10 @@ def build_fix_prompt(
         _components.append(_component("git-diff", "worktree diff", "fix", diff, reason="selected-by-ticket"))
         _components.append(_component(
             "review-findings", "reviewer output", "fix", findings, reason="selected-by-ticket" if findings else "no-findings"
+        ))
+        _components.append(_component(
+            "review-findings-history", "ticket review findings", "fix", findings_history,
+            reason="all-review-rounds" if findings_history else "no-history",
         ))
 
     return build_prompt(

@@ -9,7 +9,7 @@
 **Parallel lanes. Protected gates.**
 Every agent gets a lane. Nothing ships without a gate.
 
-LaneGate coordinates coding agents (Claude, Codex, Ollama, aider, etc.) working on one repo: every ticket gets its own git worktree, declared `touches` lock the files a ticket owns so a second agent can't claim them, and nothing reaches `main` without an approved review plus whatever guards you configure. Tickets are Markdown files in your repo. No SaaS, no external project state.
+LaneGate coordinates coding agents (Claude, Codex, Cursor, Kiro, aider, OpenHands, Ollama, …) working on one repo: every ticket gets its own git worktree, declared `touches` lock the files a ticket owns so a second agent can't claim them, and nothing reaches `main` without an approved review plus whatever guards you configure. Tickets are Markdown files in your repo. No SaaS, no external project state.
 
 **You want this if** you've watched an agent merge something half-baked and found out two commits later, or you've had two agents clobber each other's edits in the same checkout.
 
@@ -83,7 +83,7 @@ LaneGate is experimental software for coordinating coding agents on a local repo
 
 **What LaneGate does NOT do:**
 - MCP is not a sandbox. `lanegate mcp` exposes ticket lifecycle commands as native tools, and an agent with access to those tools can claim tickets, create branches, and trigger merges. The MCP server authenticates nothing beyond what the MCP client config enforces.
-- Host executors inherit host permissions. Agents (Claude Code, aider, Codex) run as the invoking OS user with full filesystem and network access. There is no bwrap, seccomp, or container wrapping.
+- Host executors inherit host permissions. Agents (Claude Code, aider, Codex, Cursor, Kiro, OpenHands) run as the invoking OS user with full filesystem and network access. By default there is no bwrap, seccomp, or container wrapping. An experimental opt-in worktree sandbox for `claude` executors exists (`sandbox: worktree`) but is not yet usable with the linked worktrees LaneGate creates — see [docs/executor-capabilities.md](docs/executor-capabilities.md#sandbox-status-reference).
 - The file-based lock is single-machine, single-checkout. Two separate clones on two machines can both claim the same ticket.
 - File-level locks are not semantic dependency analysis. Two tickets can touch different files and still break each other through shared APIs, imports, types, schemas, or runtime behavior. Treat `touches` as a practical coordination boundary, not a proof of correctness.
 
@@ -96,7 +96,7 @@ For the full threat model, executor permissions, and safe usage notes, see [SECU
 ## Known Limitations
 
 - **Lock scope is single-machine, single-checkout.** The file-based concurrency lock at `.lanegate/orchestrator.lock` prevents two `lanegate run` runs on the same checkout from racing, but does not coordinate across separate clones or machines.
-- **No OS-level sandbox in V1.** Agents run as child processes with full user permissions (no bwrap, seccomp, or container wrapping), regardless of which Claude Code permission mode is configured (see the next bullet for that separate, application-level choice). LaneGate inspects the git diff after the agent exits. It cannot observe what the agent read or sent over the network during execution.
+- **No OS-level sandbox by default.** Agents run as child processes with full user permissions (no bwrap, seccomp, or container wrapping), regardless of which Claude Code permission mode is configured (see the next bullet for that separate, application-level choice). LaneGate inspects the git diff after the agent exits. It cannot observe what the agent read or sent over the network during execution. An experimental `sandbox: worktree` opt-in for `claude` executors adds a bwrap/Seatbelt filesystem profile, but it is not yet usable with linked worktrees and provides no network or syscall confinement — treat it as in-development.
 - **Executor permissions come from the executor runtime, not from LaneGate.** `lanegate init` configures Claude Code with a scoped `--allowedTools` set by default so the agent can run headless without interactive prompts, while tools outside that list stay gated. You can instead configure `flags: ["--dangerously-skip-permissions"]`, which disables Claude Code's per-action approval prompts entirely. That's a valid choice for setups like a sandboxed CI runner, but it means the agent acts on anything without confirmation. See [Security Status](docs/security-model.md#headless-permission-options-for-the-claude-executor) for the full set of options.
 
 ---
@@ -220,7 +220,7 @@ see [docs/commands.md](docs/commands.md). `lanegate --help-all` (or `lgt --help-
 
 ## Configuration
 
-`.lanegate.yml` in your repo root, with walk-up discovery so it works from any subdirectory. Covers the delivery profile (`profile: strict` — enforced review independence), executor routing (`claude`, `codex`, `aider`, `ollama`, multi-executor `executor_steps`, dispatch budget caps), `safeguards` (pre/post-merge test gates, including the automatic re-verification against the real merged `main`), UI-ticket visual verification, and deployment `environments`. The Quick Start above shows a minimal `safeguards` block to get going.
+`.lanegate.yml` in your repo root, with walk-up discovery so it works from any subdirectory. Covers the delivery profile (`profile: strict` — enforced review independence), executor routing (`claude`, `codex`, `cursor`, `kiro`, `aider`, `openhands`, `ollama`, multi-executor `executor_steps`, dispatch budget caps), `safeguards` (pre/post-merge test gates, including the automatic re-verification against the real merged `main`), UI-ticket visual verification, and deployment `environments`. The Quick Start above shows a minimal `safeguards` block to get going.
 
 See [docs/config-reference.md](docs/config-reference.md) for every supported key, defaults, and a full annotated example, and [docs/executor-capabilities.md](docs/executor-capabilities.md) for the capability matrix across executors (local-model setup, headless flags, sandbox status).
 
@@ -265,7 +265,7 @@ continuation guarantees.
 
 LaneGate's loopback Python API (`lanegate api`) is built and running today, serving board, ticket, diff, and run state as JSON/SSE. The first local UI is still planned as a small add-on launched with `lanegate ui`: a bundled TypeScript frontend over that API for board scanning, ticket detail, blocked/review triage, diffs, run logs, and read-only settings preview. The CLI remains the complete fallback for advanced or custom workflows. The UI is not a SaaS service and does not move project state out of your checkout.
 
-V1 has shipped. Next is the housekeeping wave gating the public repo (Python mypy, a duplicate-drift sweep, an A/B retest — the Go TUI module has no equivalent type-check gate yet), plus coordination-honesty work like AST-based scope hints, executor conformance tests, and stronger sandboxing. See [ROADMAP.md](ROADMAP.md) for the current, maintained list — this section intentionally doesn't duplicate it.
+V1 has shipped and is on its 1.2 line. Ongoing work centres on coordination honesty (AST-based scope hints, executor conformance tests), broadening executor support, and a real OS-level sandbox (the current `sandbox: worktree` opt-in is experimental — see [Known Limitations](#known-limitations)). See [ROADMAP.md](ROADMAP.md) for the current, maintained list — this section intentionally doesn't duplicate it.
 
 ---
 
@@ -279,7 +279,7 @@ V1 has shipped. Next is the housekeeping wave gating the public repo (Python myp
 - `docs/security-model.md` — full threat model, trust boundaries, executor permission matrix, MCP trust model, V1 limitations, and safe usage recommendations
 - `docs/architecture.md` — built architecture, module map, and design invariants
 - `docs/config-reference.md` — supported `.lanegate.yml` keys and defaults
-- `docs/executor-capabilities.md` — capability matrix comparing Claude, Codex, Aider, and Ollama across headless support, prompt transport, local model support, auto-commit behavior, and sandbox status
+- `docs/executor-capabilities.md` — capability matrix comparing Claude, Codex, Cursor, Kiro, Aider, OpenHands, and Ollama across headless support, prompt transport, local model support, auto-commit behavior, and sandbox status
 - `docs/v2-interface-boundaries.md` — V1.5 layer boundaries (Python core / local API / UI add-on / optional runner), the `lanegate api` endpoint contract and what's built vs. still design-only, and the Go TUI spike result
 - `.lanegate.yml.example` — annotated example configuration
 

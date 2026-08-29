@@ -13,12 +13,15 @@ outcome metadata rather than an intrinsic executor capability.
 
 | Executor | Headless/non-interactive | Prompt transport | Local model support | Auto-commit | Sandbox status | Recommended use |
 |---|---|---|---|---|---|---|
-| `claude` / `claude-process` | Yes, with a scoped `--allowedTools` set (default) or `--dangerously-skip-permissions` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process, no LaneGate sandbox | Default executor for most workflows |
-| `claude-subagent` | Yes, same flag options as `claude-process` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process, no LaneGate sandbox | Long-running sessions where context continuity matters |
+| `claude` / `claude-process` | Yes, with a scoped `--allowedTools` set (default) or `--dangerously-skip-permissions` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process by default; opt-in `sandbox: worktree` (experimental, see below) | Default executor for most workflows |
+| `claude-subagent` | Yes, same flag options as `claude-process` | `-p <prompt>` (argv) | No, requires Anthropic API | No, commits via shell tools | Host process by default; opt-in `sandbox: worktree` (experimental) | Long-running sessions where context continuity matters |
 | `aider` | Yes, requires `--yes-always` | `--message <prompt>` (argv) | Yes, works with any OpenAI-compatible or Ollama backend | Yes, aider commits each accepted change directly | Host process, no LaneGate sandbox | Code-generation tasks where direct git commit control is useful |
 | `codex` | Yes, requires `--dangerously-bypass-approvals-and-sandbox` | Prompt passed as positional arg after `codex exec` (argv) | No, requires OpenAI API | No, commits via shell tools | Host process, no LaneGate sandbox | Teams already using Codex CLI, otherwise prefer `claude` |
+| `cursor` | Yes, with `-p` + `--force` for writable steps (analyze uses `--mode ask` and drops `--force`) | `-p <prompt>` (argv) | No, requires Cursor account/API key | No, commits via shell tools | Host process, no LaneGate sandbox | Teams using Cursor Agent CLI in unattended workflows |
+| `openhands` | Yes, `--headless --json`; writable steps add `--always-approve` (analyze drops it) | `-t <prompt>` (argv) | Via OpenHands' own LLM config (env overrides) | Yes, OpenHands' agent commits accepted changes | Host process, no LaneGate sandbox | Teams already running the OpenHands V1 CLI |
 | `ollama` | Yes, no interactive prompts by design | Prompt passed as positional arg to `ollama run` (argv/stdin equivalent) | Yes, local inference only, no external API calls | No, Ollama itself does not commit | Host process, no LaneGate sandbox | Fully offline or air-gapped operation, privacy-sensitive projects |
 | `agy` | Yes, requires `agy` >= 1.1.1 (see caveats) | `--print <prompt>` (argv, must be the final two tokens) | No, requires Google account/API access | No, commits via shell tools | Host process, no LaneGate sandbox | Teams on Google's Antigravity CLI, supersedes the now-deprecated `gemini` type |
+| `kiro` | Yes, with `--no-interactive --trust-all-tools` for writable steps; read-only steps use `--trust-tools=fs_read,file_search,grep` | Final positional argument to `kiro-cli chat` (argv) | No, requires Kiro API access | No, commits via shell tools | Host process, no LaneGate sandbox | Teams using Amazon Kiro CLI in unattended automation |
 
 ---
 
@@ -36,7 +39,7 @@ These two executor names both resolve to the `claude` CLI (Claude Code). `claude
 
 **Auto-commit behavior:** Claude Code does not commit on its own unless the executor explicitly runs `git commit` via its shell tool. In combined mode, the executor is instructed to run `lanegate complete && lanegate review --verdict ...` after committing. In split mode, the implement executor is expected to commit and then exit.
 
-**Sandbox status:** Claude Code runs as a host process under the invoking OS user. LaneGate does not apply any container, namespace, bwrap, or seccomp wrapper. The executor process has full read/write access to the filesystem and can make outbound network connections.
+**Sandbox status:** By default Claude Code runs as a host process under the invoking OS user with full filesystem and network access. Setting `executors.<name>.sandbox: worktree` opts into an experimental Bubblewrap (Linux) / Seatbelt (macOS) filesystem profile that hides `$HOME` and the rest of the machine, exposing only the ticket worktree, `/tmp`, system libraries and `~/.claude` — see the Sandbox status reference below for its current limitations (needs unprivileged user namespaces; not yet compatible with linked worktrees). No seccomp or network wrapper is applied in either case.
 
 **Recommended use:** Default executor for any project with an Anthropic API key. Combined mode (one subprocess handles implement and self-review) is the default and reduces round-trips.
 
@@ -122,6 +125,46 @@ Codex refers to the OpenAI Codex CLI.
 
 ---
 
+### `cursor`
+
+Cursor is Cursor's `cursor-agent` CLI, integrated through its print-mode JSON result format.
+
+**Headless operation:** For writable steps LaneGate uses `-p --force`, which enables non-interactive execution and lets Cursor apply file changes and run commands without approval prompts. Read-only steps (analyze) pass `--mode ask` (read-only Q&A) **and drop `--force`**, so the analyze phase cannot edit files or run shell commands against the main checkout before a worktree exists. `--mode plan` is deliberately not used: it makes Cursor emit only a planning narration and drop the structured JSON the analyze step needs.
+
+**Prompt transport:** The rendered prompt is passed as the value to `-p` over argv. LaneGate requests `--output-format json` so it can parse the terminal result envelope, including the `usage` token counts.
+
+**Session continuity:** During `implement` (or `fix`), LaneGate passes `--resume <session_id>` to reuse the earlier `analyze` conversation when the same executor and model are selected. Cursor resume keeps the original `session_id` and works across a directory change from the main checkout to the ticket worktree. A stale or rejected id exits non-zero and LaneGate retries fresh; set `no_resume: true` to disable reuse entirely.
+
+**Local model support:** No. Cursor Agent CLI uses a Cursor account or `CURSOR_API_KEY`; it does not expose a local-model backend through this executor.
+
+**Auto-commit behavior:** Cursor does not automatically commit. It may use its terminal tool to run git commands; LaneGate inspects the worktree after it exits.
+
+**Sandbox status:** Cursor runs as a host process under the invoking OS user. LaneGate applies no container, namespace, or kernel-level sandbox.
+
+**Recommended use:** Teams already standardizing on Cursor Agent CLI who need non-interactive implementation or review runs.
+
+**Known caveats:** Cursor CLI is in beta and its command/output schema can change. JSON output is emitted only on success; failures use a non-zero exit and stderr, so LaneGate records no structured result for failed or incomplete runs. `--force` grants the agent broad command and write authority in the worktree. Cursor bills by subscription and exposes no per-token price, so LaneGate records token counts but leaves `cost_usd` empty for Cursor steps.
+
+---
+
+### `openhands`
+
+OpenHands is the OpenHands V1 CLI (`openhands`), an agentic task runner integrated through its headless JSON mode.
+
+**Headless operation:** LaneGate runs `openhands --headless --json -t <prompt>`. Writable steps (implement, fix) add `--always-approve` so the agent acts without per-action confirmation; read-only steps (analyze) drop `--always-approve` so the analyze phase does not get self-approved write/shell authority against the main checkout.
+
+**Prompt transport:** The rendered prompt is the value of `-t` over argv.
+
+**Local model support:** Indirect. OpenHands resolves its own LLM from its configuration/environment (`LLM_MODEL`, `LLM_API_KEY`, `LLM_BASE_URL`, …); LaneGate does not currently pass the resolved per-step model through to OpenHands (tracked in TICK-724), so the model recorded on the ticket is informational only for this executor.
+
+**Auto-commit behavior:** OpenHands' agent commits accepted changes itself; LaneGate inspects the worktree after it exits.
+
+**Sandbox status:** Host process under the invoking OS user. No container or kernel-level isolation is applied by LaneGate.
+
+**Recommended use:** Teams already running the OpenHands V1 CLI.
+
+---
+
 ### `ollama`
 
 Ollama provides local model inference.
@@ -166,18 +209,57 @@ Antigravity CLI, Google's successor to the Gemini CLI (`gemini` type). Google re
 
 ---
 
+### `kiro`
+
+Kiro is Amazon's Kiro CLI. LaneGate invokes its `chat` subcommand in documented headless mode.
+
+**Headless operation:** For writable steps, LaneGate supplies `--no-interactive` and `--trust-all-tools`, so the CLI cannot wait for terminal input or a tool-permission approval. It also pins `--agent-engine v3 --output-format stream-json`; Kiro documents JSON Lines event output only for V2/V3 engines. Read-only steps use `--no-interactive --trust-tools=fs_read,file_search,grep`: real Kiro tool names (verified against kiro-cli's bundled `acp-server.js`), so file inspection and repo search work without granting `fs_write`/`execute_bash` or full tool trust. An untrusted tool call blocks forever under `--no-interactive` instead of failing cleanly, so this name list has to be exact. Configured Kiro `flags` may add other CLI options, but cannot override these managed headless/output flags.
+
+**Prompt transport:** The rendered prompt is the final positional argument to `kiro-cli chat`. Kiro requires an initial prompt as an argument in non-interactive mode.
+
+**Local model support:** No. Headless Kiro CLI requires a `KIRO_API_KEY` environment variable and calls Kiro's service.
+
+**Auto-commit behavior:** Kiro does not automatically commit. The agent may use shell tools to run git commands; LaneGate inspects the worktree after it exits.
+
+**Sandbox status:** Kiro runs as a host process under the invoking OS user. LaneGate does not apply a container, namespace, or kernel-level sandbox.
+
+**Structured output:** Kiro emits JSON Lines run events on stdout. LaneGate extracts the final assistant reply and session ID from the terminal `runFinished` event. Kiro's public headless documentation does not define a stable token/cost event schema, so cost and token fields remain unnormalized rather than treating account-specific credits as dollars or tokens.
+
+**Recommended use:** Unattended Kiro CLI workflows that need an agentic coding executor and have `KIRO_API_KEY` supplied through the environment or a named executor's `api_key_env`.
+
+**Known caveats:** `--trust-all-tools` intentionally grants all tool calls before writable runs start. Read-only runs trust only `fs_read`, `file_search`, and `grep` -- Kiro's actual read-side tool names -- so they cannot write files or run shell commands. LaneGate's executor invariant remains unattended completion without permission prompts.
+
+kiro-cli's `chat` subcommand spawns a detached, long-lived local agent server (`acp-server.js`) per invocation that outlives the CLI process and is not cleaned up by kiro-cli itself; expect orphaned processes to accumulate under heavy kiro dispatch and reap them periodically (`pgrep -f acp-server.js`).
+
+Session resume (`kiro-cli chat --resume-id <ID> --no-interactive`, or `-r`/`--resume`) does not restore prior conversation context in kiro-cli 2.20.1 -- verified live: a session recorded by `--list-sessions` still starts a brand-new session when resumed this way, four separate attempts, matching documented syntax exactly. Bare top-level `kiro-cli --resume-id <ID>` (no `chat` subcommand) *does* resume correctly, but it's interactive-only and rejects `--no-interactive` outright, so it isn't usable from LaneGate's headless dispatch. This is an upstream kiro-cli limitation, not a LaneGate integration gap -- LaneGate does not attempt session-id threading for kiro (unlike `codex`/`claude`'s `analyze_session_id` resume), so every lifecycle phase (analyze/implement/review/fix) currently re-pays full prompt cost with no cross-phase discount. Revisit if a future kiro-cli release fixes headless resume.
+
+---
+
 ## Sandbox status reference
 
-No executor is sandboxed by LaneGate itself today. The table below clarifies what isolation exists with the current no-runner execution path:
+By default no executor is sandboxed by LaneGate itself. The `claude` /
+`claude-process` / `claude-subagent` types accept an **experimental** opt-in
+`executors.<name>.sandbox: worktree`, which wraps the executor in a Bubblewrap
+(Linux) or Seatbelt (macOS) filesystem profile that hides `$HOME` and the rest
+of the machine, exposing only the ticket worktree (rw), `/tmp`, system
+libraries, and `~/.claude`. It is off unless explicitly configured. Current
+limitations: it needs unprivileged user namespaces enabled on Linux (LaneGate
+probes and falls back to no sandbox with a warning otherwise), and it does not
+yet work with linked `git worktree` checkouts — the ones LaneGate creates — so
+git commands fail inside the sandbox (tracked in TICK-725). No other executor
+type has a sandbox option.
 
 | Executor | Isolation wrapper | Network egress restricted | Process context |
 |---|---|---|---|
-| `claude` / `claude-process` | None | No | Host process under invoking user |
-| `claude-subagent` | None | No | Same as above |
+| `claude` / `claude-process` | None by default; Bubblewrap/Seatbelt worktree profile when `sandbox: worktree` is set (experimental) | No | Host process under invoking user (or bwrap/seatbelt namespace when sandboxed) |
+| `claude-subagent` | Same as above | No | Same as above |
 | `aider` | None | No (calls configured API or local Ollama) | Host process under invoking user |
 | `codex` | None | No | Host process under invoking user |
+| `cursor` | None | No | Host process, Cursor API calls are outbound |
+| `openhands` | None | No | Host process under invoking user |
 | `ollama` | None | No (runs local server, no external calls) | Host process under invoking user |
 | `agy` | None | No | Host process, Google Antigravity API calls are outbound |
+| `kiro` | None | No | Host process, Kiro API calls are outbound |
 
 Git-level containment (the `touches` list, hard-blocked files, and diff inspection) applies to all executors regardless of sandbox status. OS-level containment does not.
 

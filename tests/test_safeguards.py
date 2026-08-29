@@ -785,7 +785,7 @@ def test_lifecycle_merge_can_skip_worktree_pre_merge_but_verifies_main(tmp_path)
 
     with (
         patch("lanegate.lifecycle.subprocess.run", side_effect=mock_run),
-        patch("lanegate.lifecycle.run_safeguards", return_value=(True, None)) as safeguards,
+        patch("lanegate.lifecycle.merge.run_safeguards", return_value=(True, None)) as safeguards,
     ):
         cmd_merge("TICK-405", cfg, tmp_path)
 
@@ -824,7 +824,7 @@ def test_lifecycle_merge_runs_worktree_pre_merge_before_main_verification(tmp_pa
 
     with (
         patch("lanegate.lifecycle.subprocess.run", side_effect=mock_run),
-        patch("lanegate.lifecycle.run_safeguards", return_value=(True, None)) as safeguards,
+        patch("lanegate.lifecycle.merge.run_safeguards", return_value=(True, None)) as safeguards,
     ):
         cmd_merge("TICK-406", cfg, tmp_path)
 

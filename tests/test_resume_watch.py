@@ -269,6 +269,23 @@ def test_hibernated_for_rate_limit_excludes_non_retryable_error_false_positive(t
     assert result == []
 
 
+def test_hibernated_for_rate_limit_accepts_structured_429_with_hard_error(tmp_path):
+    cfg = _default_cfg(tmp_path)
+    tickets_dir = Path(cfg["tickets_dir"])
+    _write_hibernated_ticket(
+        tickets_dir,
+        "TICK-001",
+        "rate limit or quota interruption (executor exited 1)\n\n"
+        "Raw executor output:\n"
+        "ERROR: invalid_request_error: unknown model\n"
+        '{"error":"rate_limit","api_error_status":429}',
+    )
+
+    result = _hibernated_for_rate_limit(cfg, tmp_path)
+
+    assert [t["id"] for t in result] == ["TICK-001"]
+
+
 def test_hibernated_for_rate_limit_ignores_non_hibernated_tickets(tmp_path):
     cfg = _default_cfg(tmp_path)
     tickets_dir = Path(cfg["tickets_dir"])
@@ -1309,4 +1326,3 @@ def test_retry_subprocess_sets_resume_watch_trigger_env(tmp_path):
     env = captured_kwargs[0].get("env", {})
     assert env.get("LANEGATE_RUN_TRIGGER") == "resume-watch"
     assert "rate limit on TICK-001" in env.get("LANEGATE_RUN_TRIGGER_REASON", "")
-

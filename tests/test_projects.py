@@ -53,7 +53,7 @@ def isolated_registry(tmp_path, monkeypatch):
     reg_path = tmp_path / "registry" / "projects.json"
     reg_path.parent.mkdir(parents=True, exist_ok=True)
 
-    import lanegate.config as _cfg_mod
+    import lanegate.config_registry as _cfg_mod
 
     monkeypatch.setattr(_cfg_mod, "_REGISTRY_DIR", reg_path.parent)
     monkeypatch.setattr(_cfg_mod, "_REGISTRY_FILE", reg_path)
@@ -209,7 +209,7 @@ def test_board_global_skips_missing_config(tmp_path, capsys):
     proj = tmp_path / "ghost"
     proj.mkdir()
     # Register manually without creating config
-    import lanegate.config as _cfg_mod
+    import lanegate.config_registry as _cfg_mod
 
     entries = registry_load()
     entries.append({"path": str(proj.resolve()), "name": "ghost"})
@@ -280,7 +280,7 @@ def test_board_global_json_skips_missing_config(tmp_path, capsys):
     """JSON mode skips projects with missing config; result still valid JSON."""
     ghost = tmp_path / "ghost"
     ghost.mkdir()
-    import lanegate.config as _cfg_mod
+    import lanegate.config_registry as _cfg_mod
 
     entries = registry_load()
     entries.append({"path": str(ghost.resolve()), "name": "ghost"})

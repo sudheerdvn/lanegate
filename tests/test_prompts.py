@@ -353,6 +353,12 @@ class TestBuildImplementPrompt:
         assert "five factual blocks and roughly" in prompt
         assert "Do not add summaries discoverable directly from the code" in prompt
 
+    def test_requires_invariant_and_boundary_test_matrix(self):
+        prompt = build_implement_prompt(self._make_ticket())
+
+        assert "safety-invariant and contradictory-edge-case matrix" in prompt
+        assert "allowed behavior and the rejected boundary" in prompt
+
     def test_file_skeletons_in_trusted_layer(self):
         """Legacy inline file skeletons still appear before untrusted-data."""
         ticket = self._make_ticket(
@@ -822,6 +828,15 @@ class TestBuildFixPrompt:
         ticket = self._make_ticket()
         prompt = build_fix_prompt(ticket, diff="diff --git a/x.py", findings="")
         assert "## Review Findings To Address" not in prompt
+
+    def test_fix_template_requires_history_and_root_cause_protocol(self):
+        from lanegate.reviewer import build_fix_prompt
+
+        prompt = build_fix_prompt(self._make_ticket(), diff="d", findings="f")
+
+        assert "complete review-finding history" in prompt
+        assert "adversarial regression coverage" in prompt
+        assert "fresh subsystem root-cause analysis" in prompt
 
     def test_diff_inside_untrusted_block(self):
         from lanegate.reviewer import build_fix_prompt
@@ -1968,22 +1983,86 @@ def test_get_bounded_shared_notes_dotfiles(tmp_path):
     assert ".gitignore" in res
 
 
-def test_shared_notes_are_bounded_and_injected_once_in_analyze_and_implement_prompts(tmp_path):
+def test_shared_notes_are_bounded_and_injected_once_in_all_prompt_steps(tmp_path, monkeypatch):
     from lanegate.analyze import _build_prompt
+    import lanegate.reviewer as reviewer
 
-    notes_root = tmp_path / ".lanegate" / "notes"
+    from lanegate.reviewer import build_fix_prompt, describe_fix_payload, describe_review_payload
+
+    control_root = tmp_path / "control"
+    worktree_root = tmp_path / "worktree"
+    notes_root = control_root / ".lanegate" / "notes"
     notes_root.mkdir(parents=True)
-    (notes_root / "global.md").write_text("g" * 5000)
+    local_notes_root = worktree_root / ".lanegate" / "notes"
+    local_notes_root.mkdir(parents=True)
+    (notes_root / "global.md").write_text("control-store note\n" + "g" * 5000)
     (notes_root / "src_module.py.md").write_text("file-specific note")
-    cfg = {"payload_budgets": {"analyze": 10000, "implement": 10000}}
+    (local_notes_root / "global.md").write_text("worktree-local note")
+    monkeypatch.setattr(reviewer, "_resolve_control_root", lambda _root: control_root)
+    cfg = {"payload_budgets": {"analyze": 10000, "implement": 10000, "review": 10000, "fix": 10000}}
     ticket = {
         "id": "TICK-999", "title": "Shared notes", "touches": ["src/module.py"],
         "close_criteria": "ok", "_body": "",
     }
 
-    shared_notes = get_bounded_shared_notes(tmp_path, ticket["touches"], cfg=cfg)
+    shared_notes = get_bounded_shared_notes(control_root, ticket["touches"], cfg=cfg)
     assert len(shared_notes.encode("utf-8")) <= 4000
-    analyze_prompt = _build_prompt(ticket, tmp_path, cfg=cfg)
-    implement_prompt = build_implement_prompt(ticket, tmp_path, cfg=cfg)
+    analyze_prompt = _build_prompt(ticket, control_root, cfg=cfg)
+    implement_prompt = build_implement_prompt(ticket, control_root, cfg=cfg)
+    review_prompt = build_review_prompt(
+        ticket, project_root=worktree_root, worktree_path=worktree_root, cfg=cfg
+    )
+    fix_prompt = build_fix_prompt(
+        ticket, diff="diff", findings="finding", project_root=worktree_root,
+        worktree_path=worktree_root, cfg=cfg,
+    )
     assert analyze_prompt.count("## Shared Project Notes") == 1
     assert implement_prompt.count("## Shared Project Notes") == 1
+    assert review_prompt.count("## Shared Project Notes") == 1
+    assert fix_prompt.count("## Shared Project Notes") == 1
+    assert "control-store note" in review_prompt
+    assert "control-store note" in fix_prompt
+    assert "worktree-local note" not in review_prompt
+    assert "worktree-local note" not in fix_prompt
+    assert "## Durable notes" in review_prompt
+    assert "## Durable notes" in fix_prompt
+    assert any(component["label"] == "shared-notes" and component["step"] == "review"
+               for component in describe_review_payload(
+                   ticket, project_root=worktree_root, worktree_path=worktree_root, cfg=cfg
+               ))
+    assert any(component["label"] == "shared-notes" and component["step"] == "fix"
+               for component in describe_fix_payload(
+                   ticket, "diff", "finding", project_root=worktree_root,
+                   worktree_path=worktree_root, cfg=cfg,
+               ))
+
+
+def test_global_md_absence_nudge(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "src_foo.py.md").write_text("file note")
+
+    notes = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+    assert "file note" in notes
+    assert "NOTE: No global.md exists." in notes
+
+    # Empty notes directory (no per-file notes, no global.md) should NOT emit nudge
+    empty_notes_root = tmp_path / "empty_repo" / ".lanegate" / "notes"
+    empty_notes_root.mkdir(parents=True)
+    assert get_bounded_shared_notes(tmp_path / "empty_repo", ["src/foo.py"]) == ""
+
+
+def test_global_md_present_no_nudge(tmp_path):
+    from lanegate.prompts import get_bounded_shared_notes
+
+    notes_root = tmp_path / ".lanegate" / "notes"
+    notes_root.mkdir(parents=True)
+    (notes_root / "global.md").write_text("project-wide rule")
+    (notes_root / "src_foo.py.md").write_text("file note")
+
+    notes = get_bounded_shared_notes(tmp_path, ["src/foo.py"])
+    assert "project-wide rule" in notes
+    assert "file note" in notes
+    assert "NOTE: No global.md exists." not in notes

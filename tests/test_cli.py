@@ -90,6 +90,34 @@ def test_invalid_ticket_id_exits_cleanly_instead_of_a_raw_traceback(repo, capsys
     assert "ERROR: invalid ticket ID" in capsys.readouterr().err
 
 
+def test_outside_project_board_exits_cleanly_but_analytics_with_log_succeeds(
+    tmp_path, monkeypatch, capsys
+):
+    """Ticket readers reject a non-project cwd without blocking log analytics."""
+    from lanegate import cli
+
+    log_path = tmp_path / "context.jsonl"
+    log_path.touch()
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch("sys.argv", ["lanegate", "board"]),
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.main()
+
+    assert exc.value.code == 1
+    failure = capsys.readouterr()
+    assert "ERROR: not a lanegate project" in failure.err
+    assert "lanegate init" in failure.err
+    assert "Traceback" not in failure.err
+
+    with patch("sys.argv", ["lanegate", "analytics", "--log", str(log_path), "--json"]):
+        cli.main()
+
+    assert capsys.readouterr().out.strip() == '{"has_entries": false}'
+
+
 # --- top-level help tiers ---
 
 
@@ -99,6 +127,7 @@ def test_invalid_ticket_id_exits_cleanly_instead_of_a_raw_traceback(repo, capsys
 _TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP = frozenset(
     {
         "analytics",
+        "audit-refactor",
         "analyze",
         "api",
         "blocked",
@@ -108,6 +137,7 @@ _TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP = frozenset(
         "close",
         "context-stats",
         "create",
+        "decompose",
         "doctor",
         "done",
         "executor",
@@ -139,6 +169,7 @@ _TOP_LEVEL_COMMANDS_BEFORE_TIERED_HELP = frozenset(
         "recover-rate-limited-reviews",
         "recover-rejected",
         "reopen",
+        "reset",
         "resolve-conflict",
         "resume-watch",
         "review",
@@ -498,6 +529,13 @@ def test_stop_reason_and_grace_seconds_are_passed_through(repo):
         )
 
 
+def test_reset_routes_to_cmd_reset(repo):
+    with patch("lanegate.lifecycle.cmd_reset") as mock_reset:
+        _run_cli(["reset", "TICK-617"], repo)
+
+    mock_reset.assert_called_once_with("TICK-617", _CFG, repo)
+
+
 def test_cli_human_review_parser(repo):
     with patch("lanegate.lifecycle.cmd_human_review_approve") as mock_approve:
         _run_cli(
@@ -745,6 +783,10 @@ def test_orchestrator_lock_status_held(repo, capsys):
     assert "STALE" in out or "HELD" in out
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="pidutil.pid_cwd() has no Windows implementation, so the cwd suffix is intentionally omitted there",
+)
 def test_orchestrator_lock_status_shows_cwd(repo, capsys):
     import os
 
@@ -755,6 +797,13 @@ def test_orchestrator_lock_status_shows_cwd(repo, capsys):
     assert "HELD" in out
     assert "cwd:" in out
     _run_cli(["orchestrator-lock", "release", "--pid", str(os.getpid())], repo)
+
+
+def test_notify_watch_once_json_routes_to_single_shot_handler(repo):
+    with patch("lanegate.notify_watch.cmd_notify_watch_once") as mock_notify_watch:
+        _run_cli(["notify-watch", "--once", "--json"], repo)
+
+    mock_notify_watch.assert_called_once_with(_CFG, repo, json_output=True)
 
 
 # --- lanegate executor status / reset (TICK-090) ---

@@ -295,9 +295,38 @@ The global default executor used for all pipeline steps unless overridden.
 executor: claude   # default
 ```
 
-Valid values: `claude`, `claude-subagent`, `claude-process`, `aider`, `openhands`, `codex`, `ollama`, `gemini` (deprecated 2026-06-18, use `agy`), `agy`, `continue`.
+Valid values: `claude`, `claude-subagent`, `claude-process`, `aider`, `openhands`, `codex`, `cursor`, `kiro`, `ollama`, `gemini` (deprecated 2026-06-18, use `agy`), `agy`, `continue`.
 
 For a detailed comparison of executor capabilities, including headless support, prompt transport mechanism, local model support, auto-commit behavior, and sandbox status, see [docs/executor-capabilities.md](executor-capabilities.md).
+
+### Cursor
+
+`executor: cursor` drives Cursor's `cursor-agent` CLI in print mode with
+`--output-format json` (token counts are parsed from the result envelope; Cursor
+bills by subscription so `cost_usd` is left empty). Analyze runs read-only
+(`--mode ask`, no `--force`); implement/fix add `--force` and resume the analyze
+conversation via `--resume <session_id>`, and a rejected/expired session id
+retries once fresh. No local-model backend.
+
+### Kiro
+
+`executor: kiro` drives `kiro-cli chat --agent-engine v3 --no-interactive` with
+stream-json output. Writable steps use `--trust-all-tools`; read-only steps trust
+only `fs_read`/`file_search`/`grep`. Known upstream limitation (kiro-cli 2.20.1):
+headless `--resume` does not restore conversation context, so every phase re-pays
+full prompt cost; kiro also leaves detached `acp-server.js` processes that need
+periodic reaping (`pgrep -f acp-server.js`).
+
+### OpenHands
+
+Install the current OpenHands CLI with `uv tool install openhands` (or the
+[official install script](https://docs.openhands.dev/usage/installation)). LaneGate invokes
+OpenHands V1 in top-level headless JSON mode as
+`openhands --headless --json -t "<task>"`, adding `--always-approve` for writable
+steps (implement/fix) and omitting it for read-only analyze; it does not use the
+removed `run` subcommand. Configure the LLM through OpenHands environment variables
+(and its environment override support), rather than expecting LaneGate's `models:`
+setting to be forwarded as an OpenHands `--model` CLI argument.
 
 For local/offline execution, use `executor: aider` with a local Ollama model as aider's
 backend:
@@ -360,6 +389,21 @@ reviewer: human
 ```
 
 For a batch-level human gate, run `lanegate run --human-review final` without changing the reviewer. For per-ticket human verdicts, set `reviewer: human` and run `lanegate run --human-review per_ticket`. LaneGate completes the implementation, moves the ticket to `in_review`, and halts before merge. A person must then run `lanegate review <ticket> --verdict approved` or request changes.
+
+### `reviewer_rotation`
+
+Optional list of executor/driver names that `lanegate run` cycles through as the
+reviewer, one per ticket, persisting position in `.lanegate/` state across runs.
+It gives you review independence on a single account by alternating models, with
+no `reviewer:` pin needed.
+
+```yaml
+reviewer_rotation: [agy, codex]
+```
+
+Ignored (with a startup warning) when `steps.review.driver` is pinned or a ticket
+sets its own `reviewer:`. A ticket already assigned a reviewer mid-review keeps
+it — rotation only advances when a ticket is first dispatched to review.
 
 #### `--human-review` reference
 
@@ -493,7 +537,8 @@ choose (`claude-1`, `claude-2`, `local-ollama`, ...). Fields:
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `type` | yes | The underlying executor driver, one of `claude`, `claude-subagent`, `claude-process`, `aider`, `openhands`, `codex`, `ollama`, `gemini` (deprecated), `agy`, `continue`. |
+| `type` | yes | The underlying executor driver, one of `claude`, `claude-subagent`, `claude-process`, `aider`, `openhands`, `codex`, `cursor`, `kiro`, `ollama`, `gemini` (deprecated), `agy`, `continue`. |
+| `sandbox` | no | `worktree` opts a `claude`-type instance into an **experimental** Bubblewrap (Linux) / Seatbelt (macOS) filesystem profile — off by default. Requires unprivileged user namespaces and is not yet usable with LaneGate's linked worktrees; see [executor-capabilities.md](executor-capabilities.md#sandbox-status-reference). |
 | `model` | no | Blanket model override for every step dispatched to this instance (implement/review/fix/analyze). Use `models:` (below) instead when different steps need different models. |
 | `api_key_env` | no | Name of the environment variable (already set in your shell) that holds this instance's API key. LaneGate injects its *value* into the subprocess environment under the variable the driver itself expects (e.g. `ANTHROPIC_API_KEY` for `claude`/`claude-process`), the variable name is never written to logs. When absent, the driver's default env var is used unchanged. |
 | `max_parallel` | no | Per-instance concurrency cap, same precedence rules as the legacy per-type `executors:` block below. |

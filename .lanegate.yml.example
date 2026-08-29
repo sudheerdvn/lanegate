@@ -43,6 +43,9 @@ drivers:
   claude-main:
     type: claude-process
     model: claude-sonnet-4-6
+    # Optional filesystem-write isolation for Claude subprocesses: bwrap on
+    # Linux and built-in sandbox-exec on macOS. Network access remains enabled.
+    sandbox: worktree
 
   # Ollama REST driver — text-only, no file-editing/commit capability of its
   # own (Ollama is a model server, not a coding agent). Only useful for
@@ -128,8 +131,12 @@ drivers:
     provider: ollama
     context_window_tokens: 32768
 
-# Route each pipeline step to a specific driver.
-# Omit this block to use the top-level legacy `executor:` / `reviewer:` fields.
+# Routing precedence: per-ticket executor:/reviewer: pin > steps.<step>.driver
+# > the matching bare executor:/reviewer: field. Pool executor_override may
+# independently select the dispatched instance after this route is resolved.
+# Setting a driver here makes the corresponding bare executor:/reviewer: field
+# fully inert for that step, silently and without fallback or merging. Omit this
+# block to use the top-level legacy `executor:` / `reviewer:` fields.
 steps:
   analyze:
     driver: claude-main     # strong model for ticket analysis
@@ -183,6 +190,14 @@ max_parallel: 2
 # A drift-check failure or an empty finding list escalates to a human
 # immediately, without consuming a remaining attempt.
 max_auto_fix_attempts: 1
+
+# Orchestrate log rotation keeps the 10 most-recent orchestrate-*.log files in
+# .lanegate/logs/ and moves older ones to .lanegate/logs/archive/ (still
+# visible in TUI/CLI run history either way). Purging archived logs is
+# opt-in and off by default -- set to true to actually delete logs older
+# than run_history_retention_days.
+run_history_purge_enabled: false
+run_history_retention_days: 60
 
 # What to do when the executor hits a rate limit / quota error mid-run.
 # resume (default) — hibernate the ticket, and spawn a detached

@@ -13,10 +13,13 @@ import http.client
 import fnmatch
 import json
 import os
+import platform
 import re
+import selectors
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import zoneinfo
 from pathlib import Path
@@ -38,6 +41,7 @@ from lanegate.prompts import (
     truncate_to_budget,
 )
 from lanegate.ticket import (
+    _has_non_rate_limit_hard_error,
     collect_cross_ticket_change_notes,
     load_change_notes,
     load_file_skeletons,
@@ -52,6 +56,8 @@ _DEFAULT_API_KEY_ENV_VAR = {
     "claude-process": "ANTHROPIC_API_KEY",
     "claude-subagent": "ANTHROPIC_API_KEY",
     "codex": "OPENAI_API_KEY",
+    "cursor": "CURSOR_API_KEY",
+    "kiro": "KIRO_API_KEY",
 }
 
 
@@ -257,17 +263,8 @@ def _cooldown_reason_is_interrupt_artifact(reason: str) -> bool:
 
 
 def _cooldown_reason_is_non_retryable_error(reason: str) -> bool:
-    text = reason.lower()
-    markers = (
-        "invalid_request_error",
-        '"status":400',
-        '"status": 400',
-        "requires a newer version of codex",
-        "model metadata",
-        "unknown model",
-        "model does not exist",
-    )
-    return any(marker in text for marker in markers)
+    """Delegate cooldown fatality to the canonical rate-limit classifier."""
+    return _has_non_rate_limit_hard_error(reason)
 
 
 def _parse_reset_time(
@@ -820,9 +817,14 @@ EXECUTOR_CAPABILITIES: dict[str, dict[str, bool]] = {
     "claude-process":  {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
     "claude-subagent": {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
     "codex":           {"tool_dispatch_loop": True,  "stdin_capable": True,  "streaming_capable": True,  "streaming_capable_without_heartbeat": False},
+    # Cursor's JSON print mode emits one terminal result object rather than a
+    # progress stream; -p --force permits unattended tool use and file edits.
+    "cursor":          {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
     "aider":           {"tool_dispatch_loop": False, "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
     "ollama":          {"tool_dispatch_loop": False, "stdin_capable": True,  "streaming_capable": False, "streaming_capable_without_heartbeat": False},
     "agy":             {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": False, "streaming_capable_without_heartbeat": False},
+    # Kiro CLI emits JSONL events in its V3 headless chat mode.
+    "kiro":            {"tool_dispatch_loop": True,  "stdin_capable": False, "streaming_capable": True,  "streaming_capable_without_heartbeat": True},
     # openhands is an agentic task runner (tool-dispatch loop); it takes its
     # prompt via --task on the command line and produces no structured JSON
     # progress stream.
@@ -866,7 +868,7 @@ _CLAUDE_SUBPROCESS_TYPES = frozenset(
     t for t, c in EXECUTOR_CAPABILITIES.items()
     if c["tool_dispatch_loop"] and "claude" in t
 )
-_SESSION_RESUME_TYPES = frozenset(_CLAUDE_SUBPROCESS_TYPES | {"agy", "codex"})
+_SESSION_RESUME_TYPES = frozenset(_CLAUDE_SUBPROCESS_TYPES | {"agy", "codex", "cursor"})
 _AIDER_CONTEXT_RESERVE_TOKENS = 8_192
 _AIDER_DEFAULT_MAP_TOKENS = 1024
 # Skeletons above this size move from inline prompt content to a sidecar file;
@@ -1317,6 +1319,173 @@ _DEFAULT_PRINT_TIMEOUT_SECONDS = {
 _DEFAULT_PRINT_TIMEOUT_FALLBACK_SECONDS = 1800
 
 
+def _bwrap_prefix(worktree_path: Path, claude_config_dir: Path | None = None) -> list[str]:
+    """Return Bubblewrap arguments with a minimal read and write profile."""
+    worktree = str(worktree_path)
+    config_dir = claude_config_dir or Path.home() / ".claude"
+    home = Path.home()
+    ro_paths = [
+        "/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin",
+        "/etc/ssl", "/etc/resolv.conf", "/etc/hosts", "/etc/passwd",
+        "/etc/localtime", "/run",
+    ]
+    prefix = ["bwrap", "--unshare-user", "--unshare-pid"]
+    for path in ro_paths:
+        if Path(path).exists():
+            prefix.extend(["--ro-bind", path, path])
+
+    # These are namespace-aware bwrap mounts, not host paths.  Binding the
+    # host instances would make /proc disagree with --unshare-pid and expose
+    # host device nodes.
+    prefix.extend(["--proc", "/proc", "--dev", "/dev"])
+    prefix.extend(["--bind", "/tmp", "/tmp", "--tmpfs", "/home", "--tmpfs", "/root"])
+
+    # The empty /home and /root mounts hide their original trees (other
+    # projects, ~/.ssh, cloud creds).  Rebind only what the executor
+    # legitimately needs: rw the worktree; ro the ~/.claude config, git
+    # identity/config and ~/.claude.json creds.
+    #
+    # NOT rebound here: the real git dirs of a *linked* worktree (its .git is
+    # a file pointing at <main-repo>/.git/worktrees/<name>, tmpfs-hidden), so
+    # git commands fail inside the sandbox. Binding them safely — without
+    # handing the agent write access to the host repo's refs — needs the
+    # design work tracked in TICK-725. Until then sandbox: worktree only
+    # supports non-linked checkouts.
+    if (worktree_path / ".git").is_file():
+        print(
+            "[lanegate] WARNING: sandbox: worktree hides the linked worktree's "
+            "real .git directory — git commands will fail inside the sandbox "
+            "(see TICK-725). Use a non-linked checkout or disable the sandbox.",
+            file=sys.stderr,
+        )
+
+    rw_binds: list[Path] = [worktree_path]
+    ro_binds: list[Path] = []
+    if config_dir.exists():
+        ro_binds.append(config_dir)
+    for candidate in (home / ".gitconfig", home / ".config" / "git", home / ".claude.json"):
+        if candidate.exists():
+            ro_binds.append(candidate)
+
+    created_dirs: set[Path] = set()
+    for bound_path in [*rw_binds, *ro_binds]:
+        for hidden_home in (Path("/home"), Path("/root")):
+            try:
+                relative_parent = bound_path.relative_to(hidden_home).parent
+            except ValueError:
+                continue
+            directory = hidden_home
+            for component in relative_parent.parts:
+                directory /= component
+                if directory not in created_dirs:
+                    prefix.extend(["--dir", str(directory)])
+                    created_dirs.add(directory)
+            break
+
+    emitted: set[str] = set()
+    for p in rw_binds:
+        s = str(p)
+        if s not in emitted:
+            prefix.extend(["--bind", s, s])
+            emitted.add(s)
+    for p in ro_binds:
+        s = str(p)
+        if s not in emitted:
+            prefix.extend(["--ro-bind", s, s])
+            emitted.add(s)
+    prefix.extend(["--dir", "/var", "--"])
+    return prefix
+
+
+def _seatbelt_prefix(worktree_path: Path, claude_config_dir: Path | None = None) -> list[str]:
+    """Return a Seatbelt whitelist profile for the worktree sandbox."""
+    worktree = str(worktree_path).replace("\\", "\\\\").replace('"', '\\"')
+    config_dir = str(claude_config_dir or Path.home() / ".claude")
+    config_dir = config_dir.replace("\\", "\\\\").replace('"', '\\"')
+    profile = f'''(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow signal)
+(allow sysctl-read)
+(allow file-read*
+    (subpath "/usr")
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/lib")
+    (subpath "/System")
+    (subpath "/private/etc/ssl")
+    (subpath "/private/etc/resolv.conf")
+    (subpath "/private/etc/hosts")
+    (subpath "/private/tmp")
+    (subpath "/var/folders")
+    (subpath "{worktree}")
+    (subpath "{config_dir}"))
+(allow file-write*
+    (subpath "{worktree}")
+    (subpath "/private/tmp")
+    (subpath "/var/folders"))
+(allow network-outbound)
+(allow network-inbound (local ip))'''
+    return ["sandbox-exec", "-p", profile, "--"]
+
+
+def _warn_no_sandbox(tool: str) -> None:
+    """Warn when an opt-in filesystem sandbox cannot be applied."""
+    print(
+        f"[lanegate] WARNING: sandbox requested but {tool!r} not found — "
+        "running executor without filesystem isolation",
+        file=sys.stderr,
+    )
+
+
+_bwrap_usable_ok: bool | None = None
+
+
+def _bwrap_usable() -> bool:
+    """True when bwrap can actually create the unprivileged user+pid namespaces
+    the worktree profile needs. Many hardened kernels ship bwrap but disable
+    unprivileged user namespaces (``kernel.unprivileged_userns_clone=0`` or an
+    AppArmor restriction), and there ``--unshare-user`` fails at exec — so
+    ``shutil.which('bwrap')`` alone is not enough to promise isolation.
+
+    A successful probe is cached for the process (the kernel setting does not
+    change under us); a failure is NOT cached, so a transient failure (e.g.
+    hitting ``user.max_user_namespaces`` under load) does not permanently
+    disable the sandbox for every later dispatch.
+    """
+    global _bwrap_usable_ok
+    if _bwrap_usable_ok:
+        return True
+    try:
+        probe = subprocess.run(
+            ["bwrap", "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "true"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if probe.returncode == 0:
+        _bwrap_usable_ok = True
+        return True
+    return False
+
+
+def _sandbox_prefix(worktree_path: Path, claude_config_dir: Path | None = None) -> list[str]:
+    """Return the available platform sandbox prefix, or an empty fallback."""
+    system = platform.system()
+    if system == "Linux":
+        if shutil.which("bwrap") and _bwrap_usable():
+            return _bwrap_prefix(worktree_path, claude_config_dir)
+        _warn_no_sandbox("bwrap" if shutil.which("bwrap") is None else "bwrap (unprivileged namespaces unavailable)")
+    elif system == "Darwin":
+        if shutil.which("sandbox-exec"):
+            return _seatbelt_prefix(worktree_path, claude_config_dir)
+        _warn_no_sandbox("sandbox-exec")
+    else:
+        _warn_no_sandbox(f"(unsupported platform: {system})")
+    return []
+
+
 def _effective_print_timeout_seconds(cfg: dict, executor_cfg: dict, step: str) -> int:
     """Resolve the CLI print/turn timeout (seconds) for agy/codex.
 
@@ -1345,6 +1514,7 @@ def build_executor_cmd(
     touches: list[str] | None = None,
     analyze_session_id: str | None = None,
     worktree_path: Path | None = None,
+    claude_config_dir: Path | None = None,
     use_stdin: bool = False,
     disallowed_tools: list[str] | None = None,
     read_only: bool = False,
@@ -1374,6 +1544,8 @@ def build_executor_cmd(
             so a compatible follow-up can continue the same CLI session.
         worktree_path: directory in which the executor will run.  Aider's
             context preflight resolves relative ticket touches from this directory.
+        claude_config_dir: Claude settings directory exposed read-only when
+            ``sandbox: worktree`` is enabled for a Claude subprocess executor.
         use_stdin: when supported by the resolved CLI, omit the prompt from
             argv and expect the caller to provide it through standard input.
         disallowed_tools: tool names to deny for this call (Claude subprocess
@@ -1382,9 +1554,9 @@ def build_executor_cmd(
             ``--dangerously-skip-permissions`` flag granting full tool access
             by default.
         read_only: when true, deny edit/commit capability for every other
-            executor type (aider, codex, agy) via that type's own read-only
-            flag -- aider's ``--dry-run``, codex's ``--sandbox read-only``,
-            agy's ``--mode plan``. Claude types are covered by
+            executor type via that type's own read-only mechanism -- aider's
+            ``--dry-run``, codex's ``--sandbox read-only``, agy's ``--mode
+            plan``, and Kiro's ``--trust-tools=read,grep``. Claude types are covered by
             ``disallowed_tools`` instead, not this flag.
         max_turns: optional maximum turn count cap to pass via CLI flag.
         step: pipeline step used to select a per-step ``max_turns`` cap when
@@ -1403,6 +1575,11 @@ def build_executor_cmd(
 
     if executor_type in _CLAUDE_SUBPROCESS_TYPES:
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "claude")
+        sandbox = (
+            _sandbox_prefix(worktree_path, claude_config_dir)
+            if executor_cfg.get("sandbox") == "worktree" and worktree_path is not None
+            else []
+        )
         model_flags = ["--model", model] if model else []
         resume_flags = ["--resume", analyze_session_id] if analyze_session_id else []
         prompt_args = ["-p"] if use_stdin else ["-p", prompt]
@@ -1411,7 +1588,7 @@ def build_executor_cmd(
         # Stream JSON one event per line so compact orchestration can expose
         # safe progress metadata while the process is still running.
         return (
-            [bin_name] + extra_flags + resume_flags + prompt_args + model_flags
+            sandbox + [bin_name] + extra_flags + resume_flags + prompt_args + model_flags
             + tool_flags + turns_flags + ["--output-format", "stream-json", "--verbose"]
         )
     elif executor_type == "ollama":
@@ -1421,7 +1598,7 @@ def build_executor_cmd(
         # recognized after `run <model>` -- placed before it, ollama
         # misparses the model name and attempts a registry pull instead
         # (confirmed live).
-        return [bin_name, "run", model_arg] + extra_flags + ([] if use_stdin else [prompt])
+        return [bin_name, "run", model_arg, "--nowordwrap"] + extra_flags + ([] if use_stdin else [prompt])
     elif executor_type == "aider":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "aider")
         # Neutralize mentions of every repo file except the declared touches:
@@ -1539,15 +1716,21 @@ def build_executor_cmd(
         _warn_unbudgeted_ollama_aider(executor, cfg, executor_cfg)
         if not read_only:
             _warn_aider_missing_no_gitignore(executor, executor_cfg, extra_flags)
-        # Budget on the full touches list even in repo_map mode: Aider's
-        # --yes-always auto-confirms its own filename-mention scan of the
-        # prompt text, so touched files named there get their full contents
-        # added to the chat at runtime regardless of whether they were passed
-        # positionally. The map-tokens flag only bounds the repo map, not this.
-        _check_aider_context_budget(
-            prompt, touches, executor_cfg, model, worktree_path=worktree_path, executor=executor, cfg=cfg,
-            context_tiers_active=_context_tiers_active,
-        )
+        # Repo-map mode lets Aider pull touched files incrementally instead of
+        # eagerly preloading every file named by the ticket. Do not reject a
+        # dispatch solely because that eager-preload estimate exceeds the
+        # model context window; Aider's repo map and on-demand reads are the
+        # intended fallback for small-context local models. Configurations
+        # without the explicit repo_map opt-in retain the strict preflight.
+        # ``repo_map`` here is the resolved flag (folds in the legacy
+        # ``lazy_context`` alias) — gating on the raw ``repo_map`` key would
+        # subject a ``lazy_context: true`` config to a preflight the
+        # equivalent ``repo_map: true`` config never sees.
+        if not repo_map:
+            _check_aider_context_budget(
+                prompt, touches, executor_cfg, model, worktree_path=worktree_path,
+                executor=executor, cfg=cfg, context_tiers_active=_context_tiers_active,
+            )
         # --dry-run: aider's own edit/commit capability (--yes-always included)
         # must not run at analyze time, before any worktree exists -- this is
         # the only aider flag that blocks file writes outright rather than
@@ -1559,8 +1742,14 @@ def build_executor_cmd(
         )
     elif executor_type == "openhands":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "openhands")
-        model_flags = ["--model", model] if model else []
-        return [bin_name] + extra_flags + ["run"] + model_flags + ["--task", prompt]
+        # OpenHands V1 accepts headless tasks at the top level. LLM settings
+        # are supplied through OpenHands environment overrides, not --model.
+        # --always-approve lets the agent act without per-action confirmation;
+        # withhold it for read_only (analyze) so an analyze pass cannot approve
+        # its own edits/shell against the main checkout, matching codex
+        # (--sandbox read-only), aider (--dry-run) and agy (--mode plan).
+        approve_flags = [] if read_only else ["--always-approve"]
+        return [bin_name] + extra_flags + ["--headless", "--json", "-t", prompt] + approve_flags
     elif executor_type == "codex":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "codex")
         model_flags = ["--model", model] if model else []
@@ -1590,6 +1779,32 @@ def build_executor_cmd(
                 + [analyze_session_id, prompt_arg]
             )
         return [bin_name, "exec", "--json"] + extra_flags + model_flags + sandbox_flags + [prompt_arg]
+    elif executor_type == "cursor":
+        bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "cursor-agent")
+        model_flags = ["--model", model] if model else []
+        # Cursor's --output-format json emits one terminal result envelope,
+        # while --force makes print mode apply changes without approvals.
+        # Cursor has no stdin prompt transport compatible with this shape.
+        # --mode ask: analyze must not get edit/shell capability against the
+        # main checkout, even though a ticket's own `executors.cursor.flags`
+        # may carry --force for implement/review. `ask` (read-only Q&A) is
+        # used rather than `plan` because `plan` makes Cursor emit only a
+        # planning narration and drop the structured JSON body the analyze
+        # prompt requires; `ask` still answers in full while refusing writes.
+        mode_flags = ["--mode", "ask"] if read_only else []
+        # --resume <session_id>: reuse the analyze conversation during implement
+        # or fix. Verified against cursor-agent 2026.08.25 -- resume keeps the
+        # same session_id and recalls prior context in print mode. A stale or
+        # rejected id exits non-zero; invoke_executor (pool.py) then retries
+        # once without --resume (see _RESUME_REJECTION_MARKERS).
+        resume_flags = ["--resume", analyze_session_id] if analyze_session_id else []
+        # --force makes print mode apply changes without approval; withhold it
+        # for read_only (analyze) so `ask` mode is not the only thing standing
+        # between an analyze pass and edits to the main checkout.
+        force_flags = [] if read_only else ["--force"]
+        return [bin_name] + extra_flags + model_flags + mode_flags + resume_flags + [
+            "-p", prompt, "--output-format", "json",
+        ] + force_flags
     elif executor_type == "agy":
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "agy")
         model_flags = ["--model", model] if model else []
@@ -1617,6 +1832,25 @@ def build_executor_cmd(
         return (
             [bin_name] + extra_flags + model_flags + resume_flags + timeout_flags + mode_flags
             + ["--output-format", "json", "--print", prompt]
+        )
+    elif executor_type == "kiro":
+        bin_name = _resolve_executor_bin(executor, executor_type, bin_name or "kiro-cli")
+        # Kiro's stream-json output requires engine V2 or V3. Pin V3 here so
+        # the command is non-interactive and machine-readable regardless of a
+        # user's local default engine. Kiro's real tool names are fs_read,
+        # fs_write, execute_bash, file_search, and grep (verified against
+        # kiro-cli 2.20.1's bundled acp-server.js); read-only dispatches
+        # trust fs_read/file_search/grep, while writable dispatches retain
+        # full tool access. An untrusted tool call blocks forever under
+        # --no-interactive instead of failing cleanly, so a wrong name here
+        # hangs every read-only run rather than erroring.
+        tool_trust_flags = (
+            ["--trust-tools=fs_read,file_search,grep"] if read_only else ["--trust-all-tools"]
+        )
+        return (
+            [bin_name, "chat"] + extra_flags
+            + ["--agent-engine", "v3", "--no-interactive"] + tool_trust_flags
+            + ["--output-format", "stream-json", prompt]
         )
     else:
         bin_name = _resolve_executor_bin(executor, executor_type, bin_name or executor_type)
@@ -1754,6 +1988,83 @@ def parse_codex_json_result(stdout: str) -> dict | None:
     }
 
 
+def parse_cursor_json_result(stdout: str) -> dict | None:
+    """Parse Cursor CLI ``--output-format json`` terminal output.
+
+    Cursor writes one ``result`` envelope only after a successful print-mode
+    run. Empty output, malformed JSON, and incomplete/non-success envelopes
+    are deliberately treated as unavailable structured data rather than
+    raising while recording the executor result.
+    """
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if (
+        not isinstance(data, dict)
+        or data.get("type") != "result"
+        or data.get("subtype") != "success"
+        or data.get("is_error") is not False
+        or not isinstance(data.get("result"), str)
+        or not isinstance(data.get("session_id"), str)
+    ):
+        return None
+    # Cursor's envelope carries a `usage` object with camelCase token counts.
+    # cost_usd stays None: Cursor bills by subscription and exposes no
+    # per-token price, and the model (hence any rate) varies per run.
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    return {
+        "result_text": data["result"],
+        "cost_usd": None,
+        "duration_ms": data.get("duration_ms"),
+        "num_turns": None,
+        "input_tokens": usage.get("inputTokens"),
+        "output_tokens": usage.get("outputTokens"),
+        "cache_creation_tokens": usage.get("cacheWriteTokens"),
+        "cache_read_tokens": usage.get("cacheReadTokens"),
+        "is_error": False,
+        "session_id": data["session_id"],
+    }
+
+
+def parse_kiro_json_result(stdout: str) -> dict | None:
+    """Parse Kiro ``stream-json`` JSONL and return the terminal reply."""
+    session_id: str | None = None
+    finished: dict | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        if isinstance(data.get("sessionId"), str):
+            session_id = data["sessionId"]
+        if event.get("type") == "runFinished":
+            finished = data
+
+    if finished is None or not isinstance(finished.get("finalText"), str):
+        return None
+    return {
+        "result_text": finished["finalText"],
+        "cost_usd": None,
+        "duration_ms": None,
+        "num_turns": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "cache_creation_tokens": None,
+        "cache_read_tokens": None,
+        # Missing/unknown terminal status is not evidence of success.
+        "is_error": finished.get("status") != "success",
+        "session_id": finished.get("sessionId") or session_id,
+    }
+
+
 def parse_agy_json_result(stdout: str) -> dict | None:
     """Parse an Antigravity CLI (``agy``) ``--output-format json`` reply into
     cost/token fields.
@@ -1807,6 +2118,8 @@ def parse_agy_json_result(stdout: str) -> dict | None:
 _STRUCTURED_RESULT_PARSERS: dict[str, Callable[[str], dict | None]] = {
     **{claude_type: parse_claude_json_result for claude_type in _CLAUDE_SUBPROCESS_TYPES},
     "codex": parse_codex_json_result,
+    "cursor": parse_cursor_json_result,
+    "kiro": parse_kiro_json_result,
     "agy": parse_agy_json_result,
 }
 
@@ -1834,6 +2147,85 @@ def _check_aider_parser_rejection(stdout: str) -> None:
         print(f"\nWARNING: Aider parser mismatch detected! The model emitted a SEARCH/REPLACE block but the active edit_format rejected it. Snippet:\n{sr.group(1)[:200]}", file=sys.stderr)
         return
 
+
+def run_executor_subprocess(
+    executor_type: str, cmd: list[str], **kwargs
+) -> subprocess.CompletedProcess:
+    """Run an executor without waiting for inherited Kiro pipe fds to close.
+
+    Other executor types retain ``subprocess.run`` exactly. Kiro is read with
+    non-blocking pipes until its direct child exits, followed by a short drain
+    of bytes already buffered in the pipes; a detached descendant retaining a
+    write fd therefore cannot keep LaneGate blocked forever.
+    """
+    if executor_type != "kiro":
+        return subprocess.run(cmd, **kwargs)
+
+    popen_kwargs = dict(kwargs)
+    popen_kwargs.pop("capture_output", None)
+    input_data = popen_kwargs.pop("input", None)
+    timeout = popen_kwargs.pop("timeout", None)
+    text_mode = bool(popen_kwargs.pop("text", False))
+    encoding = popen_kwargs.pop("encoding", None) or "utf-8"
+    if input_data is not None:
+        raise ValueError("Kiro prompt transport must not use subprocess stdin")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs
+    )
+    stdout_pipe = proc.stdout
+    stderr_pipe = proc.stderr
+    assert stdout_pipe is not None and stderr_pipe is not None
+    streams = (stdout_pipe, stderr_pipe)
+    stdout_fd = stdout_pipe.fileno()
+    stderr_fd = stderr_pipe.fileno()
+    buffers: dict[int, list[bytes]] = {
+        stdout_fd: [],
+        stderr_fd: [],
+    }
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+
+    started = time.monotonic()
+    exited_at: float | None = None
+    try:
+        while selector.get_map() or proc.poll() is None:
+            now = time.monotonic()
+            if timeout is not None and now - started > timeout:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if proc.poll() is not None and exited_at is None:
+                exited_at = now
+            # Once the direct child has exited, descendants' later output is
+            # unrelated; allow only a bounded window for buffered bytes.
+            if exited_at is not None and now - exited_at >= 0.1:
+                break
+            for key, _ in selector.select(0.05):
+                chunk = os.read(key.fd, 65536)
+                if chunk:
+                    buffers[key.fd].append(chunk)
+                else:
+                    selector.unregister(key.fileobj)
+        proc.wait()
+    finally:
+        selector.close()
+        for stream in streams:
+            stream.close()
+
+    stdout_bytes = b"".join(buffers[stdout_fd])
+    stderr_bytes = b"".join(buffers[stderr_fd])
+    if text_mode:
+        return subprocess.CompletedProcess(
+            cmd,
+            proc.returncode,
+            stdout_bytes.decode(encoding, errors="replace"),
+            stderr_bytes.decode(encoding, errors="replace"),
+        )
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout_bytes, stderr_bytes)
+
+
 def dispatch_executor(
     executor: str,
     prompt: str,
@@ -1846,6 +2238,13 @@ def dispatch_executor(
 ) -> subprocess.CompletedProcess:
     """Resolve *executor* (bare type or named instance) and run it as a subprocess.
 
+    Convenience wrapper for tests and one-off CLI use. The orchestrator's real
+    dispatch path is :func:`lanegate.orchestrate.pool.invoke_executor`, which
+    streams output, meters tokens, enforces worktree isolation, and owns the
+    resume-rejection retry (see ``_RESUME_REJECTION_MARKERS`` there). Keep
+    behaviour changes that must affect real runs in ``invoke_executor``, not
+    here.
+
     Single call site responsible for injecting a named instance's
     ``api_key_env`` into the child process environment — see
     :func:`resolve_executor_env` — so callers do not have to duplicate the
@@ -1853,8 +2252,8 @@ def dispatch_executor(
     logged; only its value is copied into the child environment.
 
     When ``analyze_session_id`` is set and the executor supports session
-    resumption (Claude subprocess types, agy, codex), the first attempt adds
-    resumption flags to continue the session. On nonzero exit (e.g. session
+    resumption (Claude subprocess types, agy, codex, cursor), the first attempt
+    adds resumption flags to continue the session. On nonzero exit (e.g. session
     expired) the call is retried as a fresh dispatch without resumption flags.
     """
     executor_cfg = get_executor_config(executor, cfg)
@@ -1874,20 +2273,20 @@ def dispatch_executor(
             worktree_path=Path(cwd),
             use_stdin=use_stdin,
         )
-        result = subprocess.run(cmd_with_resume, cwd=str(cwd), env=env, **kwargs)
+        result = run_executor_subprocess(executor_type, cmd_with_resume, cwd=str(cwd), env=env, **kwargs)
         if result.returncode != 0:
             cmd_fresh = build_executor_cmd(
                 executor, prompt, cfg, model=model, touches=touches,
                 worktree_path=Path(cwd),
                 use_stdin=use_stdin,
             )
-            return subprocess.run(cmd_fresh, cwd=str(cwd), env=env, **kwargs)
+            return run_executor_subprocess(executor_type, cmd_fresh, cwd=str(cwd), env=env, **kwargs)
         return result
 
     cmd = build_executor_cmd(
         executor, prompt, cfg, model=model, touches=touches, worktree_path=Path(cwd), use_stdin=use_stdin
     )
-    result = subprocess.run(cmd, cwd=str(cwd), env=env, **kwargs)
+    result = run_executor_subprocess(executor_type, cmd, cwd=str(cwd), env=env, **kwargs)
     
     if executor_type == "aider" and result.returncode == 0:
         if "--dry-run" not in cmd and "--edit-format" in cmd and "ask" not in cmd:
@@ -2081,9 +2480,8 @@ def build_implement_prompt(
             reason="selected-by-ticket" if change_notes else "no-change-notes",
         ))
 
-    # Cross-ticket change_notes: surface what prior merged/done tickets recorded
-    # about files this ticket also touches -- the git-tracked replacement for
-    # the dead worktree-vs-repo_root per-file .lanegate/notes/ mechanism.
+    # Cross-ticket change_notes are a supplemental source: surface what prior
+    # merged/done tickets recorded about files this ticket also touches.
     cross_ticket_tickets_dir = root / (cfg or {}).get("tickets_dir", ".lanegate/tickets")
     cross_ticket_notes = collect_cross_ticket_change_notes(ticket, cross_ticket_tickets_dir, cfg)
     if cross_ticket_notes:

@@ -14,19 +14,16 @@ Local-first, git-native workflow for coding agents — ticket queue, parallel wo
 
 ## Next
 
-Gates promoting work to the public repo, plus the items that make the V1 coordination model more honest and easier to verify.
+Items that make the V1 coordination model more honest and easier to verify, plus broader executor and isolation support.
 
-Gating the public repo — LaneGate auditing its own tree, not something a user of LaneGate on another project would see:
+Done since the first public release: mypy across `lanegate/` in CI, repeated repo-wide duplicate-drift sweeps, driver-aware model/pin validation, the Cursor and Kiro executors, an OpenHands V1 rewrite, and native reviewer rotation.
 
-- Retest the discovery-guidance A/B for the `claude` executor on an over-10KB skeleton set
-- Run mypy across LaneGate's own Python tree (`lanegate/`) — no equivalent check exists yet for LaneGate's own Go TUI module (`tui/`); `go vet`/`go build` aren't wired into this repo's CI
-- Repo-wide duplicate-drift sweep
+Queued:
 
-Queued, not gating:
-
-- Warn when a ticket's `model:` has no matching `executor:`/`reviewer:` pin
-- Distinguish an actual review rejection from an approved-but-awaiting-merge ticket in the orchestrate run summary
+- A real OS-level sandbox — the current `executors.<name>.sandbox: worktree` opt-in is experimental (filesystem-only, not usable with linked worktrees, no network/syscall policy). Near-term: make it work with linked worktrees and extend it past `claude` executors; longer-term: the external runner boundary in [docs/v2-interface-boundaries.md](docs/v2-interface-boundaries.md).
 - Dependency-aware scope hints using AST/import information
+- `go vet`/`go build` wired into CI for the Go TUI module (`tui/`)
+- Retest the discovery-guidance A/B for the `claude` executor on an over-10KB skeleton set
 - Better safeguard recipes for Python, Node, Go, Rust, Java, and mixed repos — this is the one that matters for using LaneGate on a target project in any of these languages, independent of what LaneGate's own stack is
 - Executor conformance tests for scope enforcement, hooks, and headless flags
 - `lanegate doctor security` output that explains the current sandbox/review risk

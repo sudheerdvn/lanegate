@@ -974,3 +974,54 @@ def test_stream_subprocess_kills_process_on_worktree_guard_violation(tmp_path: P
     assert kill_reason == "worktree_violation"
     assert elapsed < 3.0
 
+
+def _sleepy_cmd(seconds: float = 3.0) -> list[str]:
+    import sys
+    return [sys.executable, "-c", f"import time; time.sleep({seconds})"]
+
+
+def test_stream_subprocess_classifies_suspend_gap_when_wall_time_dwarfs_cpu(tmp_path: Path):
+    """elapsed > 3x timeout with near-zero watchdog CPU => kill_reason 'suspend_gap'.
+
+    Simulated by burning wall-clock time in on_start (which runs after start_ts
+    is taken) while the watchdog process itself only sleeps — exactly the shape
+    of the orchestrator being SIGSTOPped mid-run.
+    """
+    import time
+    from lanegate.orchestrate.run_report import _stream_subprocess
+
+    rc, _stdout, stderr, kill_reason = _stream_subprocess(
+        _sleepy_cmd(3.0),
+        str(tmp_path),
+        timeout=0.1,
+        budget_probe=lambda: None,  # force the watchdog while-loop path
+        on_start=lambda _pid: time.sleep(0.6),  # wall time passes, CPU does not
+    )
+
+    assert rc != 0
+    assert kill_reason == "suspend_gap"
+    assert "suspended" in stderr
+
+
+def test_stream_subprocess_classifies_ordinary_timeout_when_cpu_tracks_wall(tmp_path: Path):
+    """A normal timeout (elapsed ~= timeout) is NOT a suspend gap.
+
+    ``_stream_subprocess`` collapses a plain ``timeout`` kill_reason to ``None``
+    in its return tuple (legacy contract); the point here is that it does not
+    escalate to ``suspend_gap``.
+    """
+    import time
+    from lanegate.orchestrate.run_report import _stream_subprocess
+
+    rc, _stdout, stderr, kill_reason = _stream_subprocess(
+        _sleepy_cmd(3.0),
+        str(tmp_path),
+        timeout=0.1,
+        budget_probe=lambda: None,
+        on_start=lambda _pid: time.sleep(0.15),  # just over timeout, well under 3x
+    )
+
+    assert rc != 0
+    assert kill_reason != "suspend_gap"
+    assert "timed out after 0.1s" in stderr
+

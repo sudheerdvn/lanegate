@@ -21,6 +21,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sys
@@ -36,6 +37,45 @@ from lanegate.ticket import load_all_tickets
 from lanegate.watch_common import read_pid as _read_pid, write_log as _write_log
 
 _STUCK_STATUSES = {"needs_review", "failed", "blocked"}
+
+
+def _ticket_action_required(ticket: dict) -> str:
+    """Return safe, human-mediated guidance for a halted ticket."""
+    status = ticket.get("status")
+    if status == "failed":
+        return "read the audit bundle, then reopen once root-caused"
+    if status == "hibernated" and _RATE_LIMIT_MARKER in (ticket.get("_body") or ""):
+        return "restart resume-watch"
+    return "needs_human"
+
+
+def _problem_finding(problem: tuple[str, str], stuck: list[dict] | None = None) -> dict:
+    """Convert a detected problem into the machine-readable public record."""
+    signature, message = problem
+    ticket_id = signature.partition(":")[2] or "?"
+    status = ""
+    action_required = "needs_human"
+
+    if signature.startswith("heartbeat-stale:"):
+        status = "active"
+        action_required = "lanegate executor status; consider killing the stuck process"
+    elif signature.startswith("process-died:"):
+        status = "active"
+        action_required = "lanegate run-report; inspect the stopped process before restarting"
+    elif signature.startswith("halted:"):
+        stuck = stuck or []
+        ticket_id = ",".join(ticket["id"] for ticket in stuck)
+        status = ",".join(ticket.get("status", "") for ticket in stuck)
+        actions = {ticket["action_required"] for ticket in stuck}
+        action_required = actions.pop() if len(actions) == 1 else "needs_human"
+
+    return {
+        "ticket_id": ticket_id,
+        "status": status,
+        "signature": signature,
+        "message": message,
+        "action_required": action_required,
+    }
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -113,19 +153,24 @@ def _stuck_tickets(cfg: dict, repo_root: Path) -> list[dict]:
     for t in tickets:
         status = t.get("status")
         if status in _STUCK_STATUSES:
-            stuck.append(t)
+            stuck.append({**t, "action_required": _ticket_action_required(t)})
         elif status == "hibernated":
             if _RATE_LIMIT_MARKER not in (t.get("_body") or ""):
-                stuck.append(t)
+                stuck.append({**t, "action_required": _ticket_action_required(t)})
             else:
                 if resume_watch_alive is None:
                     resume_watch_alive = _rate_limit_watcher_alive(repo_root)
                 if not resume_watch_alive:
-                    stuck.append(t)
+                    stuck.append({**t, "action_required": _ticket_action_required(t)})
     return stuck
 
 
-def _detect_problem(cfg: dict, repo_root: Path) -> tuple[str, str] | None:
+def _detect_problem(
+    cfg: dict,
+    repo_root: Path,
+    *,
+    stuck_tickets: list[dict] | None = None,
+) -> tuple[str, str] | None:
     """
     Return (signature, message) describing the current problem, or None if
     everything looks healthy. `signature` is a stable, order-independent key
@@ -175,7 +220,7 @@ def _detect_problem(cfg: dict, repo_root: Path) -> tuple[str, str] | None:
     # but if the orchestrator itself isn't running AND work is waiting on a
     # human, that's the "stuck overnight" case.
     if not lock.get("alive"):
-        stuck = _stuck_tickets(cfg, repo_root)
+        stuck = stuck_tickets if stuck_tickets is not None else _stuck_tickets(cfg, repo_root)
         if stuck:
             ids = sorted(f"{t['id']}({t.get('status')})" for t in stuck)
             return (
@@ -191,7 +236,7 @@ def _detect_problem(cfg: dict, repo_root: Path) -> tuple[str, str] | None:
 # ---------------------------------------------------------------------------
 
 
-def _run_loop(cfg: dict, repo_root: Path) -> None:
+def _run_loop(cfg: dict, repo_root: Path, *, json_output: bool = False) -> None:
     """
     Internal polling loop. Called by cmd_notify_watch when running as a
     daemon. Logs to .lanegate/notify-watch.log. Runs indefinitely (stop with
@@ -223,13 +268,17 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
     last_signature = _read_last_signature(state_path)
 
     while True:
-        problem = _detect_problem(cfg, repo_root)
+        stuck = _stuck_tickets(cfg, repo_root) if json_output else None
+        problem = _detect_problem(cfg, repo_root, stuck_tickets=stuck)
         signature = problem[0] if problem else ""
 
         if signature != last_signature:
             if problem:
                 _, message = problem
-                log(f"[notify-watch] PROBLEM: {message}")
+                if json_output:
+                    log(json.dumps(_problem_finding(problem, stuck), sort_keys=True))
+                else:
+                    log(f"[notify-watch] PROBLEM: {message}")
                 if topic and not send_ntfy(topic, message):
                     log("[notify-watch] ntfy push failed")
             else:
@@ -248,6 +297,21 @@ def _run_loop(cfg: dict, repo_root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def cmd_notify_watch_once(cfg: dict, repo_root: Path, *, json_output: bool = False) -> None:
+    """Inspect the current state once without watcher state or notifications."""
+    stuck = _stuck_tickets(cfg, repo_root)
+    problem = _detect_problem(cfg, repo_root, stuck_tickets=stuck)
+    if problem is None:
+        findings = []
+    else:
+        findings = [_problem_finding(problem, stuck)]
+    if json_output:
+        print(json.dumps(findings, sort_keys=True))
+    else:
+        for finding in findings:
+            print(finding["message"])
+
+
 def cmd_notify_watch(
     cfg: dict,
     repo_root: Path,
@@ -256,6 +320,8 @@ def cmd_notify_watch(
     stop: bool = False,
     test: bool = False,
     background: bool = False,
+    once: bool = False,
+    json_output: bool = False,
 ) -> None:
     """
     Main entry point for `lanegate notify-watch`.
@@ -266,7 +332,12 @@ def cmd_notify_watch(
       lanegate notify-watch --status     — report running state
       lanegate notify-watch --stop       — kill the running watcher
       lanegate notify-watch --test       — send one test push and exit
+      lanegate notify-watch --once --json — print current findings and exit
     """
+    if once:
+        cmd_notify_watch_once(cfg, repo_root, json_output=json_output)
+        return
+
     pid_path = _notify_watch_pid_file(repo_root)
 
     if background and not (status or stop or test):
@@ -280,7 +351,10 @@ def cmd_notify_watch(
             )
             sys.exit(1)
         log_path = _notify_watch_log_file(repo_root)
-        spawned_pid = spawn_detached([APP_NAME, "notify-watch"], log_path)
+        command = [APP_NAME, "notify-watch"]
+        if json_output:
+            command.append("--json")
+        spawned_pid = spawn_detached(command, log_path)
         print(f"[notify-watch] spawned detached (PID {spawned_pid}), survives this terminal closing")
         return
 
@@ -336,6 +410,6 @@ def cmd_notify_watch(
         signal.signal(signal.SIGTERM, _cleanup)
 
     try:
-        _run_loop(cfg, repo_root)
+        _run_loop(cfg, repo_root, json_output=json_output)
     finally:
         pid_path.unlink(missing_ok=True)

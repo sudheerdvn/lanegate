@@ -293,7 +293,7 @@ class TestRunDriftCheck:
         cfg["drivers"] = {
             "implement-fast": {
                 "type": "claude-process",
-                "model": "drift-driver-model",
+                "model": "claude-sonnet-5",
                 "bin": "custom-drift",
                 "flags": ["--driver-flag"],
                 "env": {"DRIFT_TOKEN": "${SOURCE_DRIFT_TOKEN}"},
@@ -318,7 +318,7 @@ class TestRunDriftCheck:
         assert drift_cmd[0] == "custom-drift"
         assert "--driver-flag" in drift_cmd
         assert "--model" in drift_cmd
-        assert drift_cmd[drift_cmd.index("--model") + 1] == "drift-driver-model"
+        assert drift_cmd[drift_cmd.index("--model") + 1] == "claude-sonnet-5"
         assert drift_kwargs["env"]["DRIFT_TOKEN"] == "drift-token"
 
     def test_executor_steps_drift_check_wins_over_implement_driver(self, tmp_path):
@@ -643,6 +643,29 @@ class TestRunDriftCheck:
 
         assert result.ok is False
         assert "ollama" in result.reason
+        mock_run.assert_not_called()
+
+    def test_drift_check_rejects_cross_provider_model(self, tmp_path):
+        """An Ollama-backed aider route cannot inherit a Claude drift model."""
+        from lanegate.orchestrate import run_drift_check
+
+        ticket = self._make_ticket()
+        cfg = _default_cfg(tmp_path)
+        cfg["models"] = {"drift_check": "claude-sonnet-5"}
+        cfg["executors"] = {
+            "ollama-aider": {"type": "aider", "provider": "ollama"}
+        }
+        cfg["steps"] = {"drift_check": {"driver": "ollama-aider"}}
+
+        with (
+            patch("lanegate.reviewer.get_worktree_diff", side_effect=self._diffs()),
+            patch("lanegate.reviewer.build_drift_check_prompt", return_value="drift prompt"),
+            patch("lanegate.orchestrate.subprocess.run") as mock_run,
+        ):
+            result = run_drift_check(ticket, cfg, tmp_path, tmp_path, "a finding", "sha-before")
+
+        assert result.ok is False
+        assert "claude-sonnet-5" in result.reason
         mock_run.assert_not_called()
 
     def test_fix_touching_unrelated_file_is_flagged_by_agent_response(self, tmp_path):
@@ -972,6 +995,35 @@ class TestRunAutoFixCycle:
         mock_review.assert_called_once()
         mock_record.assert_called_once()
         assert mock_record.call_args.kwargs.get("escalate", False) is False
+
+    def test_fix_handoff_retains_historical_review_findings(self, tmp_path):
+        """The fix pass receives the ticket body, including every review round."""
+        from lanegate.reviewer import DriftCheckResult
+
+        ticket = self._ticket(tmp_path)
+        ticket_path = ticket["_path"]
+        ticket_path.write_text(
+            ticket_path.read_text()
+            + "\n## Review Findings (attempt 2)\n"
+            + "Newest reviewer finding.\n"
+        )
+        cfg = self._cfg(tmp_path)
+
+        with (
+            patch("lanegate.orchestrate.autofix._git_head_sha", return_value="abc123"),
+            patch("lanegate.orchestrate.autofix.run_fix_agent", return_value=True) as mock_fix,
+            patch(
+                "lanegate.orchestrate.autofix.run_drift_check",
+                return_value=DriftCheckResult(ok=True),
+            ),
+            patch("lanegate.orchestrate.autofix.run_review_agent", return_value=True),
+            patch("lanegate.lifecycle.record_auto_fix_attempt"),
+        ):
+            assert run_auto_fix_cycle(ticket, cfg, tmp_path, tmp_path / "worktrees" / "tick-050")
+
+        handed_off = mock_fix.call_args.args[0]
+        assert "Reviewer requested: fix the off-by-one" in handed_off["_body"]
+        assert "Newest reviewer finding." in handed_off["_body"]
 
     def test_drift_check_failure_escalates_immediately_even_with_budget_remaining(self, tmp_path):
         """A fix that touches an unrelated file (drift detected) must escalate

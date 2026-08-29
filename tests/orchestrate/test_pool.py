@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import sys
 
 from tests.orchestrate.conftest import *  # noqa: F401,F403
 
@@ -34,7 +35,7 @@ class TestBuildExecutorCmd:
 
     def test_openhands(self):
         cmd = _build_executor_cmd("openhands", "refactor this", {})
-        assert cmd == ["openhands", "run", "--task", "refactor this"]
+        assert cmd == ["openhands", "--headless", "--json", "-t", "refactor this", "--always-approve"]
 
     def test_passthrough(self):
         cmd = _build_executor_cmd("myexec", "do work", {})
@@ -86,8 +87,9 @@ class TestBuildExecutorCmd:
         assert cmd == ["aider", "--model", "gpt-4o", "--message", "fix the bug"]
 
     def test_openhands_with_model(self):
+        # OpenHands V1 headless invocation ignores the model argument.
         cmd = _build_executor_cmd("openhands", "refactor this", {}, model="gpt-4-turbo")
-        assert cmd == ["openhands", "run", "--model", "gpt-4-turbo", "--task", "refactor this"]
+        assert cmd == ["openhands", "--headless", "--json", "-t", "refactor this", "--always-approve"]
 
     def test_codex_with_model(self):
         # `codex exec` has no --timeout flag in current CLI releases, so
@@ -102,9 +104,9 @@ class TestBuildExecutorCmd:
     # --- ollama positional model argument ---
 
     def test_ollama_model_is_positional(self):
-        """ollama: model is a positional arg — `ollama run <model> <prompt>`."""
+        """ollama run flags follow its positional model argument."""
         cmd = _build_executor_cmd("ollama", "do stuff", {}, model="llama3.1")
-        assert cmd == ["ollama", "run", "llama3.1", "do stuff"]
+        assert cmd == ["ollama", "run", "llama3.1", "--nowordwrap", "do stuff"]
 
     def test_ollama_no_model_uses_default(self):
         """ollama without a model uses llama3 as a sensible default positional arg."""
@@ -112,8 +114,9 @@ class TestBuildExecutorCmd:
         assert cmd[0] == "ollama"
         assert cmd[1] == "run"
         assert "--model" not in cmd
-        # A default model name should be the third element
-        assert len(cmd) == 4
+        # The default model is third, followed by the safe run-subcommand flag.
+        assert cmd[2:4] == ["llama3", "--nowordwrap"]
+        assert len(cmd) == 5
 
     def test_ollama_model_not_as_flag(self):
         """Ollama must NOT use --model flag — it uses a positional argument."""
@@ -618,6 +621,36 @@ class TestInvokeExecutor:
                 ".lanegate/tickets/TICK-999.md", cfg, tmp_path
             )
 
+    def test_main_checkout_bookkeeping_covers_generated_state_and_docs(self, tmp_path):
+        """TICK-708: an analyze pass rewriting a `.lanegate/context/*` skeleton,
+        or a supervisor editing a `docs/internal/*.md` session log, during a
+        concurrent review must not be mistaken for an executor leak. Real
+        source under a code root still is."""
+        cfg = _default_cfg(tmp_path)
+        bookkeeping = [
+            ".lanegate/context/TICK-500/file_skeletons.json",
+            ".lanegate/logs/orchestrate-2026-08-28.log",
+            ".lanegate/prompts/TICK-500-review.md",
+            "docs/internal/supervision-session-2026-08-27.md",
+            "README.md",
+        ]
+        for p in bookkeeping:
+            assert _is_main_checkout_bookkeeping_path(p, cfg, tmp_path), p
+        for p in ("lanegate/executor.py", "tests/test_executor.py", "pyproject.toml"):
+            assert not _is_main_checkout_bookkeeping_path(p, cfg, tmp_path), p
+
+    def test_nested_markdown_is_not_whitelisted(self, tmp_path):
+        """TICK-722: only docs/ and root-level .md are bookkeeping. A nested .md
+        (a package README, lanegate/skills/*.md) is a real project file an
+        executor edits in its worktree — a concurrent main-checkout change to
+        one is still a possible leak."""
+        cfg = _default_cfg(tmp_path)
+        assert _is_main_checkout_bookkeeping_path("CHANGELOG.md", cfg, tmp_path)
+        assert _is_main_checkout_bookkeeping_path("docs/executor-capabilities.md", cfg, tmp_path)
+        for p in ("lanegate/skills/supervise.md", "lanegate/templates/prompts/review.md",
+                  "some/pkg/README.md"):
+            assert not _is_main_checkout_bookkeeping_path(p, cfg, tmp_path), p
+
     def test_only_incremental_executors_receive_output_idle_timeout(self, tmp_path):
         ticket = {
             "id": "TICK-TIMEOUT", "title": "Timeout policy", "touches": [],
@@ -728,6 +761,36 @@ class TestInvokeExecutor:
         prompt_file = tmp_path / ".lanegate" / "prompts" / "TICK-001-implement.md"
         assert prompt_file.exists()
         assert "Test" in prompt_file.read_text()
+
+    def test_invoke_executor_forwards_claude_config_dir_from_bin(self, tmp_path):
+        ticket = {
+            "id": "TICK-071",
+            "title": "Config directory",
+            "touches": ["a.py"],
+            "close_criteria": "Done.",
+            "_body": "Body.",
+        }
+        captured_kwargs = []
+
+        def fake_build_executor_cmd(*args, **kwargs):
+            captured_kwargs.append(kwargs)
+            return ["claude", "-p"]
+
+        for executor, executors, expected in [
+            ("claude-a", {"claude-a": {"type": "claude-process", "bin": "claude-a"}}, ".claude-a"),
+            ("claude-process", {}, ".claude"),
+        ]:
+            cfg = _default_cfg(tmp_path)
+            cfg["executor"] = executor
+            cfg["executors"] = executors
+            with (
+                patch("lanegate.orchestrate.pool.build_executor_cmd", side_effect=fake_build_executor_cmd),
+                patch("lanegate.orchestrate.pool._stream_subprocess", return_value=(0, "", "")),
+            ):
+                exit_code, *_ = invoke_executor(ticket, cfg, tmp_path)
+
+            assert exit_code == 0
+            assert captured_kwargs.pop()["claude_config_dir"] == Path.home() / expected
 
     def test_calls_correct_subprocess_for_aider(self, tmp_path):
         ticket = {
@@ -1005,6 +1068,47 @@ class TestInvokeExecutor:
         ):
             assert invoke_executor(ticket, cfg, tmp_path) == (1, "", "generic failure")
 
+        assert len(calls) == 1
+
+    def test_non_codex_expired_resume_also_retries_once_fresh(self, tmp_path):
+        """The resume-rejection fresh retry is not codex-only: any executor in
+        _SESSION_RESUME_TYPES gets one fresh attempt when its --resume id is
+        rejected (TICK-718)."""
+        ticket = {
+            "id": "TICK-012C",
+            "title": "Expired cursor resume",
+            "touches": ["r.py"],
+            "close_criteria": "Done.",
+            "_body": "Body.",
+            "analyze_session_id": "expired-sess",
+            "analyze_session_executor": "cursor",
+            "analyze_session_model": "cursor-fast",
+        }
+        cfg = _default_cfg(tmp_path)
+        cfg["executor"] = "cursor"
+        cfg["executors"] = {"cursor": {"type": "cursor", "models": {"implement": "cursor-fast"}}}
+        calls = []
+
+        def expired_then_success(cmd, *args, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return 1, "", "error: session not found: expired-sess"
+            return 0, "", ""
+
+        with patch("lanegate.orchestrate.pool._stream_subprocess", side_effect=expired_then_success):
+            assert invoke_executor(ticket, cfg, tmp_path) == (0, "", "")
+
+        assert len(calls) == 2
+        assert "--resume" in calls[0]
+        assert "--resume" not in calls[1]
+
+        # A generic non-resume failure still fails once, no retry.
+        calls.clear()
+        with patch(
+            "lanegate.orchestrate.pool._stream_subprocess",
+            side_effect=lambda cmd, *a, **k: (calls.append(cmd) or (1, "", "compilation error in r.py")),
+        ):
+            assert invoke_executor(ticket, cfg, tmp_path) == (1, "", "compilation error in r.py")
         assert len(calls) == 1
 
     def test_invoke_executor_does_not_resume_session_from_other_executor(self, tmp_path):
@@ -3423,6 +3527,10 @@ class TestCommitWorktreeChanges:
             "fix: address review findings for TICK-001",
         ]
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="':' is a reserved character in Windows filenames; this fixture's literal filename cannot be created there",
+    )
     def test_paths_are_treated_as_literal_pathspecs(self, tmp_path):
         """Regression test for TICK-686: commit_worktree_changes must escape
         paths as literal pathspecs so that files like ':(glob)**' are not
@@ -4451,7 +4559,7 @@ def test_select_pool_instance_returns_none_when_all_instances_cooling_down(tmp_p
     }
 
     # Mock _pool_instance_healthy to simulate all pool instances cooling down
-    with patch("lanegate.orchestrate.loop._pool_instance_healthy", return_value=False), \
+    with patch("lanegate.orchestrate.loop_dispatch._pool_instance_healthy", return_value=False), \
          patch("lanegate.orchestrate.loop._COOLDOWN_POLL_SECONDS", 0):
         # We also need a scope context inside _cmd_orchestrate_body or similar,
         # but _select_pool_instance is an inner function defined inside _drain_loop.

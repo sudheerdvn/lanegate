@@ -39,6 +39,13 @@ lanegate review TICK-007          # submit for review → in_review
 lanegate merge TICK-007           # merge to main, delete worktree → merged
 lanegate validate TICK-007        # run configured post-merge checks → validated
 lanegate done TICK-007            # close ticket → done
+
+# Recovery
+lanegate reopen TICK-007          # send a failed/needs_review ticket back to open
+lanegate reset TICK-007           # discard a stuck non-terminal ticket's worktree + branch and
+                                  #   clear its verdict, so it re-implements from scratch. Refuses
+                                  #   terminal tickets (merged/done/failed/closed); only removes a
+                                  #   worktree that matches the ticket's own canonical path + branch.
 ```
 
 `create` derives a short board title from the intent when `--title` is omitted.
@@ -176,6 +183,9 @@ lanegate notify-watch --test        # send a test phone push (ntfy.sh), verify s
 lanegate notify-watch --background  # push a phone alert when a run looks stuck (dead process, stale
                                      # heartbeat, or halted with tickets waiting); detaches, survives this
                                      # terminal closing
+lanegate notify-watch --once --json # run stuck-ticket detection once, print a structured record
+                                     # (empty list + exit 0 when nothing is stuck), no daemon — for
+                                     # cron/CI health checks
 ```
 
 See [Rate limits and auto-resume](config-reference.md#rate-limits-and-auto-resume) and [Phone alerts for stuck runs](config-reference.md#phone-alerts-for-stuck-runs-notify-watch) in the config reference for configuration and setup, including running `notify-watch` under systemd so it survives reboots.
@@ -184,6 +194,9 @@ See [Rate limits and auto-resume](config-reference.md#rate-limits-and-auto-resum
 
 ```bash
 lanegate init             # scaffold .lanegate/ + .lanegate.yml
+lanegate audit-refactor   # scan for oversized modules and emit a dependency-ordered
+                          #   draft-ticket DAG to split them (--threshold LINES, --path DIR,
+                          #   --milestone M)
 lanegate install-agent-tools # install Claude commands plus Codex/generic MCP snippets
 lanegate install-commands # compatibility alias: copy Claude slash commands only
 lanegate gh-sync          # mirror tickets to GitHub Issues (manual visibility sync; read-only view, not bidirectional)
