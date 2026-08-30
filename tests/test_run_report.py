@@ -1013,15 +1013,20 @@ def test_stream_subprocess_classifies_ordinary_timeout_when_cpu_tracks_wall(tmp_
     import time
     from lanegate.orchestrate.run_report import _stream_subprocess
 
+    # Generous absolute numbers so a loaded CI runner's scheduling jitter can't
+    # push `elapsed` past the suspend-gap threshold (3 * timeout). With
+    # timeout=1.0s the wall clock has to reach 3.0s to misclassify; on_start
+    # sleeps only ~1.2s (just over timeout, far under 3x), leaving ~1.8s of
+    # headroom. A tiny timeout (0.1s / 0.3s threshold) flaked on macOS runners.
     rc, _stdout, stderr, kill_reason = _stream_subprocess(
-        _sleepy_cmd(3.0),
+        _sleepy_cmd(5.0),
         str(tmp_path),
-        timeout=0.1,
+        timeout=1.0,
         budget_probe=lambda: None,
-        on_start=lambda _pid: time.sleep(0.15),  # just over timeout, well under 3x
+        on_start=lambda _pid: time.sleep(1.2),
     )
 
     assert rc != 0
     assert kill_reason != "suspend_gap"
-    assert "timed out after 0.1s" in stderr
+    assert "timed out after 1.0s" in stderr
 
